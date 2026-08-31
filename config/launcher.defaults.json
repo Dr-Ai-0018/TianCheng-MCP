@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "defaultProfile": "tiancheng-local",
+  "tunnelClient": "",
+  "profileDir": "",
+  "powerShell": "",
+  "workspace": "",
+  "mcpScript": "run-mcp.ps1",
+  "mcpExecScript": "run-mcp-exec.ps1",
+  "mcpGrantsScript": "run-mcp-grants.ps1",
+  "accessPolicyPath": "config/access-policy.json",
+  "agentSourcesPath": "config/agent-sources.json",
+  "agentCatalogPath": "state/agent-catalog.sqlite3",
+  "envFile": ".env",
+  "healthBaseUrl": "http://127.0.0.1:8080",
+  "interactiveTimeoutSeconds": 75,
+  "doctorBeforeStart": true,
+  "openWebUiOnStart": false
+}

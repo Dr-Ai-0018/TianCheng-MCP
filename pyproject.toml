@@ -1,0 +1,31 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "tiancheng-local-mcp"
+version = "0.9.0"
+description = "A Windows-first, workspace-jailed local MCP server for TianCheng"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "mcp==2.1.0",
+  "qrcode>=8,<9",
+]
+
+[project.optional-dependencies]
+test = [
+  "pytest>=8.3,<9",
+  "pytest-asyncio>=0.25,<2",
+]
+
+[project.scripts]
+tiancheng-mcp = "tiancheng_mcp.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tiancheng_mcp"]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["tests"]
+asyncio_mode = "auto"

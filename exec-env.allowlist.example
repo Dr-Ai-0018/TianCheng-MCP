@@ -1,0 +1,3 @@
+# One environment variable name per line. Names only; never put values here.
+# Uncomment and rename to exec-env.allowlist to pass a selected DEV secret:
+# EXAMPLE_SERVICE_KEY

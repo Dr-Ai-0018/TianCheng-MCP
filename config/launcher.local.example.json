@@ -1,0 +1,14 @@
+{
+  "_comment": [
+    "Copy this file to launcher.local.json and fill in the values for THIS machine.",
+    "launcher.local.json is git-ignored on purpose: it is the only place machine",
+    "paths, your workspace, and your tunnel profile name belong.",
+    "Leave tunnelClient or powerShell empty to discover them on PATH instead."
+  ],
+  "workspace": "<YOUR_WORKSPACE_PATH>",
+  "tunnelClient": "<YOUR_TUNNEL_CLIENT_PATH>",
+  "powerShell": "",
+  "profileDir": "",
+  "defaultProfile": "tiancheng-local",
+  "interactiveTimeoutSeconds": 75
+}
