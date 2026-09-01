@@ -107,7 +107,7 @@ class WorkspaceJail:
 
         windows_path = PureWindowsPath(raw.replace("/", "\\"))
         if windows_path.drive or windows_path.root or windows_path.is_absolute():
-            raise WorkspaceSecurityError("Only workspace-relative paths are allowed")
+            raise WorkspaceSecurityError("Only relative paths are allowed by this tool")
 
         components: list[str] = []
         for part in windows_path.parts:
@@ -143,7 +143,7 @@ class WorkspaceJail:
 
         exists = os.path.lexists(lexical)
         if must_exist and not exists:
-            raise FileNotFoundError(f"Workspace path does not exist: {raw}")
+            raise FileNotFoundError(f"Path does not exist: {raw}")
         if exists:
             self._reject_reparse_components(lexical)
             resolved = lexical.resolve(strict=True)

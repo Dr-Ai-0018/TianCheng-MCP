@@ -103,19 +103,47 @@ def _audit_path(value: str | None) -> str | None:
     return "/".join(part for part in candidate.parts if part != ".") or "."
 
 
+def _instructions(service: TianChengService) -> str:
+    """Describe the path rules that actually apply to this server.
+
+    The two tool families take paths in different shapes, so a single static
+    sentence is wrong for one of them.  Stating only the workspace rule is what
+    sends a caller to ``read_text`` with an absolute path, where it gets a
+    refusal that reads like the grant is broken rather than like the wrong tool.
+    """
+
+    paragraphs = [
+        "Workspace tools take paths relative to the fixed workspace. For them, "
+        "absolute paths, parent traversal, symlinks, junctions, and reparse "
+        "points are refused."
+    ]
+    if service.external_grants.enabled:
+        paragraphs.append(
+            "The external_* tools are the opposite: they take an absolute path "
+            "outside the workspace, and reach it only where the static access "
+            "policy already grants it, or under a grant_id from "
+            "request_external_access. Call access_policy_explain to see whether "
+            "a path is covered before reading it, and workspace_info to list "
+            "every granted directory. Git tools are workspace-only; for a "
+            "repository outside the workspace use external_run_command with "
+            "command \"git\"."
+        )
+    paragraphs.append(
+        "Delete moves items to .tiancheng-trash instead of permanently "
+        "destroying them. Tools that run longer than the interactive budget "
+        "automatically return a job_id; use job_status, job_result, and "
+        "job_cancel to continue or stop them."
+    )
+    return " ".join(paragraphs)
+
+
 def create_server(service: TianChengService) -> MCPServer:
     mcp = MCPServer(
         name="tiancheng-local-mcp",
         title="TianCheng Local MCP",
         description="Workspace-jailed local file and Git tools for the configured workspace",
         version=__version__,
-        instructions=(
-            "All file paths are relative to the fixed workspace. Absolute paths, parent "
-            "traversal, symlinks, junctions, and reparse points are refused. Delete moves "
-            "items to .tiancheng-trash instead of permanently destroying them. Tools that "
-            "run longer than the interactive budget automatically return a job_id; use "
-            "job_status, job_result, and job_cancel to continue or stop them."
-        ),
+        instructions=_instructions(service),
     )
 
     expected_errors = (

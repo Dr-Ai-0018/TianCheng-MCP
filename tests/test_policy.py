@@ -10,6 +10,7 @@ import pytest
 
 import tiancheng_mcp
 from tiancheng_mcp.policy import AccessPolicy, AccessPolicyError, AccessRule
+from tiancheng_mcp.server import _instructions
 from tiancheng_mcp.service import TianChengService
 
 
@@ -433,3 +434,32 @@ def test_workspace_info_reports_the_directories_a_caller_may_use(tmp_path: Path)
         assert granted["note"] == "agent cwd"
     finally:
         service.shutdown()
+
+
+def test_instructions_describe_the_path_shape_each_tool_family_expects(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    def instructions(**kwargs: object) -> str:
+        service = TianChengService(workspace, tmp_path / "audit", **kwargs)
+        try:
+            return _instructions(service)
+        finally:
+            service.shutdown()
+
+    safe = instructions()
+    grants = instructions(allow_external_grants=True)
+
+    # SAFE registers no external_* tool, so promising absolute paths there would
+    # send a caller to a tool that does not exist.
+    assert "relative to the fixed workspace" in safe
+    assert "external_" not in safe
+
+    # Once the external tools exist the workspace rule is only half the story:
+    # saying absolute paths are refused is what makes a caller read a policy
+    # refusal as a broken grant instead of as the wrong tool.
+    assert "absolute path" in grants
+    assert "external_*" in grants
+    assert "access_policy_explain" in grants
+    # Git has no external counterpart, so the fallback has to be named.
+    assert "external_run_command" in grants

@@ -6,6 +6,13 @@
 - 小版本：增加向后兼容的工具、可选参数或运行能力。
 - 大版本：改变现有调用契约、默认安全边界，或需要用户迁移的变更。
 
+## [Unreleased]
+
+### Fixed
+
+- 修正服务器 instructions：原来固定声明「所有路径都是工作区相对路径，绝对路径一律拒绝」，在 GRANTS 档下与 14 个只接受绝对路径的 `external_*` 工具直接冲突，会把调用方一路推向错误的工具。现在按实际注册的工具集生成说明：SAFE 档只讲工作区规则；启用外部授权后额外说明 `external_*` 走绝对路径、先用 `access_policy_explain` 判断覆盖、用 `workspace_info` 列出已授权目录，并点明 Git 工具仅限工作区、仓库在工作区外时改用 `external_run_command`。
+- 修正两条会误导调用方的路径错误信息。`external_*` 会在授权根上新建一个受限 service，因此工作区 jail 的文案会原样出现在外部调用里，把「授权目录下没有这个文件」说成「Workspace path does not exist」，看起来像白名单失效。两条信息改为不再自称 workspace。
+
 ## [0.9.0] - 2026-08-31
 
 ### Added
