@@ -234,37 +234,43 @@ class JobManager:
 
     def cancel(self, job_id: str, reason: str = "") -> dict[str, Any]:
         record = self.get(job_id)
-        if record.done.is_set():
-            return {**record.status(), "already_finished": True}
-        record.cancel_requested = True
-        record.cancel_event.set()
-        if record.state == "queued":
-            record.state = "cancelled"
-            record.finished_at = time.time()
-            record.done.set()
-        status = record.status()
+        with self._lock:
+            if record.done.is_set():
+                return {**record.status(), "already_finished": True}
+            record.cancel_requested = True
+            record.cancel_event.set()
+            if record.state == "queued":
+                record.state = "cancelled"
+                record.finished_at = time.time()
+                record.done.set()
+            status = record.status()
         status["reason"] = (reason or "cancelled by caller")[:500]
         status["accepted"] = True
         return status
 
     def cancel_for_grant(self, grant_id: str, reason: str = "grant revoked") -> int:
         with self._lock:
-            records = [item for item in self._records.values() if item.metadata.get("grant_id") == grant_id]
-        count = 0
-        for record in records:
-            record.metadata["grant_revoked"] = True
-            if record.done.is_set():
-                # Do not expose a completed external result after its scope
-                # has been revoked.  The bytes may remain in memory only until
-                # this record is purged, but are never returned again.
+            records = [
+                item
+                for item in self._records.values()
+                if item.metadata.get("grant_id") == grant_id
+            ]
+            count = 0
+            for record in records:
+                was_finished = record.done.is_set()
+                record.metadata["grant_revoked"] = True
+                record.cancel_requested = True
+                record.cancel_event.set()
                 record.state = "expired"
                 record.result = None
+                record.exception = JobCancelled(reason)
                 record.error = reason
                 record.error_type = "GrantRevoked"
-                continue
-            if not record.done.is_set():
-                self.cancel(record.job_id, reason)
-                count += 1
+                if not was_finished:
+                    count += 1
+                if record.started_at is None:
+                    record.finished_at = time.time()
+                    record.done.set()
         return count
 
     def shutdown(self, *, wait_seconds: float = 2.0) -> None:
@@ -302,37 +308,61 @@ class JobManager:
             if record is None:
                 self._queue.task_done()
                 return
-            if record.done.is_set():
-                self._queue.task_done()
-                continue
-            record.state = "running"
-            record.started_at = time.time()
+            with self._lock:
+                if record.done.is_set():
+                    self._queue.task_done()
+                    continue
+                record.state = "running"
+                record.started_at = time.time()
             token = _CURRENT_CANCEL_EVENT.set(record.cancel_event)
             job_token = _CURRENT_JOB_ID.set(record.job_id)
             try:
-                record.result = record.runner(record.cancel_event)
-                if record.cancel_requested:
-                    record.result = None
-                    record.error = "Job cancelled"
-                    record.error_type = "JobCancelled"
-                    record.state = "cancelled"
-                else:
-                    record.state = "succeeded"
+                result = record.runner(record.cancel_event)
+                with self._lock:
+                    if record.metadata.get("grant_revoked"):
+                        record.result = None
+                        record.exception = JobCancelled(record.error or "Grant revoked")
+                        record.error = record.error or "Grant revoked"
+                        record.error_type = "GrantRevoked"
+                        record.state = "expired"
+                    elif record.cancel_requested:
+                        record.result = None
+                        record.error = "Job cancelled"
+                        record.error_type = "JobCancelled"
+                        record.state = "cancelled"
+                    else:
+                        record.result = result
+                        record.state = "succeeded"
             except JobCancelled as exc:
-                record.exception = exc
-                record.error = str(exc) or "Job cancelled"
-                record.error_type = type(exc).__name__
-                record.state = "cancelled"
+                with self._lock:
+                    if record.metadata.get("grant_revoked"):
+                        record.exception = JobCancelled(record.error or "Grant revoked")
+                        record.error = record.error or "Grant revoked"
+                        record.error_type = "GrantRevoked"
+                        record.state = "expired"
+                    else:
+                        record.exception = exc
+                        record.error = str(exc) or "Job cancelled"
+                        record.error_type = type(exc).__name__
+                        record.state = "cancelled"
             except Exception as exc:  # noqa: BLE001 - preserve failure for job_status
-                record.exception = exc
-                record.error = str(exc) or type(exc).__name__
-                record.error_type = type(exc).__name__
-                record.state = "cancelled" if record.cancel_requested else "failed"
+                with self._lock:
+                    if record.metadata.get("grant_revoked"):
+                        record.exception = JobCancelled(record.error or "Grant revoked")
+                        record.error = record.error or "Grant revoked"
+                        record.error_type = "GrantRevoked"
+                        record.state = "expired"
+                    else:
+                        record.exception = exc
+                        record.error = str(exc) or type(exc).__name__
+                        record.error_type = type(exc).__name__
+                        record.state = "cancelled" if record.cancel_requested else "failed"
             finally:
                 _CURRENT_CANCEL_EVENT.reset(token)
                 _CURRENT_JOB_ID.reset(job_token)
-                record.finished_at = time.time()
-                record.done.set()
+                with self._lock:
+                    record.finished_at = time.time()
+                    record.done.set()
                 self._queue.task_done()
 
     def _drop_locked(self, key: str) -> None:

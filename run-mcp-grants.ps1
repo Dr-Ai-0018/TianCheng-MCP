@@ -40,22 +40,7 @@ if (-not $workspace) {
         "There is deliberately no built-in default: the workspace is the security boundary.")
 }
 
-# Optional local fallback: load only the TOTP secret, never the whole .env file.
 $envPath = Join-Path $PSScriptRoot '.env'
-if (-not $env:TIANCHENG_TOTP_SECRET -and (Test-Path -LiteralPath $envPath -PathType Leaf)) {
-    foreach ($line in Get-Content -LiteralPath $envPath -Encoding UTF8) {
-        if ($line -match '^\s*TIANCHENG_TOTP_SECRET\s*=\s*(.*)\s*$') {
-            $value = $Matches[1]
-            if (($value.StartsWith('"') -and $value.EndsWith('"')) -or
-                ($value.StartsWith("'") -and $value.EndsWith("'"))) {
-                $value = $value.Substring(1, $value.Length - 2)
-            }
-            $env:TIANCHENG_TOTP_SECRET = $value
-            break
-        }
-    }
-}
-
 $allowlistPath = Join-Path $PSScriptRoot 'exec-env.allowlist'
 if (Test-Path -LiteralPath $allowlistPath -PathType Leaf) {
     $PassEnv += Get-Content -LiteralPath $allowlistPath -Encoding UTF8 |

@@ -521,61 +521,61 @@ def create_server(service: TianChengService) -> MCPServer:
     def external_list_dir(path: str = ".", depth: int = 1, grant_id: str | None = None) -> dict[str, Any]:
         if grant_id:
             return external_call("external_list_dir", grant_id, lambda: service.external_list_dir(grant_id, path, depth))
-        return call_label("external_list_dir", path, lambda: service.policy_external_list_dir(path, depth))
+        return call_label("external_list_dir", "<external-policy>", lambda: service.policy_external_list_dir(path, depth))
 
     @external_tool(description="Return metadata using grant_id, or an absolute path covered by a no-approval static policy rule.", annotations=READ_ONLY)
     def external_stat(path: str, grant_id: str | None = None) -> dict[str, Any]:
         if grant_id:
             return external_call("external_stat", grant_id, lambda: service.external_stat(grant_id, path))
-        return call_label("external_stat", path, lambda: service.policy_external_stat(path))
+        return call_label("external_stat", "<external-policy>", lambda: service.policy_external_stat(path))
 
     @external_tool(description="Read UTF-8 text using grant_id, or an absolute path covered by a no-approval static policy rule.", annotations=READ_ONLY)
     def external_read_text(path: str, start_line: int | None = None, end_line: int | None = None, max_bytes: int = 262144, grant_id: str | None = None) -> dict[str, Any]:
         if grant_id:
             return external_call("external_read_text", grant_id, lambda: service.external_read_text(grant_id, path, start_line, end_line, max_bytes))
-        return call_label("external_read_text", path, lambda: service.policy_external_read_text(path, start_line, end_line, max_bytes))
+        return call_label("external_read_text", "<external-policy>", lambda: service.policy_external_read_text(path, start_line, end_line, max_bytes))
 
     @external_tool(description="Read a source-byte chunk using grant_id, or an absolute path covered by a no-approval static policy rule.", annotations=READ_ONLY)
     def external_read_text_chunk(path: str, offset_bytes: int = 0, max_bytes: int = 262144, grant_id: str | None = None) -> dict[str, Any]:
         if grant_id:
             return external_call("external_read_text_chunk", grant_id, lambda: service.external_read_text_chunk(grant_id, path, offset_bytes, max_bytes))
-        return call_label("external_read_text_chunk", path, lambda: service.policy_external_read_text_chunk(path, offset_bytes, max_bytes))
+        return call_label("external_read_text_chunk", "<external-policy>", lambda: service.policy_external_read_text_chunk(path, offset_bytes, max_bytes))
 
     @external_tool(description="Create or replace UTF-8 text using grant_id, or an absolute path covered by a no-approval writable static policy rule.", annotations=WRITE_IDEMPOTENT)
     def external_write_text(path: str, content: str, create_parents: bool = True, expected_sha256: str | None = None, grant_id: str | None = None, idempotency_key: str | None = None) -> dict[str, Any]:
         if grant_id:
             return external_call("external_write_text", grant_id, lambda: service.external_write_text(grant_id, path, content, create_parents, expected_sha256), idempotency_key=idempotency_key, fingerprint_payload=[grant_id, path, content, create_parents, expected_sha256])
-        return call_label("external_write_text", path, lambda: service.policy_external_write_text(path, content, create_parents, expected_sha256), idempotency_key=idempotency_key, idempotency_fingerprint=side_effect_fingerprint("external_write_text", [path, content, create_parents, expected_sha256]))
+        return call_label("external_write_text", "<external-policy>", lambda: service.policy_external_write_text(path, content, create_parents, expected_sha256), idempotency_key=idempotency_key, idempotency_fingerprint=side_effect_fingerprint("external_write_text", [path, content, create_parents, expected_sha256]))
 
     @external_tool(description="Append UTF-8 text using grant_id, or an absolute path covered by a no-approval writable static policy rule.", annotations=WRITE)
     def external_append_text(path: str, content: str, create_parents: bool = True, expected_sha256: str | None = None, grant_id: str | None = None, idempotency_key: str | None = None) -> dict[str, Any]:
         if grant_id:
             return external_call("external_append_text", grant_id, lambda: service.external_append_text(grant_id, path, content, create_parents, expected_sha256), idempotency_key=idempotency_key, fingerprint_payload=[grant_id, path, content, create_parents, expected_sha256])
-        return call_label("external_append_text", path, lambda: service.policy_external_append_text(path, content, create_parents, expected_sha256), idempotency_key=idempotency_key, idempotency_fingerprint=side_effect_fingerprint("external_append_text", [path, content, create_parents, expected_sha256]))
+        return call_label("external_append_text", "<external-policy>", lambda: service.policy_external_append_text(path, content, create_parents, expected_sha256), idempotency_key=idempotency_key, idempotency_fingerprint=side_effect_fingerprint("external_append_text", [path, content, create_parents, expected_sha256]))
 
     @external_tool(description="Create a directory using grant_id, or an absolute path covered by a no-approval writable static policy rule.", annotations=WRITE_IDEMPOTENT)
     def external_mkdir(path: str, parents: bool = True, exist_ok: bool = True, grant_id: str | None = None, idempotency_key: str | None = None) -> dict[str, Any]:
         if grant_id:
             return external_call("external_mkdir", grant_id, lambda: service.external_mkdir(grant_id, path, parents, exist_ok), idempotency_key=idempotency_key, fingerprint_payload=[grant_id, path, parents, exist_ok])
-        return call_label("external_mkdir", path, lambda: service.policy_external_mkdir(path, parents, exist_ok), idempotency_key=idempotency_key, idempotency_fingerprint=side_effect_fingerprint("external_mkdir", [path, parents, exist_ok]))
+        return call_label("external_mkdir", "<external-policy>", lambda: service.policy_external_mkdir(path, parents, exist_ok), idempotency_key=idempotency_key, idempotency_fingerprint=side_effect_fingerprint("external_mkdir", [path, parents, exist_ok]))
 
     @external_tool(description="Move or rename using grant_id, or absolute paths covered by one no-approval writable static policy rule; never overwrites.", annotations=WRITE)
     def external_move(source: str, destination: str, grant_id: str | None = None, idempotency_key: str | None = None) -> dict[str, Any]:
         if grant_id:
             return external_call("external_move", grant_id, lambda: service.external_move(grant_id, source, destination), idempotency_key=idempotency_key, fingerprint_payload=[grant_id, source, destination])
-        return call_label("external_move", f"{source} -> {destination}", lambda: service.policy_external_move(source, destination), idempotency_key=idempotency_key, idempotency_fingerprint=side_effect_fingerprint("external_move", [source, destination]))
+        return call_label("external_move", "<external-policy>", lambda: service.policy_external_move(source, destination), idempotency_key=idempotency_key, idempotency_fingerprint=side_effect_fingerprint("external_move", [source, destination]))
 
     @external_tool(description="Copy using grant_id, or absolute paths covered by one no-approval writable static policy rule; never overwrites.", annotations=WRITE)
     def external_copy(source: str, destination: str, grant_id: str | None = None, idempotency_key: str | None = None) -> dict[str, Any]:
         if grant_id:
             return external_call("external_copy", grant_id, lambda: service.external_copy(grant_id, source, destination), idempotency_key=idempotency_key, fingerprint_payload=[grant_id, source, destination])
-        return call_label("external_copy", f"{source} -> {destination}", lambda: service.policy_external_copy(source, destination), idempotency_key=idempotency_key, idempotency_fingerprint=side_effect_fingerprint("external_copy", [source, destination]))
+        return call_label("external_copy", "<external-policy>", lambda: service.policy_external_copy(source, destination), idempotency_key=idempotency_key, idempotency_fingerprint=side_effect_fingerprint("external_copy", [source, destination]))
 
     @external_tool(description="Move an item to trash using grant_id, or an absolute path covered by a no-approval writable static policy rule.", annotations=DESTRUCTIVE)
     def external_delete(path: str, grant_id: str | None = None, idempotency_key: str | None = None) -> dict[str, Any]:
         if grant_id:
             return external_call("external_delete", grant_id, lambda: service.external_delete(grant_id, path), idempotency_key=idempotency_key, fingerprint_payload=[grant_id, path])
-        return call_label("external_delete", path, lambda: service.policy_external_delete(path), idempotency_key=idempotency_key, idempotency_fingerprint=side_effect_fingerprint("external_delete", [path]))
+        return call_label("external_delete", "<external-policy>", lambda: service.policy_external_delete(path), idempotency_key=idempotency_key, idempotency_fingerprint=side_effect_fingerprint("external_delete", [path]))
 
     @external_tool(description="Find paths using grant_id, or an absolute base_path covered by a no-approval static policy rule.", annotations=READ_ONLY)
     def external_glob(
@@ -583,7 +583,7 @@ def create_server(service: TianChengService) -> MCPServer:
     ) -> dict[str, Any]:
         if grant_id:
             return external_call("external_glob", grant_id, lambda: service.external_glob(grant_id, pattern, max_results, base_path))
-        return call_label("external_glob", base_path, lambda: service.policy_external_glob(pattern, max_results, base_path))
+        return call_label("external_glob", "<external-policy>", lambda: service.policy_external_glob(pattern, max_results, base_path))
 
     @external_tool(description="Search text using grant_id, or an absolute base_path covered by a no-approval static policy rule.", annotations=READ_ONLY)
     def external_search_text(
@@ -599,7 +599,7 @@ def create_server(service: TianChengService) -> MCPServer:
     ) -> dict[str, Any]:
         if grant_id:
             return external_call("external_search_text", grant_id, lambda: service.external_search_text(grant_id, query, glob_pattern, case_sensitive, max_results, max_scan_bytes, include_hidden, timeout_seconds, base_path))
-        return call_label("external_search_text", base_path, lambda: service.policy_external_search_text(query, glob_pattern, case_sensitive, max_results, max_scan_bytes, include_hidden, timeout_seconds, base_path))
+        return call_label("external_search_text", "<external-policy>", lambda: service.policy_external_search_text(query, glob_pattern, case_sensitive, max_results, max_scan_bytes, include_hidden, timeout_seconds, base_path))
 
     if service.external_grants.enabled:
 
@@ -618,7 +618,7 @@ def create_server(service: TianChengService) -> MCPServer:
         ) -> dict[str, Any]:
             if grant_id:
                 return external_call("external_run_command", grant_id, lambda: service.external_run_command(grant_id, command, args, cwd, timeout_seconds, max_output_bytes), idempotency_key=idempotency_key, fingerprint_payload=[grant_id, command, args or [], cwd, timeout_seconds, max_output_bytes])
-            return call_label("external_run_command", cwd, lambda: service.policy_external_run_command(command, args, cwd, timeout_seconds, max_output_bytes), idempotency_key=idempotency_key, idempotency_fingerprint=side_effect_fingerprint("external_run_command", [command, args or [], cwd, timeout_seconds, max_output_bytes]))
+            return call_label("external_run_command", "<external-policy>", lambda: service.policy_external_run_command(command, args, cwd, timeout_seconds, max_output_bytes), idempotency_key=idempotency_key, idempotency_fingerprint=side_effect_fingerprint("external_run_command", [command, args or [], cwd, timeout_seconds, max_output_bytes]))
 
     @mcp.tool(
         description="List a workspace-relative directory with bounded recursive depth (1-5).",

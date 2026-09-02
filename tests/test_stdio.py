@@ -420,8 +420,40 @@ async def test_static_policy_external_tools_accept_absolute_paths(
         read = _structured(
             await client.call_tool("external_read_text", {"path": str(external / "直接.txt")})
         )
+        _structured(
+            await client.call_tool(
+                "external_copy",
+                {
+                    "source": str(external / "直接.txt"),
+                    "destination": str(external / "副本.txt"),
+                },
+            )
+        )
+        _structured(
+            await client.call_tool(
+                "external_move",
+                {
+                    "source": str(external / "副本.txt"),
+                    "destination": str(external / "移动.txt"),
+                },
+            )
+        )
         assert written["path"] == "直接.txt"
         assert read["content"] == "白名单"
+    audit_events = [
+        json.loads(line)
+        for line in (tmp_path / "policy-audit" / "tiancheng-mcp-audit.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    external_events = [event for event in audit_events if event["tool"].startswith("external_")]
+    assert {event["tool"] for event in external_events} >= {
+        "external_write_text",
+        "external_read_text",
+        "external_copy",
+        "external_move",
+    }
+    assert {event["relative_path"] for event in external_events} == {"<external-policy>"}
 
 
 @pytest.mark.asyncio

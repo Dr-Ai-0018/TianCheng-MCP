@@ -7,12 +7,9 @@ challenge plus an explicit user-confirmation phrase.
 
 from __future__ import annotations
 
-import base64
-import hashlib
 import hmac
 import os
 import secrets
-import struct
 import threading
 import time
 import uuid
@@ -89,17 +86,6 @@ def _canonical_directory(raw: str, workspace_root: Path) -> Path:
     return canonical
 
 
-def _totp(secret: str, timestep: int) -> str:
-    try:
-        key = base64.b32decode(secret.strip().upper().replace(" ", ""), casefold=True)
-    except Exception as exc:
-        raise ValueError("TOTP secret is not valid base32") from exc
-    digest = hmac.new(key, struct.pack(">Q", timestep), hashlib.sha1).digest()
-    offset = digest[-1] & 0x0F
-    value = struct.unpack(">I", digest[offset : offset + 4])[0] & 0x7FFFFFFF
-    return f"{value % 1_000_000:06d}"
-
-
 @dataclass(frozen=True)
 class PendingGrant:
     request_id: str
@@ -132,19 +118,18 @@ class ExternalGrantManager:
         totp_secret: str | None = None,
         access_policy: AccessPolicy | None = None,
     ) -> None:
+        # Compatibility-only input for 0.9 callers. The old value was never
+        # validated by approve(), so retaining it as security state would be
+        # misleading. It is deliberately ignored and can be removed in 1.0.
+        del totp_secret
         self.workspace_root = workspace_root.resolve(strict=True)
         self.enabled = enabled
         self.access_policy = access_policy
-        self._secret = totp_secret or os.environ.get("TIANCHENG_TOTP_SECRET")
         self._pending: dict[str, PendingGrant] = {}
         self._active: dict[str, ExternalGrant] = {}
         self._attempts: dict[str, int] = {}
         self._expired_ids: set[str] = set()
         self._lock = threading.RLock()
-
-    @property
-    def configured(self) -> bool:
-        return bool(self._secret)
 
     def _require_enabled(self) -> None:
         if not self.enabled:
@@ -228,7 +213,7 @@ class ExternalGrantManager:
             if attempts > 5:
                 self._pending.pop(request_id, None)
                 self._attempts.pop(request_id, None)
-                raise PermissionError("Too many TOTP attempts; request cancelled")
+                raise PermissionError("Too many approval attempts; request cancelled")
             if not hmac.compare_digest(challenge, pending.challenge):
                 raise PermissionError("Invalid or mismatched approval challenge")
             grant_id = secrets.token_urlsafe(18)
@@ -258,7 +243,8 @@ class ExternalGrantManager:
             self._purge_expired_locked(time.time())
             return {
                 "enabled": self.enabled,
-                "totp_configured": self.configured,
+                "approval_mode": "conversation_challenge",
+                "totp_configured": False,
                 "pending": [self._pending_payload(item) for item in self._pending.values()],
                 "active": [self._grant_payload(item) for item in self._active.values()],
             }

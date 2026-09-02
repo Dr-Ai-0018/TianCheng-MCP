@@ -506,7 +506,7 @@ function Configure-ProfileInteractive {
     }
     if ($externalGrants) {
         Assert-FileExists -Path ([string]$Config.mcpGrantsScript) -Label 'External grants MCP startup script'
-        Write-Warning '聊天外部授权会允许 ChatGPT 在临时 TOTP 授权后访问工作区之外的目录。'
+        Write-Warning '聊天外部授权会允许 ChatGPT 在用户明确确认一次性 challenge 后访问工作区之外的目录。'
     }
     $openUi = (Read-Host 'Tunnel 启动时自动打开管理 UI？y/N') -match '^(?i)y(?:es)?$'
     $exists = Test-ProfileExists -Config $Config -Name $name
@@ -1536,7 +1536,7 @@ function Show-ProfileMenu {
         Write-Host '  3. 使用 tunnel-client 编辑 Profile'
         Write-Host '  4. 一键切换当前 Profile 为 SAFE'
         Write-Host '  5. 一键切换当前 Profile 为 DEV（工作区命令 + 远程 Git）'
-        Write-Host '  6. 启用聊天外部授权（TOTP）'
+        Write-Host '  6. 启用聊天外部授权（一次性 challenge）'
         Write-Host '  7. 启用聊天外部授权 + Exec（外部命令也可用）'
         Write-Host '  8. 开启策略热重载（高危：批准后可当场扩大白名单，无需重启）'
         Write-Host '  9. 关闭策略热重载（回到冷重载：改白名单必须重启）'
@@ -1606,12 +1606,7 @@ function Install-Alias {
 }
 
 function Setup-Totp {
-    $python = Join-Path $script:ProjectRoot '.venv\Scripts\python.exe'
-    Assert-FileExists -Path $python -Label 'Python environment'
-    $setup = Join-Path $script:ProjectRoot 'scripts\setup_totp.py'
-    Assert-FileExists -Path $setup -Label 'TOTP setup script'
-    & $python $setup
-    if ($LASTEXITCODE -ne 0) { throw "TOTP setup failed with exit code $LASTEXITCODE." }
+    throw 'TOTP setup was removed in 0.9.1 because the approval flow never validated it. Use the one-time chat challenge flow; do not send a second factor through the model/MCP channel.'
 }
 
 function Show-MainMenu {
@@ -1649,7 +1644,6 @@ function Show-MainMenu {
         Write-Host '  9. 打开 Tunnel 管理 UI'
         Write-Host '  A. 启动器设置'
         Write-Host '  B. 安装/修复 tc 快捷命令'
-        Write-Host '  C. TOTP 二维码初始化'
         Write-Host '  D. 外部路径白名单 / 访问策略'
         Write-Host '  E. 本地 Agent / 会话源管理'
         Write-Host '  0. 退出'
@@ -1666,7 +1660,6 @@ function Show-MainMenu {
                 '9' { Open-AdminUi -Config $config; Pause-Tq }
                 { $_ -match '^(?i)a$' } { Edit-SettingsInteractive -Config $config; Pause-Tq }
                 { $_ -match '^(?i)b$' } { Install-Alias; Pause-Tq }
-                { $_ -match '^(?i)c$' } { Setup-Totp; Pause-Tq }
                 { $_ -match '^(?i)d$' } { Show-AccessPolicyMenu }
                 { $_ -match '^(?i)e$' } { Show-AgentSourceMenu -Config $config }
                 '0' { return }

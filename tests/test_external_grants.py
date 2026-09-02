@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import base64
 import json
 from pathlib import Path
 
@@ -10,9 +9,6 @@ from tiancheng_mcp.jobs import JobCancelled
 from tiancheng_mcp.service import TianChengService
 
 
-SECRET = base64.b32encode(b"tiancheng-test-secret-123").decode()
-
-
 def test_chat_approved_external_grant_read_write_and_revoke(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     external = tmp_path / "external"
@@ -20,7 +16,7 @@ def test_chat_approved_external_grant_read_write_and_revoke(tmp_path: Path) -> N
     (external / "中文.txt").write_text("hello", encoding="utf-8")
     (external / "nested").mkdir()
     (external / "nested" / "note.md").write_text("needle", encoding="utf-8")
-    service = TianChengService(workspace, tmp_path / "audit", allow_external_grants=True, totp_secret=SECRET)
+    service = TianChengService(workspace, tmp_path / "audit", allow_external_grants=True)
 
     pending = service.request_external_access(str(external), "write", 600, "test")
     assert pending["status"] == "pending"
@@ -44,7 +40,7 @@ def test_external_grant_rejects_escape_and_replay(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     external = tmp_path / "external"
     external.mkdir()
-    service = TianChengService(workspace, tmp_path / "audit", allow_external_grants=True, totp_secret=SECRET)
+    service = TianChengService(workspace, tmp_path / "audit", allow_external_grants=True)
     pending = service.request_external_access(str(external), "read")
     request_id = str(pending["request_id"])
     with pytest.raises(PermissionError):
@@ -62,6 +58,18 @@ def test_external_grants_disabled_by_default(tmp_path: Path) -> None:
     service = TianChengService(tmp_path / "workspace", tmp_path / "audit")
     with pytest.raises(PermissionError):
         service.request_external_access(str(tmp_path), "read")
+
+
+def test_legacy_totp_input_is_ignored_and_reported_unconfigured(tmp_path: Path) -> None:
+    service = TianChengService(
+        tmp_path / "workspace",
+        tmp_path / "audit",
+        allow_external_grants=True,
+        totp_secret="legacy-value-that-must-not-be-security-state",
+    )
+    status = service.external_grant_status()
+    assert status["approval_mode"] == "conversation_challenge"
+    assert status["totp_configured"] is False
 
 
 def test_static_policy_can_issue_no_approval_external_grant(tmp_path: Path) -> None:
@@ -196,11 +204,13 @@ def test_static_policy_move_rejects_cross_rule_with_explanation(tmp_path: Path) 
 def test_pending_request_can_be_cancelled(tmp_path: Path) -> None:
     external = tmp_path / "external"
     external.mkdir()
-    service = TianChengService(tmp_path / "workspace", tmp_path / "audit", allow_external_grants=True, totp_secret=SECRET)
+    service = TianChengService(tmp_path / "workspace", tmp_path / "audit", allow_external_grants=True)
     pending = service.request_external_access(str(external), "read")
     cancelled = service.cancel_external_access_request(str(pending["request_id"]))
     assert cancelled["cancelled"] is True
-    assert service.external_grant_status()["pending"] == []
+    status = service.external_grant_status()
+    assert status["approval_mode"] == "conversation_challenge"
+    assert status["pending"] == []
 
 
 def test_revoke_external_grant_cancels_associated_job(tmp_path: Path) -> None:
@@ -210,7 +220,6 @@ def test_revoke_external_grant_cancels_associated_job(tmp_path: Path) -> None:
         tmp_path / "workspace",
         tmp_path / "audit",
         allow_external_grants=True,
-        totp_secret=SECRET,
         interactive_timeout_seconds=1,
     )
     try:
@@ -239,7 +248,7 @@ def test_revoke_external_grant_cancels_associated_job(tmp_path: Path) -> None:
         job_id = str(response["job_id"])
         assert service.jobs is not None
         assert service.jobs.get(job_id).done.wait(2)
-        assert service.job_status(job_id)["state"] == "cancelled"
+        assert service.job_status(job_id)["state"] == "expired"
     finally:
         service.shutdown()
 
@@ -251,7 +260,6 @@ def test_revoke_external_grant_hides_completed_job_result(tmp_path: Path) -> Non
         tmp_path / "workspace",
         tmp_path / "audit",
         allow_external_grants=True,
-        totp_secret=SECRET,
     )
     try:
         pending = service.request_external_access(str(external), "read")
@@ -280,7 +288,6 @@ def test_expired_external_grant_cancels_running_job(tmp_path: Path) -> None:
         tmp_path / "workspace",
         tmp_path / "audit",
         allow_external_grants=True,
-        totp_secret=SECRET,
         interactive_timeout_seconds=1,
     )
     try:
@@ -304,7 +311,7 @@ def test_expired_external_grant_cancels_running_job(tmp_path: Path) -> None:
         job_id = str(response["job_id"])
         assert service.jobs is not None
         assert service.jobs.get(job_id).done.wait(4)
-        assert service.job_status(job_id)["state"] == "cancelled"
+        assert service.job_status(job_id)["state"] == "expired"
         with pytest.raises(PermissionError):
             service.external_stat(grant_id, ".")
     finally:

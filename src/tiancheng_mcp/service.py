@@ -729,7 +729,7 @@ class TianChengService:
         try:
             result = operation()
         except Exception as exc:
-            self.audit.record(
+            self._record_audit_safely(
                 tool=tool,
                 relative_path=relative_path,
                 success=False,
@@ -740,7 +740,7 @@ class TianChengService:
             )
             raise
         output_truncated = result.get("output_truncated") if isinstance(result, dict) else None
-        self.audit.record(
+        self._record_audit_safely(
             tool=tool,
             relative_path=relative_path,
             success=True,
@@ -750,6 +750,18 @@ class TianChengService:
             output_truncated=output_truncated if isinstance(output_truncated, bool) else None,
         )
         return result
+
+    def _record_audit_safely(self, **event: Any) -> None:
+        """Keep audit I/O failures from changing the tool's business result."""
+
+        try:
+            self.audit.record(**event)
+        except Exception as exc:  # noqa: BLE001 - audit failures are deliberately isolated
+            print(
+                f"WARNING: audit record failed ({type(exc).__name__})",
+                file=sys.stderr,
+                flush=True,
+            )
 
     def run_with_fallback(
         self,

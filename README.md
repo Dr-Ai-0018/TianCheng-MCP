@@ -7,7 +7,7 @@
 工作区没有内置默认值，必须由你显式配置——它就是这个项目的安全边界，猜错的代价是
 把错误的目录暴露出去。
 
-当前版本：`0.9.0`。依赖锁定到官方维护的 MCP Python SDK `2.1.0`，使用当前
+当前版本：`0.9.1`。依赖锁定到官方维护的 MCP Python SDK `2.1.0`，使用当前
 `MCPServer`、`MCPServer.tool()`、`ToolAnnotations` 与 stdio transport API。
 
 - MCP Python SDK：<https://github.com/modelcontextprotocol/python-sdk/tree/v2.1.0>
@@ -70,13 +70,14 @@ destructive，`run_command` 同时标为 destructive/open-world。
 默认仍严格限制在 `<YOUR_WORKSPACE_PATH>`。使用 `run-mcp-grants.ps1`（或命令行参数
 `--allow-external-grants`）后，ChatGPT 才能申请临时外部目录能力：先调用
 `request_external_access`，让用户在聊天中明确确认后，再提交 `request_id + challenge + confirmation="批准"`
-给 `approve_external_access`。challenge 是一次性随机值，不是密码，也不是 TOTP 密钥。
+给 `approve_external_access`。challenge 是一次性随机值，不是密码；当前版本没有 TOTP 验证步骤，
+也不要在同一个模型/MCP 通道中传递任何第二因子。
 授权只存在当前 MCP 进程内存，最多 10 分钟；`external_grant_status` 可查看状态，
 `revoke_external_access` 可由 ChatGPT 主动立即撤销，`cancel_external_access_request`
 可取消尚未批准的请求。MCP/Tunnel 重启后全部失效。
 
-旧版 TOTP 初始化工具仍可用于本机保管第二因子，但聊天授权流程不要求把 TOTP 传给 MCP。
-不要把验证码或密钥写进普通文件、提交到 Git，或粘贴到其他日志。
+若未来引入第二因子，审批必须走模型与 MCP 均无法读取的独立通道；当前聊天 challenge
+只用于把用户的明确确认绑定到一次待审批请求，不构成独立的身份验证因子。
 外部 grant 的读写、删除和 exec 权限彼此独立；`external_run_command` 仍是开放世界
 能力，路径 jail 不等于 Windows OS sandbox。
 
@@ -261,20 +262,6 @@ uv run python .\scripts\smoke_stdio.py
 .\install-tc.ps1
 ```
 
-如果你仍想额外配置本机 TOTP（聊天 challenge 流程并不要求），可以运行二维码初始化：
-
-```powershell
-tc -Action totp-setup
-```
-
-上面的命令会在本机打开二维码；用 2FA 软件扫描后输入一次 6 位验证码，验证成功
-才会把密钥写入项目 `.env`。二维码默认会在验证成功后删除。当前聊天授权使用
-的是 MCP 返回的一次性 challenge，不需要把 TOTP 作为工具参数传递。也可以直接执行：
-
-```powershell
-pwsh -NoLogo -NoProfile -File .\tc.ps1 -Action totp-setup
-```
-
 重开 PowerShell 后直接输入：
 
 ```powershell
@@ -289,7 +276,7 @@ tc
 - 当前进程、Windows 用户环境变量和项目 `.env` 三种密钥方式；
 - 从真实 profile YAML 的 `mcp.commands[].command` 判断 SAFE/DEV，不再依赖易漂移的名单；
 - 一键切换 SAFE/DEV、显示实际运行中的 profile、停止/重启 Tunnel；
-- Profile 管理中可直接切换“聊天外部授权（TOTP）”或“外部授权 + Exec”，无需手动编辑 YAML；
+- Profile 管理中可直接切换“聊天外部授权（一次性 challenge）”或“外部授权 + Exec”，无需手动编辑 YAML；
 - 状态检查同时显示 Git、GCM、`gh` 可用/登录布尔状态，不输出账号 token；
 - 管理 UI、非敏感启动器设置和显式 Dev profile；
 - “E. 本地 Agent / 会话源管理”可探测 Codex/Claude CLI 与固定历史根，并由用户显式添加、启停、删除、验证、刷新或重建 metadata Catalog；
@@ -654,7 +641,6 @@ scripts/
   smoke_exec_stdio.py
   smoke_jobs.py
   policy_explain.py
-  setup_totp.py
   accept_agent_stdio.py
   accept_policy_hotreload.py
 ```

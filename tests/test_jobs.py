@@ -64,6 +64,41 @@ def test_job_cancel_cooperative_runner() -> None:
         manager.shutdown()
 
 
+def test_grant_revoke_cannot_race_with_successful_job_completion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = JobManager(workers=1)
+    started = threading.Event()
+    release = threading.Event()
+    try:
+        def runner(_cancel):
+            started.set()
+            assert release.wait(2)
+            return {"payload": "must-not-survive-revoke"}
+
+        record = manager.submit("external", runner, metadata={"grant_id": "grant-1"})
+        assert started.wait(2)
+        original_cancel = manager.cancel
+
+        def racing_cancel(job_id: str, reason: str = ""):
+            release.set()
+            assert record.done.wait(2)
+            return original_cancel(job_id, reason)
+
+        monkeypatch.setattr(manager, "cancel", racing_cancel)
+        assert manager.cancel_for_grant("grant-1") == 1
+        release.set()
+        assert record.done.wait(2)
+        result = manager.result(record.job_id)
+        assert result["state"] == "expired"
+        assert result["error_type"] == "GrantRevoked"
+        assert "result" not in result
+        assert isinstance(record.exception, JobCancelled)
+    finally:
+        release.set()
+        manager.shutdown()
+
+
 def test_job_runner_receives_context_cancellation_token() -> None:
     manager = JobManager(workers=1)
     try:

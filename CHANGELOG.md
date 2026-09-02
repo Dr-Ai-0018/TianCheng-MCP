@@ -8,10 +8,21 @@
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-09-01
+
 ### Fixed
 
+- 修复 Agent 事件脱敏对裸 `sk-...` 令牌保留原文的问题，并覆盖 OpenAI、GitHub、GitLab、Slack 和通用键值凭据形态。
+- 修复外部 grant 撤销与后台 job 完成同时发生时，已撤销结果可能重新变为可读取的竞态；撤销标记与 worker 终态提交现在原子串行化。
+- 审计日志写入失败不再把已经完成的副作用伪装成工具失败，也不会覆盖原始业务异常；只向 stderr 输出不含路径或异常正文的告警。
+- 静态白名单 `external_*` 调用的审计标签统一为 `<external-policy>`，不再记录机器绝对路径，包含 move/copy 的双路径操作。
 - 修正服务器 instructions：原来固定声明「所有路径都是工作区相对路径，绝对路径一律拒绝」，在 GRANTS 档下与 14 个只接受绝对路径的 `external_*` 工具直接冲突，会把调用方一路推向错误的工具。现在按实际注册的工具集生成说明：SAFE 档只讲工作区规则；启用外部授权后额外说明 `external_*` 走绝对路径、先用 `access_policy_explain` 判断覆盖、用 `workspace_info` 列出已授权目录，并点明 Git 工具仅限工作区、仓库在工作区外时改用 `external_run_command`。
 - 修正两条会误导调用方的路径错误信息。`external_*` 会在授权根上新建一个受限 service，因此工作区 jail 的文案会原样出现在外部调用里，把「授权目录下没有这个文件」说成「Workspace path does not exist」，看起来像白名单失效。两条信息改为不再自称 workspace。
+
+### Changed
+
+- 移除从未接入审批校验的 TOTP 二维码脚本、环境变量加载和 `qrcode` 运行依赖；旧构造参数与 `tc -Action totp-setup` 保留兼容入口，但前者被明确忽略、后者返回迁移说明。聊天授权继续使用一次性 challenge 与明确确认，不把同通道值冒充独立第二因子。
+- 新增 Windows GitHub Actions 测试矩阵，覆盖 Python 3.12/3.13、冻结锁文件、全量 pytest 与 wheel/sdist 构建。
 
 ## [0.9.0] - 2026-08-31
 

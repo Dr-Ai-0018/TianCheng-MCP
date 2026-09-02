@@ -424,6 +424,24 @@ def test_event_parser_redacts_secrets_and_bounds_data() -> None:
     assert "super-secret-value" not in str(event.data)
 
 
+@pytest.mark.parametrize(
+    "secret",
+    [
+        "sk-example1234567890",
+        "github_pat_example1234567890",
+        "ghp_example1234567890",
+        "gho_example1234567890",
+        "glpat-example1234567890",
+        "xoxb-example-1234567890",
+    ],
+)
+def test_agent_redaction_removes_bare_provider_tokens(secret: str) -> None:
+    redacted, clipped = redact_text(f"provider error: {secret}")
+    assert secret not in redacted
+    assert redacted == "provider error: <redacted>"
+    assert clipped is False
+
+
 def test_agent_session_is_workspace_bound_and_closable(workspace, tmp_path) -> None:
     service = TianChengService(workspace, tmp_path / "audit", allow_exec=True)
     if not service.agent_profiles.names():

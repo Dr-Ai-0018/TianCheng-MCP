@@ -45,9 +45,16 @@ def _codex_profile_override() -> str:
         )
     return raw
 _SECRET_PATTERNS = (
-    re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._~-]+"),
-    re.compile(r"(?i)(sk-[A-Za-z0-9_-]{8,})"),
-    re.compile(r"(?i)((?:token|key|secret|password)\s*[=:]\s*)[^\s,;]+"),
+    (re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._~-]+"), r"\1<redacted>"),
+    (
+        re.compile(r"(?i)((?:token|key|secret|password)\s*[=:]\s*)[^\s,;]+"),
+        r"\1<redacted>",
+    ),
+    (re.compile(r"(?i)sk-[A-Za-z0-9_-]{8,}"), "<redacted>"),
+    (re.compile(r"(?i)github_pat_[A-Za-z0-9_]{8,}"), "<redacted>"),
+    (re.compile(r"(?i)gh[pousr]_[A-Za-z0-9]{8,}"), "<redacted>"),
+    (re.compile(r"(?i)glpat-[A-Za-z0-9_-]{8,}"), "<redacted>"),
+    (re.compile(r"(?i)xox[baprs]-[A-Za-z0-9-]{8,}"), "<redacted>"),
 )
 
 
@@ -62,11 +69,8 @@ def _bounded_text(value: object, maximum: int) -> tuple[str, bool]:
 
 def redact_text(value: object, maximum: int = MAX_EVENT_SUMMARY_BYTES) -> tuple[str, bool]:
     text = value if isinstance(value, str) else str(value)
-    for pattern in _SECRET_PATTERNS:
-        text = pattern.sub(
-            lambda match: f"{match.group(1) if match.lastindex else ''}<redacted>",
-            text,
-        )
+    for pattern, replacement in _SECRET_PATTERNS:
+        text = pattern.sub(replacement, text)
     return _bounded_text(text, maximum)
 
 
