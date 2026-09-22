@@ -8,44 +8,34 @@ from pathlib import Path
 
 import pytest
 
+from scripts.local_runtime import launcher_config, powershell_path
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-POWERSHELL = Path(shutil.which("pwsh") or "pwsh")
-
-pytestmark = pytest.mark.skipif(
-    shutil.which("pwsh") is None, reason="PowerShell 7 (pwsh) is unavailable"
+POWERSHELL = Path(powershell_path(PROJECT_ROOT))
+_LOCAL_CONFIG = launcher_config(PROJECT_ROOT)
+_CONFIGURED_TUNNEL = _LOCAL_CONFIG.get("tunnelClient")
+REAL_TUNNEL_CLIENT = (
+    str(_CONFIGURED_TUNNEL)
+    if isinstance(_CONFIGURED_TUNNEL, str)
+    and _CONFIGURED_TUNNEL
+    and Path(_CONFIGURED_TUNNEL).is_file()
+    else shutil.which("tunnel-client")
 )
-
-# Some launcher paths only exercise the config surface, so a stub is enough.
-# The ones that make the tunnel actually write a profile need the real binary,
-# and skip rather than pretend when it is not installed.
-REAL_TUNNEL_CLIENT = shutil.which("tunnel-client")
 requires_tunnel_client = pytest.mark.skipif(
     REAL_TUNNEL_CLIENT is None,
-    reason="tunnel-client is not on PATH; profile creation cannot be exercised",
+    reason="tunnel-client is unavailable; profile creation cannot be exercised",
 )
 
 
 def fake_tunnel_client(directory: Path) -> Path:
-    """Create a stand-in tunnel-client for launcher fixtures.
-
-    These tests drive the launcher, not the tunnel, so the stub only has to
-    answer "profiles list" with an empty list. Requiring the real binary would
-    tie the suite to one machine's install.
-    """
-
     if REAL_TUNNEL_CLIENT:
         return Path(REAL_TUNNEL_CLIENT)
     path = directory / "tunnel-client.cmd"
-    script = "\r\n".join(
-        (
-            "@echo off",
-            "if \"%~1\"==\"profiles\" (echo [])",
-            "exit /b 0",
-            "",
-        )
+    path.write_text(
+        '@echo off\r\nif "%~1"=="profiles" (echo [])\r\nexit /b 0\r\n',
+        encoding="ascii",
     )
-    path.write_text(script, encoding="ascii")
     return path
 
 
@@ -81,11 +71,9 @@ def run_powershell(
     )
 
 
-def write_test_config(
-    path: Path, *, env_file: Path, profile_dir: Path, workspace: Path | None = None
-) -> None:
-    workspace = workspace if workspace is not None else path.parent / "workspace"
-    workspace.mkdir(parents=True, exist_ok=True)
+def write_test_config(path: Path, *, env_file: Path, profile_dir: Path) -> None:
+    workspace = path.parent / "workspace"
+    workspace.mkdir(exist_ok=True)
     tunnel_client = fake_tunnel_client(path.parent)
     path.write_text(
         json.dumps(
@@ -94,11 +82,9 @@ def write_test_config(
                 "profileDir": str(profile_dir),
                 "envFile": str(env_file),
                 "defaultProfile": "tiancheng-local",
+                "workspace": str(workspace),
                 "agentSourcesPath": str(path.with_name("agent-sources.json")),
                 "agentCatalogPath": str(path.with_name("agent-catalog.sqlite3")),
-                # The workspace has no built-in default, so every fixture names
-                # its own directory instead of leaning on one machine's layout.
-                "workspace": str(workspace),
             },
             ensure_ascii=False,
         ),
@@ -232,6 +218,10 @@ def test_launcher_creates_safe_stdio_profile_in_isolated_directory(tmp_path: Pat
     assert status.returncode == 0, status.stdout + status.stderr
     status_payload = json.loads(status.stdout)
     assert status_payload["selectedMode"] == "DEV"
+    assert status_payload["mcpTransport"] == "unverified"
+    assert status_payload["mcpProbeMode"] == "none"
+    assert status_payload["mcpInferred"] == "unverified"
+    assert status_payload["mcpVerified"] == "not-available"
     assert "CONTROL_PLANE_API_KEY" not in status.stdout
 
     safe = run_powershell(
@@ -282,11 +272,54 @@ def test_settings_menu_persists_interactive_timeout_without_cli_flags(tmp_path: 
         "-ConfigPath",
         str(config),
         "-NoPause",
-        input_text="\n\n\n\n82\n\n",
+        input_text="\n\n\n\n82\n\n\n\n",
     )
     assert result.returncode == 0, result.stdout + result.stderr
     saved = json.loads(config.read_text(encoding="utf-8"))
     assert saved["interactiveTimeoutSeconds"] == 82
+
+
+def test_settings_menu_persists_supervisor_and_transport_ttl(tmp_path: Path) -> None:
+    config = tmp_path / "launcher.json"
+    write_test_config(config, env_file=tmp_path / ".env", profile_dir=tmp_path / "profiles")
+    result = run_powershell(
+        PROJECT_ROOT / "tc.ps1",
+        "-Action",
+        "settings",
+        "-ConfigPath",
+        str(config),
+        "-NoPause",
+        input_text="\n\n\n\n\n\nn\n2h\n",
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    saved = json.loads(config.read_text(encoding="utf-8"))
+    assert saved["supervisor"]["enabled"] is False
+    assert saved["supervisor"]["mcpConnectionMaxTtl"] == "2h"
+    assert saved["supervisor"]["restartBudget"]["maxAttempts"] == 5
+
+
+def test_supervisor_disabled_selects_legacy_direct_launch_mode(tmp_path: Path) -> None:
+    config = tmp_path / "launcher.json"
+    write_test_config(config, env_file=tmp_path / ".env", profile_dir=tmp_path / "profiles")
+    payload = json.loads(config.read_text(encoding="utf-8"))
+    payload["python"] = str(tmp_path / "missing-python.exe")
+    payload["supervisor"] = {"enabled": False}
+    config.write_text(json.dumps(payload), encoding="utf-8")
+
+    result = run_powershell(
+        PROJECT_ROOT / "tc.ps1",
+        "-Action",
+        "info",
+        "-Json",
+        "-ConfigPath",
+        str(config),
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    info = json.loads(result.stdout)
+    assert info["supervisorEnabled"] is False
+    assert info["tunnelLaunchMode"] == "direct"
+    assert info["supervisorPythonExists"] is False
 
 
 def test_launcher_agent_status_is_local_only_and_does_not_create_policy(
@@ -315,7 +348,7 @@ def test_launcher_agent_status_is_local_only_and_does_not_create_policy(
     assert not source_policy.exists()
     lowered = (result.stdout + result.stderr).casefold()
     assert "control_plane_api_key" not in lowered
-    assert "example_service_key" not in lowered
+    assert "example-provider_key" not in lowered
 
 
 def test_launcher_agent_menu_adds_only_confirmed_catalog_source(

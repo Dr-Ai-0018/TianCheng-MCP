@@ -13,13 +13,11 @@ from .service import TianChengService
 
 
 WORKSPACE_ENV = "TIANCHENG_WORKSPACE"
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="TianCheng workspace-jailed MCP server")
-    # The workspace is the security boundary, so it is never guessed.  There is
-    # no built-in default: a wrong one would silently expose whichever directory
-    # happened to match on this machine.
     parser.add_argument(
         "--workspace",
         default=os.environ.get(WORKSPACE_ENV) or None,
@@ -71,6 +69,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional agent catalog database path (defaults to project state directory)",
     )
     parser.add_argument(
+        "--agent-profiles",
+        default=str(PROJECT_ROOT / "config" / "agent-profiles.json"),
+        help="Server-owned Agent Profile definitions",
+    )
+    parser.add_argument(
+        "--agent-env-file",
+        default=str(PROJECT_ROOT / ".env"),
+        help="Optional dotenv source; only profile-declared credential names are read",
+    )
+    parser.add_argument(
         "--allow-policy-hot-reload",
         action="store_true",
         help=(
@@ -111,6 +119,8 @@ def main(argv: list[str] | None = None) -> None:
         access_policy_path=args.access_policy,
         agent_source_policy_path=args.agent_sources,
         agent_catalog_path=args.agent_catalog,
+        agent_profile_config_path=args.agent_profiles,
+        agent_env_file=args.agent_env_file,
         allow_policy_hot_reload=args.allow_policy_hot_reload,
     )
     try:

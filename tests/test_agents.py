@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 import json
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -14,6 +15,7 @@ from tiancheng_mcp.agents import (
     AgentProfileRegistry,
     AgentRunState,
     CodexJsonlParser,
+    load_agent_profile_definitions,
     redact_text,
 )
 from tiancheng_mcp.agent_adapters import (
@@ -24,6 +26,8 @@ from tiancheng_mcp.agent_adapters import (
     ClaudeJsonlParser,
     CodexAdapter,
     NormalizedEvent,
+    merge_codex_options,
+    normalize_codex_options,
 )
 from tiancheng_mcp.agent_sources import AgentSourcePolicy
 from tiancheng_mcp.policy import AccessPolicy, AccessRule
@@ -60,10 +64,9 @@ def test_codex_profile_command_is_server_owned_and_bounded() -> None:
         profile,
         ["node", "C:/tools/codex.js"],
         prompt="检查项目",
-        cwd="C:/example-workspace",
+        cwd="E:/ExampleWorkspace",
         sandbox="read-only",
     )
-    # The public default drives the stock CLI, so no -p is passed at all.
     assert command == [
         "node",
         "C:/tools/codex.js",
@@ -72,7 +75,7 @@ def test_codex_profile_command_is_server_owned_and_bounded() -> None:
         "-s",
         "read-only",
         "-C",
-        "C:/example-workspace",
+        "E:/ExampleWorkspace",
         "检查项目",
     ]
     with pytest.raises(ValueError, match="sandbox"):
@@ -80,11 +83,394 @@ def test_codex_profile_command_is_server_owned_and_bounded() -> None:
             profile,
             ["node", "codex.js"],
             prompt="x",
-            cwd="C:/example-workspace",
+            cwd="E:/ExampleWorkspace",
             sandbox="danger-full-access",
         )
     with pytest.raises(ValueError, match="Unknown agent profile"):
         registry.get("arbitrary")
+
+
+def test_configured_profiles_bind_only_their_own_dotenv_credential(
+    monkeypatch, tmp_path
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    home = tmp_path / "IsolatedCodex"
+    home.mkdir()
+    config = tmp_path / "agent-profiles.json"
+    config.write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "inherit_defaults": True,
+                "profiles": [
+                    {
+                        "name": "codex-default",
+                        "provider": "codex",
+                        "provider_profile": "example-provider",
+                        "auth": {
+                            "mode": "env",
+                            "credential_env": "EXAMPLE_AGENT_KEY",
+                        },
+                    },
+                    {
+                        "name": "isolated-agent",
+                        "provider": "codex",
+                        "provider_profile": "isolated-agent",
+                        "codex_home": str(home),
+                        "auth": {
+                            "mode": "env",
+                            "credential_env": "ISOLATED_AGENT_KEY",
+                        },
+                    },
+                    {
+                        "name": "claude-default",
+                        "provider": "claude-code",
+                        "provider_profile": "local-default",
+                        "auth": {"mode": "existing-login"},
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "CONTROL_PLANE_API_KEY=never-copy\n"
+        "EXAMPLE_AGENT_KEY=pro-secret\n"
+        "ISOLATED_AGENT_KEY=qing-secret\n",
+        encoding="utf-8",
+    )
+    profile_config = load_agent_profile_definitions(config)
+    assert profile_config.inherit_defaults is True
+    assert [item["name"] for item in profile_config.profiles] == [
+        "codex-default",
+        "isolated-agent",
+        "claude-default",
+    ]
+    monkeypatch.setattr(
+        TianChengService, "_discover_exec_commands", lambda self: {"codex": [sys.executable]}
+    )
+    monkeypatch.setattr(
+        TianChengService,
+        "_discover_agent_only_commands",
+        lambda self: {"claude": [sys.executable]},
+    )
+    service = TianChengService(
+        workspace,
+        tmp_path / "audit",
+        allow_exec=True,
+        access_policy=AccessPolicy.default(workspace),
+        agent_source_policy=AgentSourcePolicy.empty(),
+        enable_agent_catalog=False,
+        agent_profile_config_path=config,
+        agent_env_file=env_file,
+    )
+    try:
+        isolated_agent = service.agent_profiles.get("isolated-agent")
+        assert isolated_agent.codex_config_profile == "isolated-agent"
+        qing_env = service._execution_environment(
+            include_passthrough_env=False,
+            profile_credential_env=isolated_agent.credential_env,
+            codex_home=isolated_agent.codex_home,
+        )
+        assert qing_env["ISOLATED_AGENT_KEY"] == "qing-secret"
+        assert "EXAMPLE_AGENT_KEY" not in qing_env
+        assert "CONTROL_PLANE_API_KEY" not in qing_env
+        example_profile = service.agent_profiles.get("codex-default")
+        pro_env = service._execution_environment(
+            include_passthrough_env=False,
+            profile_credential_env=example_profile.credential_env,
+        )
+        assert pro_env["EXAMPLE_AGENT_KEY"] == "pro-secret"
+        assert "ISOLATED_AGENT_KEY" not in pro_env
+        claude = service.agent_profiles.get("claude-default")
+        assert claude.auth_mode == "existing-login"
+        assert claude.credential_env is None
+    finally:
+        service.shutdown()
+
+
+def test_profile_overlay_retains_defaults_and_can_explicitly_disable_one() -> None:
+    registry = AgentProfileRegistry(
+        ["codex", "claude"],
+        profile_definitions=(
+            {
+                "name": "isolated-agent",
+                "provider": "codex",
+                "provider_profile": "isolated-agent",
+                "codex_home": "E:/ExampleWorkspace/AgentHomes/IsolatedCodex",
+                "credential_env": "ISOLATED_AGENT_KEY",
+                "auth_mode": "env",
+                "enabled": True,
+            },
+        ),
+    )
+    assert registry.names() == ("claude-default", "codex-default", "isolated-agent")
+
+    disabled = AgentProfileRegistry(
+        ["codex", "claude"],
+        profile_definitions=(
+            {
+                "name": "claude-default",
+                "provider": "claude-code",
+                "provider_profile": "local-default",
+                "credential_env": None,
+                "auth_mode": "existing-login",
+                "enabled": False,
+            },
+        ),
+    )
+    assert disabled.names() == ("codex-default",)
+
+    with pytest.raises(ValueError, match="cannot change provider"):
+        AgentProfileRegistry(
+            ["codex", "claude"],
+            profile_definitions=(
+                {
+                    "name": "claude-default",
+                    "provider": "codex",
+                    "provider_profile": "example-provider",
+                    "credential_env": "EXAMPLE_AGENT_KEY",
+                    "auth_mode": "env",
+                    "enabled": True,
+                },
+            ),
+            inherit_default_profiles=False,
+        )
+
+
+def test_missing_profile_config_falls_back_to_available_builtin_profiles(
+    monkeypatch, tmp_path
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setattr(
+        TianChengService,
+        "_discover_exec_commands",
+        lambda self: {"codex": [sys.executable]},
+    )
+    monkeypatch.setattr(
+        TianChengService,
+        "_discover_agent_only_commands",
+        lambda self: {"claude": [sys.executable]},
+    )
+    service = TianChengService(
+        workspace,
+        tmp_path / "audit",
+        allow_exec=True,
+        access_policy=AccessPolicy.default(workspace),
+        agent_source_policy=AgentSourcePolicy.empty(),
+        enable_agent_catalog=False,
+        agent_profile_config_path=tmp_path / "missing-agent-profiles.json",
+    )
+    try:
+        assert service.agent_profiles.names() == (
+            "claude-default",
+            "codex-default",
+        )
+    finally:
+        service.shutdown()
+
+
+@pytest.mark.parametrize(
+    "auth",
+    (
+        {"mode": "existing-login", "credential_env": "SHOULD_NOT_EXIST"},
+        {"mode": "env"},
+        {"mode": "unknown"},
+    ),
+)
+def test_profile_config_rejects_ambiguous_or_unknown_auth(
+    tmp_path, auth
+) -> None:
+    config = tmp_path / "agent-profiles.json"
+    config.write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "inherit_defaults": True,
+                "profiles": [
+                    {
+                        "name": "claude-default",
+                        "provider": "claude-code",
+                        "provider_profile": "local-default",
+                        "auth": auth,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError):
+        load_agent_profile_definitions(config)
+
+
+def test_codex_native_invocation_options_render_in_cli_0153_order() -> None:
+    registry = AgentProfileRegistry(["codex"])
+    profile = registry.get("codex-default")
+    command = registry.build_codex_command(
+        profile,
+        ["codex"],
+        prompt="检查参数",
+        cwd="E:/ExampleWorkspace",
+        sandbox="workspace-write",
+        invocation_options={
+            "ask_for_approval": "never",
+            "search": True,
+            "model": "gpt-5.6-luna",
+            "reasoning_effort": "max",
+            "model_provider": "example-provider",
+            "config": ["web_search=\"cached\"", "features.example=true"],
+            "enable": ["alpha_one", "alpha_two"],
+            "disable": ["legacy_one"],
+            "strict_config": True,
+            "images": ["E:/ExampleWorkspace/image.png"],
+            "oss": True,
+            "local_provider": "ollama",
+            "approve_for_me": True,
+            "add_dirs": ["E:/ExampleWorkspace/extra"],
+            "thread_source": "tiancheng-mcp",
+            "skip_git_repo_check": True,
+            "ignore_user_config": True,
+            "ignore_rules": True,
+            "output_schema": "E:/ExampleWorkspace/schema.json",
+            "color": "never",
+            "output_last_message": "E:/ExampleWorkspace/result.txt",
+        },
+    )
+    assert command[:5] == ["codex", "-a", "never", "--search", "exec"]
+    assert command[5:11] == [
+        "--json",
+        "-s",
+        "workspace-write",
+        "-C",
+        "E:/ExampleWorkspace",
+        "-m",
+    ]
+    assert command[-1] == "检查参数"
+    assert command.count("-c") == 4
+    assert command[command.index("-m") + 1] == "gpt-5.6-luna"
+    assert "model_reasoning_effort=\"max\"" in command
+    assert "model_provider=\"example-provider\"" in command
+    assert command[command.index("--local-provider") + 1] == "ollama"
+    assert command[command.index("--thread-source") + 1] == "tiancheng-mcp"
+    assert command[command.index("--output-schema") + 1].endswith("schema.json")
+
+    leading_flag_prompt = registry.build_codex_command(
+        profile,
+        ["codex"],
+        prompt="--help is prompt text",
+        cwd="E:/ExampleWorkspace",
+        sandbox="read-only",
+    )
+    assert leading_flag_prompt[-2:] == ["--", "--help is prompt text"]
+
+    fork = registry.build_codex_command(
+        profile,
+        ["codex"],
+        prompt="",
+        cwd="E:/ExampleWorkspace",
+        sandbox="read-only",
+        thread_id="thr_source",
+        invocation_options={"model": "gpt-5.6-sol"},
+        action="fork",
+    )
+    assert fork[-3:] == ["gpt-5.6-sol", "fork", "thr_source"]
+
+    review = registry.build_codex_command(
+        profile,
+        ["codex"],
+        prompt="只看并发问题",
+        cwd="E:/ExampleWorkspace",
+        sandbox="read-only",
+        invocation_options={
+            "review_base": "main",
+            "review_title": "Native option review",
+        },
+        action="review",
+    )
+    assert review[-6:] == [
+        "review",
+        "--base",
+        "main",
+        "--title",
+        "Native option review",
+        "只看并发问题",
+    ]
+
+
+def test_codex_options_validate_merge_clear_and_high_risk_flags() -> None:
+    defaults = normalize_codex_options(
+        {
+            "model": "gpt-5.6-sol",
+            "search": True,
+            "config": ["model_reasoning_effort=\"high\""],
+        }
+    )
+    merged = merge_codex_options(
+        defaults,
+        {"model": "gpt-5.6-terra", "search": None},
+    )
+    assert merged == {
+        "model": "gpt-5.6-terra",
+        "config": ("model_reasoning_effort=\"high\"",),
+    }
+    with pytest.raises(ValueError, match="Unknown Codex option"):
+        normalize_codex_options({"raw_args": ["--yolo"]})
+    with pytest.raises(ValueError, match="dotted key=value"):
+        normalize_codex_options({"config": ["not-a-pair"]})
+    with pytest.raises(PermissionError, match="server-side policy"):
+        normalize_codex_options({"config": ["sandbox_mode=\"danger-full-access\""]})
+    with pytest.raises(PermissionError, match="credentials"):
+        normalize_codex_options({"config": ["telemetry.api_key=\"secret\""]})
+    with pytest.raises(PermissionError, match="server-owned"):
+        normalize_codex_options({"thread_source": "spoofed-source"})
+
+    registry = AgentProfileRegistry(["codex"])
+    profile = registry.get("codex-default")
+    with pytest.raises(PermissionError, match="externally isolated"):
+        registry.build_codex_command(
+            profile,
+            ["codex"],
+            prompt="x",
+            cwd="E:/ExampleWorkspace",
+            sandbox="workspace-write",
+            invocation_options={
+                "dangerously_bypass_approvals_and_sandbox": True
+            },
+        )
+    with pytest.raises(ValueError, match="JSONL parser"):
+        registry.build_codex_command(
+            profile,
+            ["codex"],
+            prompt="x",
+            cwd="E:/ExampleWorkspace",
+            sandbox="read-only",
+            invocation_options={"color": "always"},
+        )
+    with pytest.raises(ValueError, match="both enabled and disabled"):
+        registry.build_codex_command(
+            profile,
+            ["codex"],
+            prompt="x",
+            cwd="E:/ExampleWorkspace",
+            sandbox="read-only",
+            invocation_options={"enable": ["x"], "disable": ["x"]},
+        )
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        registry.build_codex_command(
+            profile,
+            ["codex"],
+            prompt="",
+            cwd="E:/ExampleWorkspace",
+            sandbox="read-only",
+            invocation_options={
+                "review_uncommitted": True,
+                "review_base": "main",
+            },
+            action="review",
+        )
 
 
 def test_claude_profile_command_is_server_owned_restricted_and_bounded() -> None:
@@ -94,7 +480,7 @@ def test_claude_profile_command_is_server_owned_restricted_and_bounded() -> None
         profile,
         ["C:/tools/claude.exe"],
         prompt="检查项目",
-        cwd="C:/example-workspace",
+        cwd="E:/ExampleWorkspace",
         sandbox="read-only",
     )
     assert command == [
@@ -118,7 +504,7 @@ def test_claude_profile_command_is_server_owned_restricted_and_bounded() -> None
         profile,
         ["C:/tools/claude.exe"],
         prompt="继续",
-        cwd="C:/example-workspace",
+        cwd="E:/ExampleWorkspace",
         sandbox="workspace-write",
         native_session_id="claude_session_1",
     )
@@ -143,7 +529,7 @@ def test_claude_profile_command_is_server_owned_restricted_and_bounded() -> None
             profile,
             ["C:/tools/claude.exe"],
             prompt="bad\x00prompt",
-            cwd="C:/example-workspace",
+            cwd="E:/ExampleWorkspace",
             sandbox="read-only",
         )
 
@@ -180,7 +566,7 @@ def test_claude_stream_json_parser_ignores_tool_payloads_and_redacts() -> None:
                 "type": "result",
                 "session_id": "claude_session_1",
                 "is_error": False,
-                "result": "EXAMPLE_SERVICE_KEY=fixture-secret 完成",
+                "result": "EXAMPLE_AGENT_KEY=fixture-secret 完成",
             }
         )
     )
@@ -201,6 +587,7 @@ def test_agent_registry_exposes_capabilities_and_stable_unsupported_errors() -> 
             "display_name": "Codex",
             "available": True,
             "profiles": ["codex-default"],
+            "tested_cli_version": "0.153.0",
             "capabilities": {
                 "create": True,
                 "attach": True,
@@ -210,13 +597,23 @@ def test_agent_registry_exposes_capabilities_and_stable_unsupported_errors() -> 
                 "cancel": True,
                 "steer": False,
                 "interaction": False,
-                "fork": False,
+                "fork": True,
+                "review": True,
             },
         },
     )
     profile = registry.get("codex-default")
     assert profile.agent == "codex"
     assert profile.codex_profile == ""
+    assert profile.codex_config_profile == ""
+    assert registry.profile_summaries() == (
+        {
+            "profile": "codex-default",
+            "provider": "codex",
+            "auth_mode": "existing-login",
+            "runtime_home_isolated": False,
+        },
+    )
     assert registry.adapter_for_profile(profile).provider == "codex"
     assert isinstance(CodexAdapter(), AgentAdapter)
     registry.require_capability(profile, "attach")
@@ -417,7 +814,7 @@ def test_event_parser_redacts_secrets_and_bounds_data() -> None:
     assert clipped is False
     parser = CodexJsonlParser()
     event = parser.feed_line(
-        '{"type":"error","message":"EXAMPLE_SERVICE_KEY=super-secret-value"}'
+        '{"type":"error","message":"EXAMPLE_AGENT_KEY=super-secret-value"}'
     )
     assert event is not None
     assert "super-secret-value" not in event.summary
@@ -449,6 +846,7 @@ def test_agent_session_is_workspace_bound_and_closable(workspace, tmp_path) -> N
     session = service.agent_session_create()
     assert session["profile"] == "codex-default"
     assert session["cwd"] == "."
+    assert session["sandbox"] == "workspace-write"
     assert service.agent_session_inspect(session["session_id"])["closed"] is False
     with pytest.raises((ValueError, PermissionError)):
         service.agent_session_create(cwd="..")
@@ -523,6 +921,137 @@ def test_agent_run_receives_immediate_stdin_eof(workspace, tmp_path) -> None:
     assert process.stdin_closed is True
 
 
+def test_isolated_agent_profile_freezes_and_injects_isolated_codex_home(monkeypatch) -> None:
+    with tempfile.TemporaryDirectory(prefix="tc-agent-home-") as temporary:
+        root = Path(temporary)
+        workspace = root / "workspace"
+        home = workspace / "AgentHomes" / "IsolatedCodex"
+        room = workspace / "Rooms" / "示例目录"
+        home.mkdir(parents=True)
+        room.mkdir(parents=True)
+        script = root / "fake_codex_home.py"
+        script.write_text(
+            "import json, os\n"
+            "print(json.dumps({'type':'thread.started','thread_id':'thr_home'}), flush=True)\n"
+            "print(json.dumps({'type':'item.completed','item':{'type':'agent_message','text':os.environ.get('CODEX_HOME', '')}}), flush=True)\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("CODEX_HOME", str(root / "parent-codex-home"))
+        service = TianChengService(
+            workspace,
+            root / "audit",
+            allow_exec=True,
+            access_policy=AccessPolicy.default(workspace),
+            agent_source_policy=AgentSourcePolicy.empty(),
+            enable_agent_catalog=False,
+        )
+        service._exec_commands["codex"] = [sys.executable, str(script)]
+        service.agent_profiles = AgentProfileRegistry(
+            {"codex": [sys.executable, str(script)]},
+            profile_definitions=(
+                {
+                    "name": "isolated-agent",
+                    "provider": "codex",
+                    "provider_profile": "isolated-agent",
+                    "codex_home": str(home),
+                    "credential_env": "ISOLATED_AGENT_KEY",
+                },
+            ),
+        )
+        try:
+            info = service.workspace_info()
+            assert "isolated-agent" in info["available_agent_profiles"]
+            assert {
+                "profile": "isolated-agent",
+                "provider": "codex",
+                "auth_mode": "env",
+                "runtime_home_isolated": True,
+            } in info["agent_profile_metadata"]
+
+            session = service.agent_session_create(
+                profile="isolated-agent", cwd="Rooms/示例目录"
+            )
+            assert session["runtime_home_isolated"] is True
+            assert "codex_home" not in session
+            inspected = service.agent_session_inspect(session["session_id"])
+            assert inspected["runtime_home_isolated"] is True
+            assert "codex_home" not in inspected
+
+            started = service.agent_run_start(session["session_id"], "wake up")
+            completed = _wait_for_run(service, session["session_id"], started["run_id"])
+            assert completed["state"] == "succeeded"
+            result = service.agent_run_result(session["session_id"], started["run_id"])
+            assert Path(result["result"]).resolve() == home.resolve()
+        finally:
+            service.shutdown()
+
+
+def test_isolated_codex_home_is_validated_at_create_and_each_run() -> None:
+    with tempfile.TemporaryDirectory(prefix="tc-agent-home-policy-") as temporary:
+        root = Path(temporary)
+        workspace = root / "workspace"
+        home = workspace / "AgentHomes" / "IsolatedCodex"
+        home.mkdir(parents=True)
+        service = TianChengService(
+            workspace,
+            root / "audit",
+            allow_exec=True,
+            access_policy=AccessPolicy.default(workspace),
+            agent_source_policy=AgentSourcePolicy.empty(),
+            enable_agent_catalog=False,
+        )
+        service.agent_profiles = AgentProfileRegistry(
+            ["codex"],
+            profile_definitions=(
+                {
+                    "name": "isolated-agent",
+                    "provider": "codex",
+                    "provider_profile": "isolated-agent",
+                    "codex_home": str(home),
+                    "credential_env": "ISOLATED_AGENT_KEY",
+                },
+            ),
+        )
+        original = service.agent_profiles.get("isolated-agent")
+        service.agent_profiles._profiles["isolated-agent"] = replace(
+            original, codex_home=str(home)
+        )
+        try:
+            session = service.agent_session_create(profile="isolated-agent")
+            service.access_policy = AccessPolicy(
+                workspace,
+                [
+                    AccessRule(path=workspace, mode="full"),
+                    AccessRule(path=home, mode="deny"),
+                ],
+            )
+            with pytest.raises(PermissionError):
+                service.agent_run_start(session["session_id"], "must fail closed")
+
+            sensitive = workspace / "secrets" / "IsolatedCodex"
+            sensitive.mkdir(parents=True)
+            service.access_policy = AccessPolicy.default(workspace)
+            service.agent_profiles._profiles["isolated-agent"] = replace(
+                original, codex_home=str(sensitive)
+            )
+            with pytest.raises(PermissionError, match="sensitive path component"):
+                service.agent_session_create(profile="isolated-agent")
+
+            service.agent_profiles._profiles["isolated-agent"] = replace(
+                original, codex_home="relative-home"
+            )
+            with pytest.raises(ValueError, match="absolute path"):
+                service.agent_session_create(profile="isolated-agent")
+
+            service.agent_profiles._profiles["isolated-agent"] = replace(
+                original, codex_home=str(workspace / "AgentHomes" / "missing")
+            )
+            with pytest.raises(FileNotFoundError, match="must already exist"):
+                service.agent_session_create(profile="isolated-agent")
+        finally:
+            service.shutdown()
+
+
 def test_agent_run_resumes_only_its_bound_thread(workspace, tmp_path) -> None:
     script = tmp_path / "fake_resume_codex.py"
     argument_log = tmp_path / "arguments.jsonl"
@@ -549,6 +1078,171 @@ def test_agent_run_resumes_only_its_bound_thread(workspace, tmp_path) -> None:
     assert "resume" not in calls[0]
     resume_index = calls[1].index("resume")
     assert calls[1][resume_index : resume_index + 3] == ["resume", "thr_resume", "second"]
+
+
+def test_codex_run_fork_and_review_update_the_managed_binding(workspace, tmp_path) -> None:
+    script = tmp_path / "fake_codex_actions.py"
+    argument_log = tmp_path / "codex-actions.jsonl"
+    script.write_text(
+        "import json, pathlib, sys\n"
+        "args = sys.argv[2:]\n"
+        "path = pathlib.Path(sys.argv[1])\n"
+        "with path.open('a', encoding='utf-8') as stream:\n"
+        "    stream.write(json.dumps(args) + '\\n')\n"
+        "thread_id = 'thr_reviewed' if 'review' in args else "
+        "('thr_forked' if 'fork' in args else 'thr_base')\n"
+        "print(json.dumps({'type':'thread.started','thread_id':thread_id}), flush=True)\n"
+        "print(json.dumps({'type':'item.completed','item':{'type':'agent_message','text':'ok'}}), flush=True)\n",
+        encoding="utf-8",
+    )
+    service = TianChengService(workspace, tmp_path / "audit", allow_exec=True)
+    service._exec_commands["codex"] = [sys.executable, str(script), str(argument_log)]
+    service.agent_profiles = AgentProfileRegistry(["codex"])
+    session = service.agent_session_create()
+
+    created = service.agent_run_start(session["session_id"], "create")
+    _wait_for_run(service, session["session_id"], created["run_id"])
+    forked = service.agent_run_start(
+        session["session_id"], "", {"model": "gpt-5.6-sol"}, "fork"
+    )
+    _wait_for_run(service, session["session_id"], forked["run_id"])
+    reviewed = service.agent_run_start(
+        session["session_id"],
+        "focus on races",
+        {"review_base": "main", "review_title": "Concurrency"},
+        "review",
+    )
+    _wait_for_run(service, session["session_id"], reviewed["run_id"])
+
+    calls = [
+        json.loads(line)
+        for line in argument_log.read_text(encoding="utf-8").splitlines()
+    ]
+    fork_index = calls[1].index("fork")
+    assert calls[1][fork_index:] == ["fork", "thr_base"]
+    review_index = calls[2].index("review")
+    assert calls[2][review_index:] == [
+        "review",
+        "--base",
+        "main",
+        "--title",
+        "Concurrency",
+        "focus on races",
+    ]
+    inspected = service.agent_session_inspect(session["session_id"])
+    assert inspected["native_session_id"] == "thr_reviewed"
+    assert reviewed["codex_action"] == "review"
+    assert reviewed["codex_options"]["review_base_configured"] is True
+
+    ephemeral_session = service.agent_session_create()
+    ephemeral = service.agent_run_start(
+        ephemeral_session["session_id"],
+        "one shot",
+        {"ephemeral": True},
+    )
+    _wait_for_run(
+        service, ephemeral_session["session_id"], ephemeral["run_id"]
+    )
+    assert service.agent_session_inspect(ephemeral_session["session_id"])[
+        "native_session_id"
+    ] is None
+
+
+def test_codex_session_defaults_run_overrides_paths_and_route_environment(
+    workspace, tmp_path
+) -> None:
+    image = workspace / "input.png"
+    schema = workspace / "schema.json"
+    extra = workspace / "extra"
+    image.write_bytes(b"fixture")
+    schema.write_text('{"type":"object"}', encoding="utf-8")
+    extra.mkdir()
+    argument_log = tmp_path / "codex-options.jsonl"
+    script = tmp_path / "fake_codex_options.py"
+    script.write_text(
+        "import json, os, pathlib, sys\n"
+        "path = pathlib.Path(sys.argv[1])\n"
+        "with path.open('a', encoding='utf-8') as stream:\n"
+        "    stream.write(json.dumps({'args': sys.argv[2:], 'route': os.environ.get('AWZ_ROUTE')}) + '\\n')\n"
+        "print(json.dumps({'type':'thread.started','thread_id':'thr_options'}), flush=True)\n"
+        "print(json.dumps({'type':'item.completed','item':{'type':'agent_message','text':'ok'}}), flush=True)\n",
+        encoding="utf-8",
+    )
+    service = TianChengService(workspace, tmp_path / "audit", allow_exec=True)
+    service._exec_commands["codex"] = [sys.executable, str(script), str(argument_log)]
+    service.agent_profiles = AgentProfileRegistry(["codex"])
+    session = service.agent_session_create(
+        sandbox="workspace-write",
+        codex_defaults={
+            "model": "gpt-5.6-sol",
+            "route": "primary",
+            "images": ["input.png"],
+            "add_dirs": ["extra"],
+            "output_schema": "schema.json",
+            "output_last_message": "last.txt",
+        },
+    )
+    assert session["codex_defaults"] == {
+        "model": "gpt-5.6-sol",
+        "route_configured": True,
+        "images_count": 1,
+        "add_dirs_count": 1,
+        "output_schema_configured": True,
+        "output_last_message_configured": True,
+    }
+
+    first = service.agent_run_start(
+        session["session_id"],
+        "first",
+        {"model": "gpt-5.6-luna", "reasoning_effort": "max"},
+    )
+    _wait_for_run(service, session["session_id"], first["run_id"])
+    assert first["codex_options"]["model"] == "gpt-5.6-luna"
+    assert first["codex_options"]["reasoning_effort"] == "max"
+    inspected = service.agent_run_inspect(session["session_id"], first["run_id"])
+    assert inspected["codex_options"] == first["codex_options"]
+
+    second = service.agent_run_start(
+        session["session_id"],
+        "second",
+        {"route": None, "model": "gpt-5.6-terra"},
+    )
+    _wait_for_run(service, session["session_id"], second["run_id"])
+
+    calls = [
+        json.loads(line)
+        for line in argument_log.read_text(encoding="utf-8").splitlines()
+    ]
+    assert calls[0]["route"] == "primary"
+    assert calls[1]["route"] is None
+    assert calls[0]["args"][calls[0]["args"].index("-m") + 1] == "gpt-5.6-luna"
+    assert calls[1]["args"][calls[1]["args"].index("-m") + 1] == "gpt-5.6-terra"
+    assert str(image.resolve()) in calls[0]["args"]
+    assert str(schema.resolve()) in calls[0]["args"]
+    assert str(extra.resolve()) in calls[0]["args"]
+    assert str((workspace / "last.txt").resolve()) in calls[0]["args"]
+
+
+def test_codex_option_paths_reject_escape_and_claude_options(workspace, tmp_path) -> None:
+    service = TianChengService(workspace, tmp_path / "audit", allow_exec=True)
+    service._exec_commands["codex"] = [sys.executable, "fake-codex.py"]
+    service.agent_profiles = AgentProfileRegistry(["codex"])
+    with pytest.raises((PermissionError, WorkspaceSecurityError)):
+        service.agent_session_create(codex_defaults={"images": ["../secret.png"]})
+    with pytest.raises(ValueError, match="per-run"):
+        service.agent_session_create(
+            codex_defaults={"review_uncommitted": True}
+        )
+
+    claude = TianChengService(workspace, tmp_path / "claude-audit", allow_exec=False)
+    claude.agent_profiles = AgentProfileRegistry(
+        {"claude": [sys.executable]}, adapters=(ClaudeCodeAdapter(),)
+    )
+    with pytest.raises(NotImplementedError, match="Codex options"):
+        claude.agent_session_create(
+            profile="claude-default",
+            codex_defaults={"model": "gpt-5.6-sol"},
+        )
 
 
 def test_agent_session_attaches_catalog_ref_and_reauthorizes_each_run(
@@ -757,8 +1451,8 @@ def test_claude_agent_only_runtime_creates_resumes_and_attaches_catalog(
         "import json, os, pathlib, sys\n"
         "log = pathlib.Path(sys.argv[1])\n"
         "args = sys.argv[2:]\n"
-        "if os.environ.get('EXAMPLE_SERVICE_KEY'):\n"
-        "    args.append('UNEXPECTED_PASSTHROUGH_ENV')\n"
+        "if os.environ.get('EXAMPLE_AGENT_KEY'):\n"
+        "    args.append('UNEXPECTED_AGENT_ENV')\n"
         "with log.open('a', encoding='utf-8') as stream:\n"
         "    stream.write(json.dumps(args) + '\\n')\n"
         "session_id = args[args.index('--resume') + 1] if '--resume' in args else 'claude_new_1'\n"
@@ -766,12 +1460,12 @@ def test_claude_agent_only_runtime_creates_resumes_and_attaches_catalog(
         "print(json.dumps({'type':'result','session_id':session_id,'is_error':False,'result':'claude ok'}), flush=True)\n",
         encoding="utf-8",
     )
-    monkeypatch.setenv("EXAMPLE_SERVICE_KEY", "fixture-secret-never-log")
+    monkeypatch.setenv("EXAMPLE_AGENT_KEY", "fixture-secret-never-log")
     service = TianChengService(
         workspace,
         tmp_path / "audit",
         allow_exec=True,
-        passthrough_env=("EXAMPLE_SERVICE_KEY",),
+        passthrough_env=("EXAMPLE_AGENT_KEY",),
         agent_source_policy=policy,
         agent_catalog_path=tmp_path / "state" / "catalog.sqlite3",
     )
@@ -812,14 +1506,14 @@ def test_claude_agent_only_runtime_creates_resumes_and_attaches_catalog(
         assert "--safe-mode" in call
         assert "--strict-mcp-config" in call
         assert "--dangerously-skip-permissions" not in call
-        assert "UNEXPECTED_PASSTHROUGH_ENV" not in call
+        assert "UNEXPECTED_AGENT_ENV" not in call
 
 
 def test_agent_failure_is_bounded_and_redacted(workspace, tmp_path) -> None:
     script = tmp_path / "fake_failed_codex.py"
     script.write_text(
         "import sys\n"
-        "sys.stderr.write('EXAMPLE_SERVICE_KEY=super-secret-value ' + ('x' * 50000))\n"
+        "sys.stderr.write('EXAMPLE_AGENT_KEY=super-secret-value ' + ('x' * 50000))\n"
         "raise SystemExit(3)\n",
         encoding="utf-8",
     )
@@ -882,10 +1576,11 @@ def test_agent_cancel_timeout_and_shutdown_are_distinct(workspace, tmp_path) -> 
     cancel_service.agent_profiles = AgentProfileRegistry(["codex"])
     cancel_session = cancel_service.agent_session_create()
     cancel_run = cancel_service.agent_run_start(cancel_session["session_id"], "cancel")
+    assert cancel_run["max_runtime_seconds"] == 3600
     with pytest.raises(RuntimeError, match="one active run"):
         cancel_service.agent_run_start(cancel_session["session_id"], "overlap")
     cancelled = cancel_service.agent_run_cancel(
-        cancel_session["session_id"], cancel_run["run_id"], "EXAMPLE_SERVICE_KEY=hidden"
+        cancel_session["session_id"], cancel_run["run_id"], "EXAMPLE_AGENT_KEY=hidden"
     )
     assert cancelled["state"] == "cancelled"
     assert "hidden" not in cancelled["reason"]
@@ -893,16 +1588,22 @@ def test_agent_cancel_timeout_and_shutdown_are_distinct(workspace, tmp_path) -> 
     timeout_service = TianChengService(workspace, tmp_path / "audit-timeout", allow_exec=True)
     timeout_service._exec_commands["codex"] = [sys.executable, str(script)]
     timeout_service.agent_profiles = AgentProfileRegistry(["codex"])
-    timeout_profile = timeout_service.agent_profiles.get("codex-default")
-    timeout_service.agent_profiles._profiles["codex-default"] = replace(
-        timeout_profile, max_runtime_seconds=1
-    )
     timeout_session = timeout_service.agent_session_create()
-    timeout_run = timeout_service.agent_run_start(timeout_session["session_id"], "timeout")
+    timeout_run = timeout_service.agent_run_start(
+        timeout_session["session_id"], "timeout", max_runtime_seconds=1
+    )
+    assert timeout_run["max_runtime_seconds"] == 1
     timed_out = _wait_for_run(
         timeout_service, timeout_session["session_id"], timeout_run["run_id"], timeout=5
     )
     assert timed_out["state"] == "timed_out"
+    assert timed_out["max_runtime_seconds"] == 1
+
+    limit_session = timeout_service.agent_session_create()
+    with pytest.raises(ValueError, match="between 1 and 10800"):
+        timeout_service.agent_run_start(
+            limit_session["session_id"], "too long", max_runtime_seconds=10_801
+        )
 
     shutdown_service = TianChengService(workspace, tmp_path / "audit-shutdown", allow_exec=True)
     shutdown_service._exec_commands["codex"] = [sys.executable, str(script)]
@@ -1141,28 +1842,3 @@ def test_attach_resumes_history_from_a_whitelisted_directory(
             service.agent_session_attach(record["conversation_ref"])
     finally:
         service.shutdown()
-
-
-def test_codex_profile_override_is_opt_in_and_cannot_inject_arguments(monkeypatch) -> None:
-    from tiancheng_mcp.agent_adapters import CODEX_PROFILE_ENV
-
-    # Opting in adds -p, and nothing else.
-    monkeypatch.setenv(CODEX_PROFILE_ENV, "my-local-profile")
-    registry = AgentProfileRegistry(["codex"])
-    profile = registry.get("codex-default")
-    assert profile.codex_profile == "my-local-profile"
-    command = registry.build_codex_command(
-        profile,
-        ["codex"],
-        prompt="hello",
-        cwd="C:/workspace",
-        sandbox="read-only",
-    )
-    assert command[command.index("-p") + 1] == "my-local-profile"
-
-    # A value carrying whitespace, a switch, or a path separator would become a
-    # second argument inside the fixed template, so it is refused outright.
-    for hostile in ("a b", "--dangerously-bypass", "-p", "a\\b", "a/b", "x" * 65):
-        monkeypatch.setenv(CODEX_PROFILE_ENV, hostile)
-        with pytest.raises(ValueError, match=CODEX_PROFILE_ENV):
-            AgentProfileRegistry(["codex"])

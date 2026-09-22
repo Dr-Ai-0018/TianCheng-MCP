@@ -37,8 +37,8 @@ def test_stdio_keyboard_interrupt_is_a_clean_shutdown(
             "--audit-dir",
             str(tmp_path / "audit"),
             "--pass-env",
-            "EXAMPLE_SERVICE_KEY",
+            "EXAMPLE_AGENT_KEY",
         ]
     )
     assert service_holder and service_holder[0].stopped is True
-    assert service_holder[0].kwargs["passthrough_env"] == ["EXAMPLE_SERVICE_KEY"]
+    assert service_holder[0].kwargs["passthrough_env"] == ["EXAMPLE_AGENT_KEY"]

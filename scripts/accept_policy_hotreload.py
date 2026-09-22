@@ -22,39 +22,10 @@ from pathlib import Path
 
 from mcp import Client, StdioServerParameters
 
-
-def _powershell() -> Path:
-    """Locate pwsh on PATH, or accept an explicit override.
-
-    Nothing here may point at one particular machine's install: a clone has to
-    work wherever PowerShell 7 happens to live.
-    """
-
-    override = os.environ.get("TIANCHENG_POWERSHELL")
-    if override:
-        return Path(override)
-    found = shutil.which("pwsh")
-    if not found:
-        raise SystemExit(
-            "pwsh (PowerShell 7) was not found on PATH. Install it, or set "
-            "TIANCHENG_POWERSHELL to its full path."
-        )
-    return Path(found)
-
-
-def _workspace() -> Path:
-    """Return the workspace this smoke run may touch."""
-
-    value = os.environ.get("TIANCHENG_WORKSPACE")
-    if not value:
-        raise SystemExit(
-            "Set TIANCHENG_WORKSPACE to the directory this smoke run may use. "
-            "It has no default: the workspace is the security boundary."
-        )
-    return Path(value)
+from local_runtime import workspace_path
 
 REPO = Path(__file__).resolve().parents[1]
-WORKSPACE = None  # resolved lazily by _workspace()
+WORKSPACE = workspace_path(REPO)
 RUN_POLL_TIMEOUT = 300.0
 
 
@@ -148,7 +119,7 @@ async def main() -> None:
     # user. That is an artifact of the test staging, not of the server or the
     # agent, and it would otherwise look like a lost write.
     import uuid as _uuid
-    sandbox = Path(tempfile.gettempdir()) / f"tc-accept-hot-{_uuid.uuid4().hex[:8]}"
+    sandbox = Path(tempfile.mkdtemp(prefix=f"tc-accept-hot-{_uuid.uuid4().hex[:8]}-"))
     sandbox.mkdir()
     # Keep the throwaway policy file in its own directory: the server refuses
     # to whitelist anything under the directory holding its policy, so a
@@ -167,7 +138,7 @@ async def main() -> None:
     (sandbox / "policy").mkdir()
     policy_file = sandbox / "policy" / "access-policy.json"
     policy_file.write_text(
-        json.dumps({"rules": [{"path": str(_workspace()), "mode": "full"}]}, ensure_ascii=False),
+        json.dumps({"rules": [{"path": str(WORKSPACE), "mode": "full"}]}, ensure_ascii=False),
         encoding="utf-8",
     )
 
@@ -177,7 +148,7 @@ async def main() -> None:
             "-m",
             "tiancheng_mcp",
             "--workspace",
-            str(_workspace()),
+            str(WORKSPACE),
             "--audit-dir",
             str(REPO / "logs"),
             "--allow-exec",

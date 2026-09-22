@@ -175,7 +175,7 @@ def test_agent_admin_smoke_uses_fixed_read_only_request(tmp_path: Path) -> None:
     result = run_agent_smoke(
         workspace,
         profile="claude-default",
-        passthrough_env=("EXAMPLE_SERVICE_KEY",),
+        passthrough_env=("EXAMPLE_AGENT_KEY",),
         service_factory=FakeService,
     )
 

@@ -110,20 +110,20 @@ def test_exec_environment_does_not_inherit_control_plane_key(
 def test_exec_environment_passes_only_explicit_named_variable(
     workspace: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setenv("EXAMPLE_SERVICE_KEY", "fixture-not-a-real-key")
+    monkeypatch.setenv("EXAMPLE_AGENT_KEY", "example-provider-test-secret")
     enabled = TianChengService(
         workspace,
         tmp_path / "exec-audit",
         allow_exec=True,
-        passthrough_env=("EXAMPLE_SERVICE_KEY",),
+        passthrough_env=("EXAMPLE_AGENT_KEY",),
     )
     result = enabled.run_command(
         "python",
-        ["-c", "import os; print(os.environ.get('EXAMPLE_SERVICE_KEY', 'missing'))"],
+        ["-c", "import os; print(os.environ.get('EXAMPLE_AGENT_KEY', 'missing'))"],
         timeout_seconds=10,
     )
     assert result["exit_code"] == 0
-    assert result["stdout"].strip() == "fixture-not-a-real-key"
+    assert result["stdout"].strip() == "example-provider-test-secret"
 
 
 def test_exec_environment_never_allows_protected_names(

@@ -8,6 +8,82 @@
 
 ## [Unreleased]
 
+### Added
+
+- 新增确定性的公开版同步器：只导出 Git 跟踪文件，执行 TianCheng/TianCheng 命名映射，
+  拒绝内部名称、已知机器路径和 local-only Agent profile 残留，并要求源与目标仓库状态可核验。
+- 新增可移植的 launcher/Agent profile 示例；真实工作区、工具路径、Agent runtime home、
+  credential 变量名、访问策略、Catalog、状态和日志全部进入 Git 忽略的本机配置层。
+- 内置 Codex profile 统一为不绑定私人 provider 或 credential 的 `codex-default`；额外 Codex
+  profile 继续通过 local-only `config/agent-profiles.json` 叠加。
+- 新增 Windows Tunnel Supervisor：按 profile 单实例托管 `tunnel-client + stdio MCP` 完整
+  进程树，支持内部 502/连续 upstream failure/进程退出检测、指数退避、稳定窗口重置、
+  10 分钟重启预算、熔断和原子状态快照；`tc start/start-new/stop/restart` 已接入该生命周期。
+- 启动器配置新增 `supervisor` 段，默认显式使用 `mcpConnectionMaxTtl=24h`；设置界面可开关
+  Supervisor 和修改 transport TTL，并明确它不是 Agent 或后台进程运行上限。
+- Agent profile 配置升级为 v2 overlay：`inherit_defaults=true` 保留内置 provider profile，
+  支持同名覆盖、追加与 `enabled=false` 显式禁用；认证只能选择单一 `credential_env` 或
+  `existing-login`。配置缺失回退内置默认，存在但无效仍 fail-closed，避免自定义 Codex profile
+  意外移除 `claude-default`。
+- `agent_run(start)` 新增逐 run `max_runtime_seconds`；省略时采用推荐的 1 小时默认值，调用方可
+  按任务调整，服务端硬限制为 `1..10800` 秒（最长 3 小时），run payload 回显实际生效值。
+- 新增配置驱动的 MCP Agent Profile registry 与 `isolated-agent` profile；由服务端冻结独立
+  `<ABSOLUTE_CODEX_HOME>` runtime home；Codex spawn 前通过专用通道设置
+  `CODEX_HOME`，MCP 调用方不能传入或覆盖任意环境变量/runtime home。
+- Agent profile 可绑定单个 `credential_env`。CLI 只从 `.env` 读取 profile 声明的名称，运行时
+  只向当前 profile 注入自己的 credential；Agent key 不再依赖全局 `exec-env.allowlist`，新增
+  profile 无需修改 Python registry 或 PowerShell 启动器。
+- `workspace_info.agent_profile_metadata` 与 session inspect 新增非敏感的
+  `runtime_home_isolated` 标记；Codex CLI 的 `-p` 语义在代码中明确为
+  `codex_config_profile`，与 MCP profile 名称分离。
+- Codex Agent session/run 新增结构化 `codex_defaults` 与逐 run `codex_options`，覆盖已测试
+  `codex-cli 0.153.0` 的 `exec` 运行参数面；model、reasoning effort、route、重复 config/
+  feature/path flags 均保持原生 argv 语义，不再需要为每个模型和路由复制 profile。
+- `agent_run(start)` 新增 `codex_action=continue|fork|review`；fork 只使用当前服务端绑定的
+  native session id，review target 参数在 spawn 前执行互斥校验。
+
+### Changed
+
+- `tc status` 不再把 `/readyz` 当作 MCP 已通过端到端探测；现在分别报告 Supervisor、Tunnel
+  readiness、`MCP Inferred` 与 `MCP Verified`。当前 stdio 无同 transport probe 时 verified
+  明确显示 `not-available`，旧的裸 Tunnel 则显示 `unverified`。
+- `agent_session(create|attach)` 的默认 sandbox 从 `read-only` 改为 `workspace-write`；需要只读
+  行为时必须显式传入 `sandbox="read-only"`。调用方显式选择的 sandbox 仍保持不变。
+- provider capabilities 现在返回 `tested_cli_version`，Codex 同时声明 fork/review 能力；
+  session/run inspect 仅返回有界、非敏感的 effective options 摘要。
+- Codex 的 root-level `--search` 与 `-a` 按 0.153.0 实际语法放在 `exec` 前；旧调用不传新
+  options 时仍生成原有命令。
+
+### Security
+
+- transport 恢复只重建连接和受控进程树，不自动重放任何结果未知的请求；写入、命令、Agent、
+  Git 等副作用仍由现有 job/idempotency 契约负责。Supervisor 只接受本机 loopback health URL、
+  结构化 argv 和受限 profile 名称，状态文件不保存 key、env、工具参数或正文。
+- 独立 Codex home 必须预先存在，并在 session 创建和每次 run 前重新验证：要求绝对路径、
+  无 reparse、命中无需审批的可写 access-policy，且拒绝系统目录、服务代码/策略/日志目录、
+  filesystem root 与敏感名称路径。返回值不暴露 runtime home、凭据内容或完整子进程环境。
+- Profile 配置采用严格字段白名单；credential 变量名受既有保护名单约束，`.env` 中未被 profile
+  声明的变量不会加载，多个 profile 的 credential 不会进入同一个 Agent 子进程。
+- Codex 路径参数逐项经过 workspace/access-policy 与 reparse 校验；route 只作为受控的
+  单进程 `AWZ_ROUTE` overlay 注入且不回显值。任意 argv/env map、危险 sandbox/hook bypass、
+  secret/env/provider endpoint/hook/plugin/MCP 等敏感 `-c` 根均明确拒绝。
+- `--last/--all` 不能绕过明确 session 绑定；ephemeral run 不持久化临时 native thread id。
+
+### Verified
+
+- 定向回归 `tests/test_tunnel_supervisor.py + tests/test_launcher.py` 为 `31 passed`。
+- `supervisor.enabled=false` 配合故意无效的 Python 路径仍成功进入旧的裸 Tunnel 路径；实际
+  command line 只有 `run --profile tiancheng-local`，无 Supervisor、无 TTL override。
+- `tc stop` 后 Supervisor、tunnel-client、stdio child 均为 0，`.lock/.stop` 不存在；持续观察
+  60 秒没有复活。只强杀 Supervisor PID 后，Job Object 也将 Tunnel/stdio 孤儿数保持为 0。
+- 实际终止 tunnel-client 后自动进入 generation 2；state/JSONL 已核对并由单测固定
+  `generation/recovery_reason/restart_count/backoff_until` 四个诊断字段。
+- `isolated-agent` 已迁移到 Codex CLI 当前的独立 `isolated-agent.config.toml` profile 文件格式。真实请求
+  已通过自定义 endpoint 认证并精确返回预期 marker；stdio 验收通过 profile 注册、隔离标记、
+  session、native resume、并发拒绝、cancel/close、read-only 拒写和清理链路，结果 `21/23`。
+  未通过的两项均为 workspace-write 文件落盘验证：当前 Codex 内嵌 Codex 的测试宿主把直接调用
+  和 MCP 子进程都约束为 read-only，因此仍需从正常 Tunnel 宿主完成最终写入确认。
+
 ## [0.9.1] - 2026-09-01
 
 ### Fixed
@@ -36,7 +112,7 @@
 - 新增 local-only Agent source admin 与 `tc` 主菜单 E：固定根/CLI version 探测、source 增删启停/验证、单源 metadata refresh，以及停止 Tunnel 后的可恢复 Catalog rebuild；这些能力不注册为 MCP tool。
 - 新增 TUI 真实最小 Agent smoke 入口：必须停止 Tunnel 并输入 provider-specific 二次确认，固定 read-only prompt/180 秒超时，只报告 marker 验证结果而不输出模型正文。
 - 白名单新增 `browse` 档：只允许列目录，且每次只返回一层。可逐级下钻（列授权根 → 进入子目录 → 再列一层），但读不到文件内容、不能写、不能执行，`browse` 与 `allow_exec` 组合直接拒绝。用于让调用方先看清目录结构，再决定把哪些目录提升进白名单。
-- Agent 的工作目录不再写死为工作区，改为由 access policy 决定：白名单覆盖的目录都可以承载 Codex/Claude 会话，沙箱 `read-only`/`workspace-write` 分别要求规则的 `read`/`write` 能力。运行 agent 不算 `exec`，因为命令模板由服务端固定且限定在该目录，与任意 `external_run_command` 分开授权。
+- Agent 的工作目录不再写死 `<WORKSPACE>`，改为由 access policy 决定：白名单覆盖的目录都可以承载 Codex/Claude 会话，沙箱 `read-only`/`workspace-write` 分别要求规则的 `read`/`write` 能力。运行 agent 不算 `exec`，因为命令模板由服务端固定且限定在该目录，与任意 `external_run_command` 分开授权。
 - Agent 会话每次 run 前重新校验工作目录授权，`attach` 的续接会话同样如此；规则被撤销、缩小或换根时下一轮立即 fail-closed，不会继续在原目录执行。
 - Catalog 记录新增 `cwd_scope`，`attach` 现在接受工作目录位于白名单内的历史会话；原始绝对路径只用于服务端授权，不会出现在 MCP 返回值里。
 - 新增热重载模式（`--allow-policy-hot-reload`，默认关闭，属高危档）。开启后注册四个独立工具：`access_policy_change_request` 暂存目录与模式并返回一次性 challenge，本身不授予任何权限；`access_policy_change_confirm` 只接受 `request_id`、`challenge` 与用户确认词，在类型层面就无法选择或扩大路径与权限——能力在暂存时即已冻结；另有 `cancel` 与只读 `status`。确认后原子写入 `access-policy.json`（保留 `.bak`）并立即生效，无需重启。冷重载行为完全不变。
@@ -48,14 +124,14 @@
 - `workspace_info` 的 `access_policy` 现在逐条列出白名单规则（路径、模式、`allow_exec`、`require_approval`、启用状态、备注），不再只返回规则数量。此前调用方无法知道自己能用哪些目录，只能先猜路径再用 `access_policy_explain` 逐个验证；而 `explain` 本来就能问出同样的信息，所以隐藏列表不增加任何安全性，只增加使用摩擦。停用的规则同样列出，便于分辨"未授权"与"已停用"。
 - 引入 provider-neutral `AgentAdapter`、capabilities 和 profile→adapter 绑定；Codex 的命令构造与 JSONL parser 已迁出通用 runtime。
 - Catalog schema v2 将每条索引绑定到 source root 与候选文件 identity；list/inspect 会重新校验 identity、size 与 mtime，目录遍历错误会降级为 partial refresh 而不会误删未扫描记录。
-- Agent session/run payload 新增 `provider` 与 `native_session_id`，同时保留 `thread_id` 兼容字段；`agent_session` 增加 `attach`，`agent_run` action 不变。
+- Agent session/run payload 新增 `provider` 与 `native_session_id`，同时保留 `thread_id` 兼容字段；`agent_session` 在 0.9c 增加 `attach`，`agent_run` action 不变。
 - 生命周期事件使用 adapter display name，runtime 不再硬编码 Codex 文案；provider/profile 绑定不一致时 fail-closed。
 - Attached session 每轮执行前重验授权；允许同一 identity 的原生历史正常追加，但 source disable、root/file replacement、native id/cwd 变化都会拒绝，绝不回退 `--last`。
 - Claude `read-only` 仅开放 Read/Glob/Grep，`workspace-write` 仅增加 Edit/Write；不接受 Bash、任意 settings/agents/plugins/MCP/add-dir/model/effort 或危险权限参数。
 - Catalog 将 Windows 无符号 64 位文件 identity 无损映射为 SQLite int64，避免部分卷上的 `st_dev/st_ino` 触发写入溢出并拖垮 refresh。
 - Catalog 所有 SQLite 连接现在显式关闭，避免 Windows 文件锁和长期运行时的连接泄漏阻断 refresh/rebuild。
 - Agent source 原子保存若在 ACL 收紧阶段失败，会恢复上一版（首次创建则撤销），不会留下“命令报错但宽权限新策略已生效”的半完成状态。
-- Agent profile 显式声明是否接收已配置的业务环境变量；`codex-default` 保留既有透传，`claude-default` 默认不接收 `EXAMPLE_SERVICE_KEY` 等变量。
+- Agent profile 显式声明是否接收已配置的业务环境变量；`codex-default` 保留既有透传，`claude-default` 默认不接收 `EXAMPLE_AGENT_KEY` 等变量。
 
 ### Fixed
 
@@ -70,16 +146,29 @@
 
 ### Verified
 
-- 自动化测试覆盖 WorkspaceJail、reparse point 拒绝、access policy 求值、external grants、job 生命周期、Agent adapter/registry、metadata Catalog、Agent source 策略与 launcher 行为；Agent 相关用例使用不依赖真实 CLI 的 fake adapter。
-- 合成 stdio 验收经真实 JSON-RPC 走完整启动路径，覆盖工具注册面、catalog list、session attach 与 run start/inspect/result，不读取任何真实会话历史，也不调用真实模型。
-- 白名单、`browse` 档与策略热重载另有一份 stdio 验收，使用一次性策略文件，覆盖：批准前拒绝；暂存请求不授予任何权限；错误 confirmation 被拒；服务端自身目录、config 目录与盘符根被拒；`browse` 每次只返回一层且深度请求被夹回一层、拒绝文件内容、不能承载 Agent；权限提升后生效、收窄后立即失效，全程无需重启。
-- 每一条"文件已创建"结论都由 MCP `read_text` 独立读回内容验证，不采信 Agent 自报；`read-only` 会话的写入不产生文件；运行结束后无 Agent 子进程残留。
-- job record 回收路径经实测复现并修复：观察类工具此前会占满记录表并使所有走 job 的工具持续拒绝服务。
-- managed process 与 Agent 的输出流为真正增量：修复前读取线程会阻塞到读满缓冲区或管道关闭，导致事件在进程结束时才一次性到达。
-- 在授权的本地环境完成了额外的端到端验证，包括真实 Agent CLI 的启动、续接、并行、事件流隔离与取消。这些运行依赖本机安装与私有凭据，**不随本仓库提供，也无法在公开仓库中复现**。
-- **平台限制（非本项目缺陷）**：经 ChatGPT 连接器验收时，`access_policy_change_confirm` 始终无法到达服务端，被 ChatGPT 侧的安全检查拦截；同一流程中的 `request`、`status`、`cancel` 均可正常到达。把单一多 action 工具拆分为四个独立工具、并把 confirm 的 schema 收窄到只接受 `request_id`/`challenge`/`confirmation` 之后，该行为没有变化，说明拦截针对的是"提交权限变更"这一动作本身，而非 schema 形态。审计日志确认拦截发生在服务端之外：被拦后 staged request 保持 pending，未产生半授权状态，`fail-closed` 行为正确。因此策略热重载的端到端能力目前只在本地 stdio 客户端验证通过，ChatGPT 侧不可用。未采取任何针对该安全检查的规避措施。
-- 两条真实环境约束：`external_*` 文件工具只在开启 external grants 时注册，因此热重载需配合 GRANTS Profile 才完整可用；Codex 拒绝在非 git 仓库目录中运行，服务端不传 `--skip-git-repo-check`。
-- 出厂默认 Agent source 数为 0：不配置任何 source 就不会读取本机历史，必须由用户显式授权后才会扫描。
+- 使用不依赖 Codex JSONL 的 fake adapter 覆盖 create、resume、事件、结果与 provider binding。
+- 0.9a 全量测试 `103 passed, 1 skipped`；用户随后在管理员 PowerShell 将原 symlink skip 定向补跑为 `1 passed`。
+- 0.9b 提交前全量测试 `125 passed, 1 skipped`；唯一 skip 仍为当前普通 Windows 测试进程没有 symlink 创建权限，用户已在管理员 PowerShell 将同一用例定向补跑为 `1 passed`。
+- 0.9c 提交前全量测试 `129 passed, 1 skipped`；合成 stdio smoke 实际完成 catalog list、session attach、run start/inspect/result，未读取真实 history 或调用真实模型。
+- 0.9d 提交前全量测试 `134 passed, 1 skipped`；fake Claude 覆盖 create、resume、Catalog attach、result、agent-only executable 与 prepared-process fail-closed 边界。
+- 0.9e source/TUI 批次全量测试 `140 passed, 1 skipped`；隔离 fixture 覆盖 discovery、ADD 确认、ACL rollback、增删启停、refresh、Windows 可恢复 rebuild 与 launcher JSON 状态。
+- 0.9e smoke/env 批次全量测试 `141 passed, 1 skipped`；fake runtime 覆盖固定 smoke prompt/生命周期，fake secret 覆盖 Codex/Claude profile 环境隔离。
+- stdin EOF 修复后，真实 `codex-default` smoke 使用 `gpt-5.6-sol` 成功验证 marker，Agent runtime 内部耗时 `13.483s`；同轮全量测试 `142 passed, 1 skipped`。
+- Claude 参数顺序修复后，真实 `claude-default` smoke 使用 `claude-sonnet-5` 成功验证 marker，Agent runtime 内部耗时 `7.288s`。
+- job record 回收批次全量测试 `145 passed, 2 skipped`。两个 skip 均为环境限制：当前测试进程没有 symlink 创建权限，且本机 `rg` 不在 PATH（`shutil.which('rg')` 为 None，`search_text` 回退到 Python 实现）。
+- 0.5-A 真实 stdio 全链验收：经 `run-mcp-exec.ps1` 走真实 stdio JSON-RPC，Codex `codex-default` 与 Claude `claude-default` 各完成 create → 任意写入任务 → 同 session resume → events/result → cancel → close，合并 `40/40` 通过，耗时 `146.1s`。
+- 0.9.0 收口前全量测试 `160 passed, 2 skipped`（两个 skip 仍为环境限制：无 symlink 创建权限、本机 `rg` 不在 PATH）。
+- 0.9.0 经 ChatGPT 连接器真实端到端验收：`codex-default`（cwd `<WORKSPACE_A>`）与 `claude-default`（cwd `<WORKSPACE_B>`）各完成 create → start → events 游标轮询 → result → close，全部 `succeeded`、exit code `0`，首个 event 分别为 `5.57s` 与 `3.52s`，全程无工具调用被连接器拦截；两个 agent 的输出均包含各自仓库根目录的真实文件清单。
+- 0.9.0 多 Agent 编排验收：`codex-default` 与 `claude-default` 两个 session 在 `<WORKSPACE>` 同时处于 `running`（B 启动后立即 inspect A 仍为 `running`，非串行伪并行），各自 cursor 独立且事件流互不串台（A 的事件不含对方 marker，反之亦然）；Claude 随后在同一 session 的第二个 run 中读取 Codex 写出的文件并追加到自己的产物，最终内容经 `read_text` 读回确认同时包含两个 marker，构成基于共享 workspace artifact 的真实交接；对同一 session 的重复 `start` 按预期拒绝（`Only one active run is allowed per agent session`），长任务 `cancel` 后终态为 `cancelled`，两个 session 均正常关闭。
+- 上述验收的每一条“文件已创建”结论均由 MCP `read_text` 独立读回内容验证，不采信模型自报；resume 前后 `native_session_id` 一致；`read-only` session 的写入未产生文件；测试目录经 `delete` 进入 trash 且原路径消失；运行结束后无 Codex/Claude 子进程残留。
+- 该验收在修复前实测复现了 job record 耗尽：单次运行产生 251 次 `agent_run_events`，随后 `mkdir`/`delete`/`trash_list` 全部拒绝服务，而 `stat` 仍可用；修复后同一链路轮询次数降至 1–7 次。
+- 白名单/`browse`/热重载真实 stdio 验收 `26/26` 通过，使用一次性策略文件，未修改机器上真实的 `access-policy.json`。覆盖：批准前 Agent 与列目录均拒绝；`request` 暂存不授予任何权限；错误 confirmation 被拒；服务端自身目录、config 目录与盘符根被拒；`browse` 只返回一层且 `depth=5` 被夹回一层、拒绝文件内容、不能承载 Agent；提升为 `write` 后 Codex 与 Claude 各自在工作区外的目录真实写入文件，内容由 MCP 独立读回验证，且同一文件用工作区工具读不到；把规则收窄回 `browse` 后 Agent 与读取立即失效，全程未重启。
+- **平台限制（非本项目缺陷）**：经 ChatGPT 连接器远端验收时，`access_policy_change_confirm` 始终无法到达 TianCheng 服务端，被 ChatGPT 侧的安全检查拦截；同一流程中的 `request`、`status`、`cancel` 均可正常到达。把单一多 action 工具拆分为四个独立工具、并把 confirm 的 schema 收窄到只接受 `request_id`/`challenge`/`confirmation` 之后，该行为没有变化，说明拦截针对的是"提交权限变更"这一动作本身，而非 schema 形态。审计日志确认拦截发生在服务端之外：被拦后 staged request 保持 pending，未产生半授权状态，`fail-closed` 行为正确。因此策略热重载的端到端能力目前只在本地 stdio 客户端验证通过，ChatGPT 侧不可用。未采取任何针对该安全检查的规避措施。
+- 验收过程中确认两条真实环境约束：`external_*` 文件工具只在 external grants 开启时注册，因此热重载需配合 GRANTS Profile 才完整可用；Codex 拒绝在非 git 仓库目录运行，服务端不传 `--skip-git-repo-check`。
+- 出厂默认 source count 仍为 0：不配置任何 source 就不会读取本机历史，需用户显式授权后才会扫描。
+- 0.5-B 真实历史 attach/resume 已由用户授权后实测：本机 source 索引 752 个 transcript 文件（Codex 634、Claude 118），Codex 与 Claude 各自从 Catalog `conversation_ref` attach 到一段真实历史会话并原生 resume，各 `11/11` 通过；判定依据是被恢复的会话能答出仅存在于其自身上文中的事实（`RESUMED-OK <n>`），而非模型自报成功。验收脚本不打印任何 transcript、标题或提示词正文，只做有界 marker 校验。
+- 0.5-C Tunnel/ChatGPT 远端全链已完成，结果记录于上方条目：两个 provider 端到端跑通，并另行验证了并行、事件流隔离、共享 artifact 交接与单 session run 锁。
+- 剩余限制：策略热重载的 `confirm` 在 ChatGPT 连接器下仍不可用（见上方平台限制条目），该能力目前只在本地 stdio 客户端验证通过。
 
 ## [0.8.1] - 2026-08-29
 
@@ -166,7 +255,7 @@
 
 - 落地静态 `AccessPolicy` 策略引擎 Phase A：规则模型、最长路径匹配、deny 优先、
   fail-closed 配置校验和 reparse-point 防护。
-- `workspace_info` 增加当前策略规则摘要；默认仍只允许配置的工作区。
+- `workspace_info` 增加当前策略规则摘要；默认仍只允许 `<WORKSPACE>`。
 - 增加策略引擎单元测试，覆盖权限级别、冲突、缺失目录和越界场景。
 
 ### Note

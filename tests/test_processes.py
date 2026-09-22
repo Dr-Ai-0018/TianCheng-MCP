@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import os
+import shutil
 import time
 from pathlib import Path
+
+import pytest
 
 from tiancheng_mcp.service import TianChengService
 
@@ -130,3 +134,63 @@ def test_managed_output_is_readable_before_the_process_exits(
         service.stop_process(process_id, force=True)
     finally:
         service.shutdown()
+
+
+def _fake_which(mapping: dict[str, str]):
+    def which(name: str, *args, **kwargs):
+        return mapping.get(name)
+
+    return which
+
+
+def _touch(path: Path) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("", encoding="utf-8")
+    return path
+
+
+def test_codex_discovery_uses_the_npm_managed_launcher(
+    monkeypatch: pytest.MonkeyPatch, workspace: Path, tmp_path: Path
+) -> None:
+    launcher = _touch(tmp_path / "npm/codex.cmd")
+    _touch(tmp_path / "npm/node_modules/@openai/codex/bin/codex.js")
+    node = _touch(tmp_path / "node.exe")
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "AppData/Local"))
+    monkeypatch.setattr(
+        shutil, "which", _fake_which({"node": str(node), "codex": str(launcher)})
+    )
+
+    service = TianChengService(workspace, tmp_path / "audit", allow_exec=True)
+
+    codex = service._exec_commands["codex"]
+    assert codex[0] == str(node.resolve())
+    assert codex[1].endswith("codex.js")
+
+
+def test_codex_discovery_refuses_the_desktop_build(
+    monkeypatch: pytest.MonkeyPatch, workspace: Path, tmp_path: Path
+) -> None:
+    local_app_data = tmp_path / "AppData/Local"
+    desktop = _touch(local_app_data / "OpenAI/Codex/bin/247581e40ee272fb/codex.exe")
+    monkeypatch.setenv("LOCALAPPDATA", str(local_app_data))
+    monkeypatch.setattr(shutil, "which", _fake_which({"codex": str(desktop)}))
+
+    service = TianChengService(workspace, tmp_path / "audit", allow_exec=True)
+
+    # Mixing the Desktop build with the npm release makes each one invalidate
+    # the other's elevated-sandbox marker, so every sandboxed call re-runs the
+    # elevated provisioning helper and raises a UAC prompt.
+    assert "codex" not in service._exec_commands
+
+
+def test_codex_discovery_refuses_a_bare_windows_executable(
+    monkeypatch: pytest.MonkeyPatch, workspace: Path, tmp_path: Path
+) -> None:
+    stray = _touch(tmp_path / "elsewhere/codex.exe")
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "AppData/Local"))
+    monkeypatch.setattr(shutil, "which", _fake_which({"codex": str(stray)}))
+    monkeypatch.setattr(os, "name", "nt")
+
+    service = TianChengService(workspace, tmp_path / "audit", allow_exec=True)
+
+    assert "codex" not in service._exec_commands

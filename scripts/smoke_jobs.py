@@ -6,46 +6,15 @@ import asyncio
 import json
 import sys
 import uuid
-import os
-import shutil
 from pathlib import Path
 
 from mcp import Client, StdioServerParameters
 
-
-def _powershell() -> Path:
-    """Locate pwsh on PATH, or accept an explicit override.
-
-    Nothing here may point at one particular machine's install: a clone has to
-    work wherever PowerShell 7 happens to live.
-    """
-
-    override = os.environ.get("TIANCHENG_POWERSHELL")
-    if override:
-        return Path(override)
-    found = shutil.which("pwsh")
-    if not found:
-        raise SystemExit(
-            "pwsh (PowerShell 7) was not found on PATH. Install it, or set "
-            "TIANCHENG_POWERSHELL to its full path."
-        )
-    return Path(found)
-
-
-def _workspace() -> Path:
-    """Return the workspace this smoke run may touch."""
-
-    value = os.environ.get("TIANCHENG_WORKSPACE")
-    if not value:
-        raise SystemExit(
-            "Set TIANCHENG_WORKSPACE to the directory this smoke run may use. "
-            "It has no default: the workspace is the security boundary."
-        )
-    return Path(value)
+from local_runtime import workspace_path
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-WORKSPACE = None  # resolved lazily by _workspace()
+WORKSPACE = workspace_path(PROJECT_ROOT)
 
 
 def structured(result: object) -> dict:
@@ -63,7 +32,7 @@ async def smoke() -> None:
             "-m",
             "tiancheng_mcp",
             "--workspace",
-            str(_workspace()),
+            str(WORKSPACE),
             "--audit-dir",
             str(PROJECT_ROOT / "logs"),
             "--allow-exec",
@@ -72,9 +41,6 @@ async def smoke() -> None:
         ],
         cwd=str(PROJECT_ROOT),
         encoding="utf-8",
-        # The SDK gives the child a minimal environment, so the workspace
-        # and any other TIANCHENG_* settings would not reach the server.
-        env=dict(os.environ),
     )
     key = f"smoke-{uuid.uuid4().hex}"
     validation_failed = False

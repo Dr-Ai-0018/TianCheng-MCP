@@ -1,11 +1,8 @@
 # TianCheng Local MCP
 
-面向 Windows 11 / PowerShell 7 的本地 stdio MCP Server。它只向 MCP 客户端暴露
-**你自己指定的一个工作区目录**内的文件与本地 Git 能力；服务端代码、依赖和审计日志留在
-仓库目录里，不在客户端可写的工作区内。
-
-工作区没有内置默认值，必须由你显式配置——它就是这个项目的安全边界，猜错的代价是
-把错误的目录暴露出去。
+面向 Windows 11 / PowerShell 7 的本地 stdio MCP Server。它只向 ChatGPT 暴露
+`<WORKSPACE>` 工作区内的文件与本地 Git 能力；服务端代码、依赖和审计日志位于
+仓库目录，不在 ChatGPT 可写工作区内。
 
 当前版本：`0.9.1`。依赖锁定到官方维护的 MCP Python SDK `2.1.0`，使用当前
 `MCPServer`、`MCPServer.tool()`、`ToolAnnotations` 与 stdio transport API。
@@ -30,7 +27,7 @@ tunnel-client v0.0.12
 run-mcp.ps1
         |
 TianCheng Local MCP
-   |-- WorkspaceJail  --> <YOUR_WORKSPACE_PATH> only
+   |-- WorkspaceJail  --> <WORKSPACE> only
    |-- file/search/git tools
    `-- audit log      --> <REPO>\logs
 ```
@@ -67,7 +64,7 @@ destructive，`run_command` 同时标为 destructive/open-world。
 
 ### 聊天内动态外部授权（可选）
 
-默认仍严格限制在 `<YOUR_WORKSPACE_PATH>`。使用 `run-mcp-grants.ps1`（或命令行参数
+默认仍严格限制在 `<WORKSPACE>`。使用 `run-mcp-grants.ps1`（或命令行参数
 `--allow-external-grants`）后，ChatGPT 才能申请临时外部目录能力：先调用
 `request_external_access`，让用户在聊天中明确确认后，再提交 `request_id + challenge + confirmation="批准"`
 给 `approve_external_access`。challenge 是一次性随机值，不是密码；当前版本没有 TOTP 验证步骤，
@@ -86,7 +83,7 @@ destructive，`run_command` 同时标为 destructive/open-world。
 并在 `workspace_info` 报告规则摘要。启用 external grants 后，匹配到
 `require_approval=false` 的静态外部规则会直接签发受限 grant；对应 `external_*` 工具也可以
 省略 `grant_id`，直接使用白名单允许的绝对路径，不会绕过现有路径检查或能力限制。默认行为
-仍只有 `<YOUR_WORKSPACE_PATH>`。
+仍只有 `<WORKSPACE>`。
 
 TUI 主菜单的“D. 外部路径白名单 / 访问策略”已经可以查看、新增、编辑、启用/禁用和删除规则，
 并提供“测试路径权限”和“验证策略并提示 reload”。保存时会先生成同目录 `.bak` 快照，使用
@@ -101,20 +98,7 @@ TUI 主菜单的“D. 外部路径白名单 / 访问策略”已经可以查看�
 但读不到任何文件内容，也不能写或执行；`browse` 与 `allow_exec` 不能同时设置。它的用途是让
 调用方先看清目录结构，再决定把哪些目录提升进白名单。
 
-内置两个 profile：`codex-default` 与 `claude-default`，分别驱动标准 Codex CLI 和
-Claude Code CLI，命令模板由服务端固定。
-
-`codex-default` 默认**不**传 `-p`，即使用你 Codex 的默认配置。如果你在本机配置了自己的
-Codex profile，设置环境变量即可启用，仓库里不会保存任何人的私有 profile 名：
-
-```powershell
-$env:TIANCHENG_CODEX_PROFILE = 'your-profile-name'
-```
-
-该值只接受裸 profile 名（首字符为字母或数字，其后可含字母、数字、点、短横、下划线，最长
-64 字符）。含空格、斜杠或以 `-` 开头的值会被直接拒绝，避免往固定命令模板里塞进额外参数。
-
-Agent 的工作目录不固定为工作区。白名单覆盖的任何目录都可以承载 Codex/Claude 会话：
+Agent 的工作目录不再固定为 `<WORKSPACE>`。白名单覆盖的任何目录都可以承载 Codex/Claude 会话：
 `read-only` 需要规则具备 `read`，`workspace-write` 需要 `write`，因此 `browse` 规则不能跑 Agent。
 启动 Agent 不算 `exec`——命令模板由服务端固定并限定在该目录，与任意 `external_run_command`
 分开授权，你可以只开 Agent 而不开任意命令执行。
@@ -126,9 +110,10 @@ Agent 的工作目录不固定为工作区。白名单覆盖的任何目录都�
 
 - `external_*` 文件工具只在开启 external grants 时注册。只开热重载可以把目录写进白名单，
   但没有文件工具能操作它，只有 Agent 能用；要完整可用请使用 GRANTS 或 GRANTS+Exec Profile。
-- Codex 拒绝在非 git 仓库的目录中运行（`Not inside a trusted directory`）。服务端不会传
-  `--skip-git-repo-check`，因为那是 Codex 自己用于保证改动可回滚的安全网。把普通目录加入
-  白名单后 Codex 仍会拒绝，Claude 不受影响。
+- Codex 默认拒绝在非 git 仓库的目录中运行（`Not inside a trusted directory`）。确有需要时，
+  可在单次 `agent_run(start)` 的 `codex_options` 中明确设置
+  `skip_git_repo_check: true`；这只关闭 Codex 内层仓库检查，不会绕过 TianCheng 的 cwd、路径或
+  access-policy 校验。Claude 不受这项 Codex 检查影响。
 
 ### 热重载模式（高危，默认关闭）
 
@@ -149,109 +134,37 @@ Agent 的工作目录不固定为工作区。白名单覆盖的任何目录都�
 请清楚这一档的实际含义：challenge 会返回给调用方，所以「必须用户批准」是一道**对话层面的
 约定**，而不是密码学上的强制。它默认关闭，只有你明确开启时才存在。
 
-## 在新设备上部署
+## 安装
 
-### 1. 前置条件
-
-- Windows 11
-- PowerShell 7（`pwsh`，需在 PATH 上）
-- Python 3.12+
-- [uv](https://docs.astral.sh/uv/)
-- Git（可选，本地 Git 工具需要它）
-- OpenAI tunnel-client（只有走 Secure MCP Tunnel 时才需要）
-
-### 2. 取得代码
-
-公开仓库的 clone 与 pull **不需要 GitHub token**：
+要求 Python 3.12+、[uv](https://docs.astral.sh/uv/) 和可选的 Git。
 
 ```powershell
-git clone https://github.com/Dr-Ai-0018/TianCheng-MCP.git
-Set-Location -LiteralPath .\TianCheng-MCP
-```
-
-### 3. 安装依赖
-
-```powershell
+Set-Location -LiteralPath '<REPO>'
 uv sync --frozen --extra test
-```
-
-### 4. 选定工作区
-
-工作区是这个服务器唯一可以触碰的目录。**它没有默认值**，配置缺失时启动会直接报错，
-而不会退回到任何人的机器路径。
-
-```powershell
-New-Item -ItemType Directory -Path '<YOUR_WORKSPACE_PATH>' -Force | Out-Null
-```
-
-不要把仓库自身或其父目录设为工作区。
-
-### 5. 生成本机配置
-
-```powershell
+New-Item -ItemType Directory -Path '<WORKSPACE>' -Force | Out-Null
 Copy-Item .\config\launcher.local.example.json .\config\launcher.local.json
 ```
 
-然后编辑 `config\launcher.local.json`，至少填写 `workspace`。`launcher.local.json`
-已被 `.gitignore` 排除，**机器专属路径只应该出现在这个文件里**。
+在 `config\launcher.local.json` 中填写 `workspace`。`tunnelClient` 与 `powerShell` 留空时
+从 PATH 自动发现；只有本机未加入 PATH 时才填写绝对路径。
 
-`tunnelClient` 与 `powerShell` 留空即表示从 PATH 上自动探测；只有当它们不在 PATH 上时
-才需要写绝对路径。也可以用环境变量 `TIANCHENG_WORKSPACE` 覆盖工作区。
+### 配置与版本控制边界
 
-### 6. 选择运行档位
+Git 只跟踪可移植默认值和示例：`launcher.defaults.json`、
+`launcher.local.example.json`、`agent-profiles.example.json` 与 `.env.example`。
+以下文件只属于当前机器，均被 `.gitignore` 排除：
 
-| 档位 | 启动方式 | 能力 |
-| --- | --- | --- |
-| SAFE | `.\run-mcp.ps1` | 只有工作区内的文件与本地 Git，**默认档** |
-| GRANTS | `.\run-mcp-grants.ps1` | 增加聊天内动态外部授权（一次性 challenge + 显式确认） |
-| DEV | `.\run-mcp-exec.ps1` | 增加白名单 `run_command` 与受管进程 |
-| GRANTS+Exec | `.\run-mcp-grants.ps1 -AllowExec` | 同时开启上面两项，风险最高 |
+- `config/launcher.local.json`：工作区、工具路径和本机 Tunnel 设置；
+- `config/agent-profiles.json`：私有 provider/profile、独立 `CODEX_HOME` 与凭据变量名；
+- `.env`、`exec-env.allowlist`：本机变量值和显式透传名单；
+- `config/access-policy.json`、`config/agent-sources.json`：本机授权策略；
+- `state/`、`logs/`：运行状态、Catalog 与审计日志。
 
-热重载（`-AllowPolicyHotReload`）是可选的高危附加项，默认关闭。
-
-### 7. 为这个节点建立独立的 Tunnel
-
-**每台新设备都必须有自己独立的一套**，不要复用别的机器的：
-
-- 独立的 `tunnel_id`
-- 独立的 runtime / control-plane API key
-- 独立的 tunnel-client profile
-
-ChatGPT 端也要**新建一个独立的 MCP 连接器实例**并绑定到这个新 Tunnel。
-
-任何 key、Tunnel ID 或连接器 ID 都**不要提交进 Git**。
-
-### 8. 验证
+需要自定义 Agent 时复制示例后再修改；不要直接修改随仓库提交的示例：
 
 ```powershell
-uv run pytest -q
-uv run python .\scripts\smoke_stdio.py
+Copy-Item .\config\agent-profiles.example.json .\config\agent-profiles.json
 ```
-
-`smoke_stdio.py` 需要 `TIANCHENG_WORKSPACE` 指向一个可写的测试目录。
-
-### 本地文件的存放边界
-
-以下文件都已被 `.gitignore` 排除，**只属于本机**：
-
-| 文件 | 内容 |
-| --- | --- |
-| `.env` | 明文本地变量（不是加密保险箱） |
-| `config/launcher.local.json` | 本机路径、工作区、profile 名 |
-| `config/access-policy.json` | 白名单规则 |
-| `config/agent-sources.json` | Agent 历史来源授权 |
-| `state/agent-catalog.sqlite3` | Agent 会话 metadata 索引 |
-| `logs/` | 审计日志 |
-| `exec-env.allowlist` | 允许透传的环境变量**名**（不存值） |
-
-### 需要先知道的三条限制
-
-1. **默认不读取任何真实 Agent 历史。** 出厂 source 数为 0，必须由你在本机显式授权
-   来源后才会扫描。
-2. **热重载在 ChatGPT 里不保证可用。** `access_policy_change_confirm` 会被 ChatGPT
-   连接器的安全层拦下，这是平台侧行为，不是本项目的缺陷。该能力目前只在本地 stdio
-   客户端验证通过。
-3. **路径 jail 不等于 OS sandbox。** 见下方「重要：路径 jail 不等于 OS sandbox」。
 
 ## `tc` 中文控制台
 
@@ -278,6 +191,8 @@ tc
 - 一键切换 SAFE/DEV、显示实际运行中的 profile、停止/重启 Tunnel；
 - Profile 管理中可直接切换“聊天外部授权（一次性 challenge）”或“外部授权 + Exec”，无需手动编辑 YAML；
 - 状态检查同时显示 Git、GCM、`gh` 可用/登录布尔状态，不输出账号 token；
+- Tunnel 默认由 Supervisor 托管：stdio transport 出现确定性的内部 502、连续 upstream
+  failure，或 tunnel-client 退出时，会按退避和重启预算自动重建完整进程树；
 - 管理 UI、非敏感启动器设置和显式 Dev profile；
 - “E. 本地 Agent / 会话源管理”可探测 Codex/Claude CLI 与固定历史根，并由用户显式添加、启停、删除、验证、刷新或重建 metadata Catalog；
 - `tc -Action info|profiles|key-status|status|agents -Json` 非交互诊断。
@@ -290,6 +205,34 @@ API key 加载优先级为：当前进程 → Windows 用户环境变量 → `.e
 “是否已配置”和来源，从不显示值。`.env` 位于项目根目录、已被 `.gitignore` 排除，写入
 后会尝试移除继承 ACL 并只授权当前 Windows 用户；它仍然是明文文件，不是加密保险箱。
 `.env` 只由 `tc` 加载，直接执行 tunnel-client 不会自动读取它。
+
+### Tunnel 自动恢复与连接 TTL
+
+`tc start` 和 `tc start-new` 默认不再直接裸跑 `tunnel-client`，而是由本地 Supervisor
+托管。默认配置将 `--mcp.connection-max-ttl` 显式设为 `24h`，并在连接出现确定性的
+`client_internal + upstream_response_received=false` 时立即重建 Tunnel/MCP 进程树；较模糊
+的 deadline/upstream 错误必须在短窗口内连续出现才会触发恢复。控制面普通 poll 断线继续由
+`tunnel-client` 自己退避重连，不会因此误重启 stdio MCP。
+
+Supervisor 默认 10 分钟内最多恢复 5 次，之后熔断为 `FAILED`，避免配置错误造成重启风暴。
+`tc stop` 会停止 Supervisor 和完整子进程树；用户主动停止不会被自动拉起。可在“启动器设置”
+里开关 Supervisor 或修改 transport TTL。这里的 TTL 是 **Tunnel 到 stdio MCP 的连接寿命**，
+不是 `agent_run.max_runtime_seconds`，也不是 `start_process.max_runtime_seconds`。
+
+`supervisor.enabled=false` 是显式逃生开关：此时 `tc` 完全走旧的直接启动路径，不启动 Python
+Supervisor、不要求 Supervisor Python 存在，也不追加 transport TTL 参数。正常 `tc stop` 使用
+stop request 让 Supervisor 自己回收 Job Object 子树，随后确认并删除 `.lock/.stop` 文件；若
+graceful stop 超时才按已核验 PID 强制收尾。
+
+`tc status` 将健康拆成 Tunnel `/readyz`、`MCP Inferred` 和 `MCP Verified` 三栏。当前
+`tunnel-client v0.0.12` 对 stdio 跳过真实 MCP probe，所以 `MCP Verified` 明确显示
+`not-available`，不会把 `/readyz=ready` 冒充成已通过工具 roundtrip。
+在上游提供同 transport probe 前，首次暴露 transport 失效的请求仍可能返回可重试错误；
+Supervisor 只恢复连接，绝不自动重放结果未知的写入、命令、Agent 或 Git 请求。
+
+每次恢复都会向 `logs/tunnel-supervisor-<profile>.jsonl` 追加一行 JSON，至少包含
+`generation/recovery_reason/restart_count/backoff_until`；同样的最新字段会进入
+`state/tunnel-supervisor-<profile>.json`。两处都不记录 key、env、工具参数或正文。
 
 如果只想直接启动裸 stdio MCP，可运行：
 
@@ -313,7 +256,7 @@ DEV 子进程默认仍然拿不到任意业务 secret。如果确实需要让某
 
 ```powershell
 Set-Content -LiteralPath .\exec-env.allowlist `
-  -Value '# names only','EXAMPLE_SERVICE_KEY' -Encoding utf8
+  -Value '# names only','EXAMPLE_AGENT_KEY' -Encoding utf8
 .\run-mcp-exec.ps1
 ```
 
@@ -321,8 +264,8 @@ Set-Content -LiteralPath .\exec-env.allowlist `
 
 ```powershell
 .\.venv\Scripts\python.exe -m tiancheng_mcp `
-  --workspace '<YOUR_WORKSPACE_PATH>' --audit-dir .\logs `
-  --allow-exec --pass-env EXAMPLE_SERVICE_KEY
+  --workspace '<WORKSPACE>' --audit-dir '<REPO>\logs' `
+  --allow-exec --pass-env EXAMPLE_AGENT_KEY
 ```
 
 `--pass-env` 可以重复使用，但只接受合法环境变量名；`CONTROL_PLANE_API_KEY`、OpenAI
@@ -357,7 +300,7 @@ uv run python .\scripts\smoke_exec_stdio.py
    继承用户/系统 Git config 与 GCM，以便访问 GitHub 等远程仓库。
 
 上述边界的目标是保证 MCP 文件和 Git 工具不会把用户提供的路径解析到
-`<YOUR_WORKSPACE_PATH>` 之外。安全检查故意保守：即使链接最终仍指向工作区内部，也会拒绝。
+`<WORKSPACE>` 之外。安全检查故意保守：即使链接最终仍指向工作区内部，也会拒绝。
 
 ### 重要：路径 jail 不等于 OS sandbox
 
@@ -431,6 +374,70 @@ stderr、错误摘要和最终消息都会截断并脱敏。尚未支持任意 p
 同时返回 provider-neutral `native_session_id` 和兼容字段 `thread_id`。未声明的
 Claude runtime、steer/interaction 等能力仍会稳定拒绝。
 
+Agent Profile 名称与 Codex CLI 自己的 config profile 是两层不同概念。服务器内置
+`codex-default` 与 `claude-default`，两者复用各自 CLI 已有登录态，不绑定私人 provider 或
+凭据变量。可选的本机 `config/agent-profiles.json` 严格加载额外 profile；该文件不由 Git
+跟踪，结构参考 `config/agent-profiles.example.json`。v2 默认用 `inherit_defaults=true` 保留可用
+provider 的内置 profile，再按同名覆盖、新名追加、`enabled=false` 禁用；因此只配置 Codex
+不会再误删内置 `claude-default`。配置文件缺失时安全回退到内置 profile，文件存在但字段、
+provider 或认证声明无效时则拒绝启动，不会静默降级。配置只允许声明 provider、真正传给
+Codex `-p` 的 `provider_profile`、专用 `codex_home` 和受控 `auth`，不能声明 executable、
+argv 或任意环境变量表。示例中的隔离 profile 展示了如何绑定独立 `CODEX_HOME`；调用方只能
+选择已经由服务端注册的名称，不能在 `agent_session` 或 `agent_run` 中提交、覆盖或读取这些绑定。
+该目录必须已经存在，且每次创建 session 和启动 run 时都要重新通过无审批的可写
+access-policy、系统/敏感/服务目录和 reparse 检查。`workspace_info.agent_profile_metadata`
+只返回 `runtime_home_isolated` 与 `auth_mode`，session inspect 只返回前者；两者都不暴露
+runtime home 路径、环境变量名或凭据。
+`agent_session(create|attach)` 默认使用 `workspace-write`；只有显式传入
+`sandbox="read-only"` 才创建只读 session。
+
+`auth.mode="env"` 必须且只能绑定一个 `credential_env`；CLI 启动时从项目 `.env` 中只读取
+这些明确声明的名称，并把值保存在 MCP 私有配置中。`auth.mode="existing-login"` 不允许同时
+声明 credential，只继承启动器允许的本机登录态目录/变量。启动 Agent 子进程时只注入当前
+profile 自己的 credential；不同 profile 的
+key 不会互相透传，`CONTROL_PLANE_API_KEY` 等未声明或受保护变量也不会进入 Agent 环境。
+通用 DEV 命令的 `exec-env.allowlist`/`--pass-env` 机制与 Agent credential 相互独立。以后新增
+隔离 Agent 只需增加一条 profile 配置并准备对应 Codex home/config 与 `.env` key，无需修改
+Python registry 或 PowerShell 启动器。
+
+Codex CLI 当前使用独立 profile 文件：基础 `config.toml` 可声明 `[model_providers.<name>]`，而
+传给 `codex -p <name>` 的差异配置必须写在同一 `CODEX_HOME` 下的 `<name>.config.toml`，并使用
+顶层 `model`/`model_provider` 等字段；不要再写旧式 `[profiles.<name>]` 表。
+
+当前 Codex 运行参数契约以稳定版 `codex-cli 0.153.0` 为已测试基线。`agent_session` 的
+`codex_defaults` 保存会话默认值，`agent_run(start)` 的 `codex_options` 可逐轮覆盖；设置为
+`null` 可清除某个默认值。原生 `model`、`reasoning_effort`、有序 `config`、feature 开关、
+image/add-dir/output 路径、approval/search、OSS provider 以及其他 `codex exec` flags 均由
+结构化字段表达，不接受完整 command、argv、executable 或任意环境变量表。`route` 只映射到
+该 run 的 `AWZ_ROUTE`，不会修改父进程、`.env` 或本机 Codex profile：
+
+```json
+{
+  "action": "start",
+  "session_id": "sess_...",
+  "prompt": "检查这个实现",
+  "codex_options": {
+    "model": "gpt-5.6-luna",
+    "reasoning_effort": "max",
+    "route": "primary",
+    "search": true
+  }
+}
+```
+
+`codex_action` 支持 `continue`（新建或继续当前绑定）、`fork`（只 fork 当前明确绑定的 native
+session）和 `review`；review 可用 `review_uncommitted`、`review_base`、`review_commit`、
+`review_title`，三个 review target 互斥。`--last/--all` 不开放，避免绕过 Catalog/session
+绑定。危险的无沙箱与 hook-trust bypass 虽能被 schema 识别，但会明确拒绝；secret/env、
+provider endpoint、hook/plugin/MCP、sandbox/approval 等敏感 `-c` 根也不能借普通请求透传。
+`ephemeral` run 不会把 Codex 返回的临时 thread id 保存成后续 resume 绑定。
+
+`agent_run(action="start")` 可用 `max_runtime_seconds` 设置当前 run 的硬生命周期。省略时采用
+日常推荐的 `3600` 秒（1 小时）；允许范围为 `1..10800` 秒，最长 3 小时。到达上限后服务端
+终止该 Agent 的整个进程树，`inspect`/`result` 会返回 `timed_out` 和实际生效的时限。该参数
+只控制本机 Agent 子进程，不改变 MCP 客户端或上游 managed-agent 自身的任务时限。需要更长、
+不依赖 Agent session/resume/event 语义的通用进程，应使用 `start_process`。
+
 0.9b 增加统一 `agent_catalog`：`providers`、`sources`、`list`、`inspect` 是轻量查询，
 `refresh` 在超过交互预算时自动转后台 job。Catalog source 与普通文件权限、external grant
 完全分离，只接受本地 `config/agent-sources.json` 中已验证的 `catalog-read` 根；MCP 工具没有
@@ -442,7 +449,7 @@ Claude runtime、steer/interaction 等能力仍会稳定拒绝。
 0.9c 在 DEV Profile 的 `agent_session` 增加 `attach`：调用方只能提交 Catalog 生成的
 `conversation_ref`，不能直接提交 native session id、thread id、`--last` 或历史文件路径。
 服务端重新验证 source/root/file identity、provider、session id 与历史 cwd；cwd 不在
-`<YOUR_WORKSPACE_PATH>` 时仍可查看安全 metadata，但不能 attach。绑定成功后的第一轮直接使用受控
+`<WORKSPACE>` 时仍可查看安全 metadata，但不能 attach。绑定成功后的第一轮直接使用受控
 `codex exec ... resume <native_session_id> <prompt>`，继续沿用服务器 profile、sandbox、cwd、
 最小环境和 managed-process 限制。同一原生 JSONL 正常追加后可继续下一轮；source 被禁用、
 根或文件被替换、会话 id/cwd 绑定变化时立即 fail-closed。当前仍未配置或扫描真实 source。
@@ -454,7 +461,8 @@ Claude runtime、steer/interaction 等能力仍会稳定拒绝。
 `workspace-write` 只增加 Edit/Write，不开放 Bash、PowerShell、任意 settings/agents/plugins、
 额外 MCP、`--add-dir` 或危险权限开关。新会话、同 session resume 与授权 Catalog history
 attach 共用 Codex 已验证的进程、超时、取消、事件分页和 source binding 机制。已配置的
-业务环境变量只进入明确声明需要它的 Codex profile，不会透传给 `claude-default`。当前只完成
+业务环境变量只进入 `auth.mode="env"` 的 Codex profile，不会透传给默认走本机登录态的
+`claude-default`。当前只完成
 fake Claude/合成 history 验证；真实模型 smoke 尚未自动执行。
 
 0.9e 增加 local-only source admin 与 `tc` 菜单入口。CLI/version probe 只执行有界
@@ -488,6 +496,7 @@ Windows 实机验证 `codex-default` 与 `claude-default` marker 均成功。Cla
 | command timeout | 60 s | 300 s |
 | managed process 输出缓冲 | 512 KiB | 每流 2 MiB |
 | managed process 生命周期 | 1 h | 24 h |
+| Agent run 生命周期 | 1 h（推荐默认） | 3 h |
 | Agent event retention | - | 每个 run 2,000 条 |
 | Agent events 等待 | 0 s | 10 s |
 | Agent session/run | - | 每进程 128 session；每 session 100 run |
@@ -565,26 +574,24 @@ uv run python .\scripts\accept_policy_hotreload.py
 `env:CONTROL_PLANE_API_KEY`，不会把 key 值写入 profile。先确保当前 PowerShell 已经按你
 现有流程设置该变量，再替换真实 tunnel id：
 
-> Windows 注意：`--mcp-command` 内的路径应使用正斜杠。v0.0.12 的命令解析器会把
+> Windows 注意：`--mcp-command` 内应使用 `E:/...` 正斜杠。v0.0.12 的命令解析器会把
 > 未正确转义的反斜杠当成转义字符；TUI 会自动完成这项规范化。
 
-把 `<...>` 占位符换成你自己机器上的实际值：
-
 ```powershell
-Set-Location -LiteralPath '<YOUR_TUNNEL_CLIENT_DIR>'
+Set-Location -LiteralPath '<TUNNEL_CLIENT_DIR>'
 
 .\tunnel-client.exe init `
   --sample sample_mcp_stdio_local `
   --profile tiancheng-local `
-  --tunnel-id '<YOUR_TUNNEL_ID>' `
-  --mcp-command '<YOUR_PWSH_PATH> -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File <YOUR_REPO_PATH>/run-mcp.ps1'
+  --tunnel-id '<TUNNEL_ID>' `
+  --mcp-command '<PWSH_PATH> -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File <REPO_PATH>/run-mcp.ps1'
 
 .\tunnel-client.exe doctor --profile tiancheng-local --explain
 .\tunnel-client.exe run --profile tiancheng-local
 ```
 
 保持 `run` 进程运行。然后在 ChatGPT 中点击 **Local MCP → 刷新**，重新发现 TianCheng
-工具；原先 embedded stub 的 `echo`、`server_info`、`uppercase` 应被这里的 31 个工具
+工具；原先 embedded stub 的 `echo`、`server_info`、`uppercase` 应被这里的 24 个工具
 取代。
 
 ## 项目文件
@@ -598,49 +605,31 @@ run-mcp-exec.ps1
 tc.ps1
 install-tc.ps1
 .env.example
-run-mcp-grants.ps1
-exec-env.allowlist.example
 config/
-  launcher.defaults.json        # 随仓库提交，只含相对路径
-  launcher.local.example.json   # 复制成 launcher.local.json 后填本机值
+  launcher.defaults.json          # 可移植默认值
+  launcher.local.example.json     # 本机覆盖示例
+  agent-profiles.example.json     # 私有 Agent profile 示例
 src/tiancheng_mcp/
   __init__.py
   __main__.py
-  agent_adapters.py
-  agent_admin.py
-  agent_catalog.py
-  agent_sources.py
-  agents.py
   audit.py
   cli.py
-  grants.py
-  jobs.py
-  policy.py
   security.py
   server.py
   service.py
 tests/
   conftest.py
-  test_agent_admin.py
-  test_agent_catalog.py
-  test_agent_sources.py
-  test_agents.py
-  test_audit.py
-  test_cli.py
-  test_external_grants.py
   test_files.py
   test_git.py
-  test_jobs.py
-  test_launcher.py
-  test_policy.py
-  test_processes.py
   test_security.py
   test_stdio.py
+  test_launcher.py
+  test_processes.py
+  test_audit.py
 scripts/
+  local_runtime.py
   smoke_stdio.py
   smoke_exec_stdio.py
-  smoke_jobs.py
-  policy_explain.py
   accept_agent_stdio.py
   accept_policy_hotreload.py
 ```

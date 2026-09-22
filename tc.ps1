@@ -25,31 +25,6 @@ $ErrorActionPreference = 'Stop'
 
 $script:ProjectRoot = $PSScriptRoot
 $script:WorkspaceCache = ''
-
-function Get-Workspace {
-    <#
-        The workspace is the security boundary, so there is no built-in
-        default: a wrong guess would silently point the server at somebody
-        else's directory.  It comes from launcher.local.json or the
-        TIANCHENG_WORKSPACE environment variable, and its absence is an error.
-    #>
-    if (-not [string]::IsNullOrWhiteSpace($script:WorkspaceCache)) {
-        return $script:WorkspaceCache
-    }
-    $value = ''
-    try {
-        $config = Get-LauncherConfig
-        if ($config.ContainsKey('workspace')) { $value = [string]$config['workspace'] }
-    } catch { }
-    if ($env:TIANCHENG_WORKSPACE) { $value = [string]$env:TIANCHENG_WORKSPACE }
-    if ([string]::IsNullOrWhiteSpace($value)) {
-        throw ("No workspace is configured. Copy config\launcher.local.example.json to " +
-            "config\launcher.local.json and set 'workspace', or set the " +
-            "TIANCHENG_WORKSPACE environment variable.")
-    }
-    $script:WorkspaceCache = [System.IO.Path]::GetFullPath($value)
-    return $script:WorkspaceCache
-}
 $script:DefaultsPath = Join-Path $PSScriptRoot 'config\launcher.defaults.json'
 $script:LocalConfigPath = if ($ConfigPath) {
     [System.IO.Path]::GetFullPath($ConfigPath)
@@ -70,10 +45,8 @@ function Read-JsonHashtable {
     return $raw | ConvertFrom-Json -AsHashtable
 }
 
-# Paths the shipped defaults express relative to the project root, so a clone
-# works from any directory without editing a tracked file.
 $script:ProjectRelativeKeys = @(
-    'mcpScript', 'mcpExecScript', 'mcpGrantsScript',
+    'python', 'mcpScript', 'mcpExecScript', 'mcpGrantsScript',
     'accessPolicyPath', 'agentSourcesPath', 'agentCatalogPath', 'envFile'
 )
 
@@ -88,11 +61,9 @@ function Resolve-LauncherConfig {
             $Config[$key] = [System.IO.Path]::GetFullPath((Join-Path $script:ProjectRoot $value))
         }
     }
-    # External tools are discovered on PATH when the local config leaves them
-    # blank.  Nothing here may fall back to one particular machine's layout.
     foreach ($pair in @(
         @{ Key = 'tunnelClient'; Command = 'tunnel-client' },
-        @{ Key = 'powerShell';   Command = 'pwsh' }
+        @{ Key = 'powerShell'; Command = 'pwsh' }
     )) {
         $key = $pair.Key
         if ($Config.ContainsKey($key) -and -not [string]::IsNullOrWhiteSpace([string]$Config[$key])) {
@@ -103,6 +74,21 @@ function Resolve-LauncherConfig {
         if ($found) { $Config[$key] = [string]$found.Source }
     }
     return $Config
+}
+
+function Get-Workspace {
+    if (-not [string]::IsNullOrWhiteSpace($script:WorkspaceCache)) {
+        return $script:WorkspaceCache
+    }
+    $config = Get-LauncherConfig
+    $value = if ($config.ContainsKey('workspace')) { [string]$config.workspace } else { '' }
+    if ($env:TIANCHENG_WORKSPACE) { $value = [string]$env:TIANCHENG_WORKSPACE }
+    if ([string]::IsNullOrWhiteSpace($value)) {
+        throw ("No workspace is configured. Set 'workspace' in " +
+            "config\launcher.local.json or set TIANCHENG_WORKSPACE.")
+    }
+    $script:WorkspaceCache = [System.IO.Path]::GetFullPath($value)
+    return $script:WorkspaceCache
 }
 
 function Get-LauncherConfig {
@@ -148,9 +134,7 @@ function Assert-FileExists {
     param([Parameter(Mandatory)][AllowEmptyString()][string]$Path, [Parameter(Mandatory)][string]$Label)
 
     if ([string]::IsNullOrWhiteSpace($Path)) {
-        throw ("$Label is not configured and was not found on PATH. Copy " +
-            "config\launcher.local.example.json to config\launcher.local.json and set it, " +
-            "or run: tc -Action settings")
+        throw "$Label is not configured and was not found on PATH."
     }
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
         throw "$Label does not exist: $Path"
@@ -282,6 +266,13 @@ function Get-ProfileDirectoryArguments {
     return @()
 }
 
+function Test-SupervisorEnabled {
+    param([hashtable]$Config)
+
+    return -not $Config.ContainsKey('supervisor') -or
+        -not $Config.supervisor.ContainsKey('enabled') -or [bool]$Config.supervisor.enabled
+}
+
 function Test-ProfileExists {
     param([hashtable]$Config, [string]$Name)
 
@@ -373,7 +364,7 @@ function Assert-EnvFileOutsideWorkspace {
     $candidate = [System.IO.Path]::GetFullPath($Path)
     $relative = [System.IO.Path]::GetRelativePath($workspace, $candidate)
     if ($relative -ne '..' -and -not $relative.StartsWith("..$([System.IO.Path]::DirectorySeparatorChar)")) {
-        throw ".env must remain outside the workspace: $workspace"
+        throw '.env must remain outside the configured workspace.'
     }
 }
 
@@ -499,14 +490,14 @@ function Configure-ProfileInteractive {
     $externalGrants = $mode -in @('2', '3')
     $execMode = $mode -eq '3'
     if ($execMode) {
-        Write-Warning 'Exec 模式不是 OS sandbox，代码可能访问工作区之外。'
+        Write-Warning 'Exec 模式不是 OS sandbox，代码可能访问配置工作区之外。'
         if ((Read-Host '请输入 ENABLE EXEC 确认') -cne 'ENABLE EXEC') {
             throw 'Exec profile creation cancelled.'
         }
     }
     if ($externalGrants) {
         Assert-FileExists -Path ([string]$Config.mcpGrantsScript) -Label 'External grants MCP startup script'
-        Write-Warning '聊天外部授权会允许 ChatGPT 在用户明确确认一次性 challenge 后访问工作区之外的目录。'
+        Write-Warning '聊天外部授权会允许 ChatGPT 在用户明确确认一次性 challenge 后访问配置工作区之外的目录。'
     }
     $openUi = (Read-Host 'Tunnel 启动时自动打开管理 UI？y/N') -match '^(?i)y(?:es)?$'
     $exists = Test-ProfileExists -Config $Config -Name $name
@@ -652,6 +643,18 @@ function Invoke-Doctor {
     $arguments += Get-ProfileDirectoryArguments -Config $Config
     & ([string]$Config.tunnelClient) @arguments | Out-Host
     $exitCode = $LASTEXITCODE
+    if ($exitCode -eq 0 -and (Test-SupervisorEnabled -Config $Config)) {
+        Assert-FileExists -Path ([string]$Config.python) -Label 'TianCheng Python environment'
+        $supervisorArguments = @(
+            '-m', 'tiancheng_mcp.tunnel_supervisor',
+            '--defaults', $script:DefaultsPath,
+            '--local-config', $script:LocalConfigPath,
+            '--profile', $Name,
+            '--check'
+        )
+        & ([string]$Config.python) @supervisorArguments | Out-Host
+        $exitCode = $LASTEXITCODE
+    }
     return $exitCode
 }
 
@@ -691,7 +694,28 @@ function Start-TunnelForeground {
             throw 'Doctor failed; Tunnel was not started.'
         }
     }
+    $existing = @(Get-RunningTunnelRecords -Config $Config | Where-Object Profile -eq $Name)
+    $existingSupervisors = @(Get-RunningSupervisorRecords -Config $Config | Where-Object Profile -eq $Name)
+    if ($existing.Count -gt 0 -or $existingSupervisors.Count -gt 0) {
+        throw "Profile '$Name' is already running. Use tc status or tc restart."
+    }
     Write-Host "`n正在启动 Tunnel；它会自动拉起 TianCheng MCP。按 Ctrl+C 停止。" -ForegroundColor Green
+    $supervisorEnabled = Test-SupervisorEnabled -Config $Config
+    if ($supervisorEnabled) {
+        Assert-FileExists -Path ([string]$Config.python) -Label 'TianCheng Python environment'
+        $supervisorArguments = @(
+            '-m', 'tiancheng_mcp.tunnel_supervisor',
+            '--defaults', $script:DefaultsPath,
+            '--local-config', $script:LocalConfigPath,
+            '--profile', $Name,
+            '--state-dir', (Join-Path $script:ProjectRoot 'state')
+        )
+        & ([string]$Config.python) @supervisorArguments
+        if ($LASTEXITCODE -ne 0) {
+            throw "Tunnel supervisor exited with code $LASTEXITCODE."
+        }
+        return
+    }
     $arguments = @('run', '--profile', $Name)
     $arguments += Get-ProfileDirectoryArguments -Config $Config
     & ([string]$Config.tunnelClient) @arguments
@@ -760,6 +784,49 @@ function Get-RunningTunnelRecords {
     }
 }
 
+function Get-RunningSupervisorRecords {
+    param([hashtable]$Config)
+
+    if (-not $IsWindows -or -not $Config.ContainsKey('python')) { return @() }
+    try {
+        $expected = [System.IO.Path]::GetFullPath([string]$Config.python)
+        $expectedPrefix = '^\s*"?' + [regex]::Escape($expected) +
+            '"?\s+-m\s+tiancheng_mcp\.tunnel_supervisor(?:\s|$)'
+        return @(
+            Get-CimInstance Win32_Process -ErrorAction Stop |
+                Where-Object { $_.Name -in @('python.exe', 'pythonw.exe') } |
+                ForEach-Object {
+                    $commandLine = [string]$_.CommandLine
+                    # A Windows venv launcher may report its base uv-managed
+                    # interpreter as ExecutablePath.  Validate the exact
+                    # configured launcher at argv[0] instead of rejecting it.
+                    if ($commandLine -notmatch "(?i)$expectedPrefix") { return }
+                    $match = [regex]::Match(
+                        $commandLine,
+                        '(?i)(?:^|\s)--profile(?:=|\s+)["'']?([A-Za-z0-9._-]+)'
+                    )
+                    if ($match.Success) {
+                        [PSCustomObject]@{ Profile = $match.Groups[1].Value; ProcessId = [int]$_.ProcessId }
+                    }
+                }
+        )
+    } catch {
+        return @()
+    }
+}
+
+function Get-SupervisorState {
+    param([string]$Name)
+
+    $path = Join-Path $script:ProjectRoot "state\tunnel-supervisor-$Name.json"
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $null }
+    try {
+        return Read-JsonHashtable -Path $path
+    } catch {
+        return @{ state = 'invalid'; mcp_transport = 'unknown'; probe_mode = 'none' }
+    }
+}
+
 function Get-DeveloperToolStatus {
     $git = Get-Command git -ErrorAction SilentlyContinue
     $gh = Get-Command gh -ErrorAction SilentlyContinue
@@ -784,19 +851,54 @@ function Get-DeveloperToolStatus {
 function Stop-TunnelProfile {
     param([hashtable]$Config, [string]$Name, [bool]$Confirmed)
 
+    $supervisors = @(Get-RunningSupervisorRecords -Config $Config | Where-Object Profile -eq $Name)
     $records = @(Get-RunningTunnelRecords -Config $Config | Where-Object Profile -eq $Name)
-    if ($records.Count -eq 0) {
+    if ($records.Count -eq 0 -and $supervisors.Count -eq 0) {
         Write-Host "Profile '$Name' 当前没有运行中的 Tunnel。" -ForegroundColor Yellow
         return $false
     }
     if (-not $Confirmed -and (Read-Host "停止 '$Name'？输入 STOP") -cne 'STOP') {
         throw 'Tunnel stop cancelled.'
     }
+    $stateDirectory = Join-Path $script:ProjectRoot 'state'
+    $stopPath = Join-Path $stateDirectory "tunnel-supervisor-$Name.stop"
+    $lockPath = Join-Path $stateDirectory "tunnel-supervisor-$Name.lock"
+    if ($supervisors.Count -gt 0) {
+        if (-not (Test-Path -LiteralPath $stateDirectory -PathType Container)) {
+            New-Item -ItemType Directory -Path $stateDirectory -Force | Out-Null
+        }
+        [System.IO.File]::WriteAllText(
+            $stopPath,
+            "stop$([Environment]::NewLine)",
+            [System.Text.UTF8Encoding]::new($false)
+        )
+        $stopDeadline = [DateTime]::UtcNow.AddSeconds(20)
+        do {
+            Start-Sleep -Milliseconds 250
+            $supervisors = @(Get-RunningSupervisorRecords -Config $Config | Where-Object Profile -eq $Name)
+        } while ($supervisors.Count -gt 0 -and [DateTime]::UtcNow -lt $stopDeadline)
+    }
+    foreach ($record in $supervisors) {
+        & "$env:SystemRoot\System32\taskkill.exe" /PID $record.ProcessId /T /F | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "Could not force-stop supervisor PID $($record.ProcessId)." }
+    }
+    Start-Sleep -Milliseconds 300
+    $records = @(Get-RunningTunnelRecords -Config $Config | Where-Object Profile -eq $Name)
     foreach ($record in $records) {
         & "$env:SystemRoot\System32\taskkill.exe" /PID $record.ProcessId /T /F | Out-Null
         if ($LASTEXITCODE -ne 0) { throw "Could not stop tunnel-client PID $($record.ProcessId)." }
     }
-    Write-Host "已停止 '$Name' 的 $($records.Count) 个 Tunnel 进程。" -ForegroundColor Green
+    foreach ($runtimePath in @($stopPath, $lockPath)) {
+        if (Test-Path -LiteralPath $runtimePath -PathType Leaf) {
+            Remove-Item -LiteralPath $runtimePath -Force
+        }
+    }
+    $remainingSupervisors = @(Get-RunningSupervisorRecords -Config $Config | Where-Object Profile -eq $Name)
+    $remainingTunnels = @(Get-RunningTunnelRecords -Config $Config | Where-Object Profile -eq $Name)
+    if ($remainingSupervisors.Count -gt 0 -or $remainingTunnels.Count -gt 0) {
+        throw "Profile '$Name' still has managed processes after stop."
+    }
+    Write-Host "已停止 '$Name' 的 Supervisor 和 Tunnel 进程树。" -ForegroundColor Green
     return $true
 }
 
@@ -815,13 +917,57 @@ function Show-Status {
     $key = Get-KeyRecord -Config $Config
     $health = Get-HealthStatus -Config $Config
     $running = @(Get-RunningTunnelRecords -Config $Config)
+    $supervisors = @(Get-RunningSupervisorRecords -Config $Config)
+    $supervisorState = Get-SupervisorState -Name $selected
+    $supervisorAlive = @($supervisors | Where-Object Profile -eq $selected).Count -gt 0
+    $recordedTerminal = $null -ne $supervisorState -and
+        [string]$supervisorState.state -in @('stopped', 'failed')
+    $supervisorLabel = if ($supervisorAlive -and $null -ne $supervisorState) {
+        [string]$supervisorState.state
+    } elseif ($supervisorAlive) { 'starting' }
+    elseif ($recordedTerminal) { [string]$supervisorState.state }
+    elseif ($null -ne $supervisorState) { 'stale' }
+    else { 'not-started' }
+    $mcpTransport = if ($supervisorAlive -and $null -ne $supervisorState) {
+        [string]$supervisorState.mcp_transport
+    } elseif ($recordedTerminal) { [string]$supervisorState.mcp_transport }
+    else { 'unverified' }
+    $probeMode = if ($supervisorAlive -and $null -ne $supervisorState) {
+        [string]$supervisorState.probe_mode
+    } elseif ($recordedTerminal) { [string]$supervisorState.probe_mode }
+    else { 'none' }
+    $mcpInferred = if ($supervisorAlive -and $null -ne $supervisorState) {
+        [string]$supervisorState.state
+    } elseif ($recordedTerminal) { [string]$supervisorState.state }
+    else { 'unverified' }
+    # tunnel-client v0.0.12 skips a real MCP probe for stdio.  Keep this
+    # separate from inferred health so /readyz can never masquerade as an
+    # end-to-end tool roundtrip.
+    $mcpVerified = 'not-available'
+    $configuredTtl = if ($Config.ContainsKey('supervisor') -and
+        $Config.supervisor.ContainsKey('mcpConnectionMaxTtl')) {
+        [string]$Config.supervisor.mcpConnectionMaxTtl
+    } else { '24h' }
     $developer = Get-DeveloperToolStatus
     $status = [ordered]@{
         selectedProfile = $selected
         profileExists = $profiles -contains $selected
         selectedMode = Get-ProfileMode -Config $Config -Name $selected
         configuredProfiles = $profiles
-        runningProfiles = @($running | ForEach-Object Profile | Sort-Object -Unique)
+        runningProfiles = @(
+            @($running | ForEach-Object Profile) + @($supervisors | ForEach-Object Profile) |
+                Sort-Object -Unique
+        )
+        supervisorState = $supervisorLabel
+        mcpTransport = $mcpTransport
+        mcpProbeMode = $probeMode
+        mcpInferred = $mcpInferred
+        mcpVerified = $mcpVerified
+        mcpConnectionMaxTtl = $configuredTtl
+        lastMcpHealthyAt = if ($null -ne $supervisorState) { $supervisorState.last_healthy_at } else { $null }
+        lastRecoveryReason = if ($null -ne $supervisorState) { $supervisorState.last_recovery_reason } else { $null }
+        supervisorGeneration = if ($null -ne $supervisorState) { $supervisorState.generation } else { $null }
+        restartCountWindow = if ($null -ne $supervisorState) { $supervisorState.restart_count_window } else { 0 }
         keyConfigured = [bool]$key.Configured
         keySource = [string]$key.Source
         tunnelReachable = [bool]$health.Reachable
@@ -837,9 +983,14 @@ function Show-Status {
     Write-Host "Profile 存在 : $($status.profileExists)"
     Write-Host "实际 MCP 模式 : $($status.selectedMode)"
     Write-Host "运行中 Profile : $($status.runningProfiles -join ', ')"
+    Write-Host "Supervisor 状态 : $($status.supervisorState)"
+    Write-Host "MCP Inferred     : $($status.mcpInferred) ($($status.mcpProbeMode))"
+    Write-Host "MCP Verified     : $($status.mcpVerified)"
+    Write-Host "MCP Connection TTL: $($status.mcpConnectionMaxTtl)（不是 Agent 运行上限）"
+    Write-Host "Generation / 恢复数: $($status.supervisorGeneration) / $($status.restartCountWindow)"
     Write-Host "密钥已配置   : $($status.keyConfigured)"
     Write-Host "密钥来源     : $($status.keySource)"
-    Write-Host "Tunnel Ready : $($status.tunnelReady)"
+    Write-Host "Tunnel Ready     : $($status.tunnelReady)（不等于 MCP roundtrip 已验证）"
     Write-Host "管理地址     : $($status.healthBaseUrl)/ui"
     Write-Host "Git / GCM    : $($developer.gitAvailable) / $($developer.gcmConfigured)"
     Write-Host "gh / 已登录  : $($developer.ghAvailable) / $($developer.ghAuthenticated)"
@@ -895,6 +1046,13 @@ function Show-Info {
         localConfigPath = $script:LocalConfigPath
         defaultProfile = [string]$Config.defaultProfile
         tunnelClientExists = Test-Path -LiteralPath ([string]$Config.tunnelClient) -PathType Leaf
+        supervisorPythonExists = Test-Path -LiteralPath ([string]$Config.python) -PathType Leaf
+        supervisorEnabled = Test-SupervisorEnabled -Config $Config
+        tunnelLaunchMode = if (Test-SupervisorEnabled -Config $Config) { 'supervised' } else { 'direct' }
+        mcpConnectionMaxTtl = if ($Config.ContainsKey('supervisor') -and
+            $Config.supervisor.ContainsKey('mcpConnectionMaxTtl')) {
+            [string]$Config.supervisor.mcpConnectionMaxTtl
+        } else { '24h' }
         mcpScriptExists = Test-Path -LiteralPath ([string]$Config.mcpScript) -PathType Leaf
         execScriptExists = Test-Path -LiteralPath ([string]$Config.mcpExecScript) -PathType Leaf
         grantsScriptExists = Test-Path -LiteralPath ([string]$Config.mcpGrantsScript) -PathType Leaf
@@ -923,6 +1081,13 @@ function Edit-SettingsInteractive {
     $profileDir = Read-Host "Profile 目录（留空=系统默认）[$($Config.profileDir)]"
     $timeout = Read-Host "MCP 自动转后台等待秒数（1-90） [$interactiveTimeout]"
     $doctor = Read-Host "启动前运行 doctor？Y/n [$($Config.doctorBeforeStart)]"
+    $supervisorEnabled = Test-SupervisorEnabled -Config $Config
+    $currentTtl = if ($Config.ContainsKey('supervisor') -and
+        $Config.supervisor.ContainsKey('mcpConnectionMaxTtl')) {
+        [string]$Config.supervisor.mcpConnectionMaxTtl
+    } else { '24h' }
+    $supervisorChoice = Read-Host "启用 Tunnel 自动恢复 Supervisor？Y/n [$supervisorEnabled]"
+    $ttlChoice = Read-Host "MCP 传输连接 TTL（不是 Agent 运行上限）[$currentTtl]"
     $changes = @{}
     if ($tunnel) { Assert-FileExists -Path $tunnel -Label 'tunnel-client'; $changes.tunnelClient = $tunnel }
     if ($powershell) { Assert-FileExists -Path $powershell -Label 'PowerShell 7'; $changes.powerShell = $powershell }
@@ -937,6 +1102,31 @@ function Edit-SettingsInteractive {
     }
     if ($doctor -match '^(?i)n(?:o)?$') { $changes.doctorBeforeStart = $false }
     elseif ($doctor -match '^(?i)y(?:es)?$') { $changes.doctorBeforeStart = $true }
+    $supervisorChanges = @{}
+    if ($Config.ContainsKey('supervisor')) {
+        foreach ($entry in $Config.supervisor.GetEnumerator()) {
+            $supervisorChanges[$entry.Key] = $entry.Value
+        }
+    }
+    $supervisorChanged = $false
+    if ($supervisorChoice -match '^(?i)n(?:o)?$') {
+        $supervisorChanges.enabled = $false
+        $supervisorChanged = $true
+    } elseif ($supervisorChoice -match '^(?i)y(?:es)?$') {
+        $supervisorChanges.enabled = $true
+        $supervisorChanged = $true
+    }
+    if ($ttlChoice) {
+        if ($ttlChoice -notmatch '^([1-9][0-9]*)(s|m|h)$') {
+            throw 'MCP 传输连接 TTL 必须是正整数加 s/m/h，例如 30m、2h、24h。'
+        }
+        $amount = [long]$Matches[1]
+        $seconds = switch ($Matches[2]) { 's' { $amount }; 'm' { $amount * 60 }; 'h' { $amount * 3600 } }
+        if ($seconds -gt 604800) { throw 'MCP 传输连接 TTL 不能超过 168h。' }
+        $supervisorChanges.mcpConnectionMaxTtl = $ttlChoice
+        $supervisorChanged = $true
+    }
+    if ($supervisorChanged) { $changes.supervisor = $supervisorChanges }
     if ($changes.Count -gt 0) {
         Save-LauncherOverrides -Changes $changes
         Write-Host '启动器设置已保存。' -ForegroundColor Green
@@ -1618,7 +1808,7 @@ function Show-MainMenu {
         $runningProfiles = @(Get-RunningTunnelRecords -Config $config | ForEach-Object Profile | Sort-Object -Unique)
         Clear-Host
         Write-Host '╔══════════════════════════════════════╗' -ForegroundColor Cyan
-        Write-Host '║       天成 Local MCP 控制台          ║' -ForegroundColor Cyan
+        Write-Host '║       天澄 Local MCP 控制台          ║' -ForegroundColor Cyan
         Write-Host '╚══════════════════════════════════════╝' -ForegroundColor Cyan
         Write-Host "Profile: $selected [$modeLabel]   Key: $($key.Configured)" -ForegroundColor DarkGray
         if ($modeLabel -eq 'GRANTS') {

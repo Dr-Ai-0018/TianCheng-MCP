@@ -22,7 +22,7 @@ def test_normal_write_overwrite_and_read(service: TianChengService, workspace: P
 
 
 def test_unicode_chinese_path_and_append(service: TianChengService) -> None:
-    written = service.write_text("学习/语文笔记.md", "你好，天成")
+    written = service.write_text("学习/语文笔记.md", "你好，天澄")
     appended = service.append_text(
         "学习/语文笔记.md", "\n第二行", expected_sha256=written["sha256"]
     )

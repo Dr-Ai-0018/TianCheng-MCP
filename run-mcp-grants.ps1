@@ -34,10 +34,9 @@ foreach ($configPath in @(
 }
 if ($env:TIANCHENG_WORKSPACE) { $workspace = $env:TIANCHENG_WORKSPACE }
 if (-not $workspace) {
-    throw ("No workspace is configured. Copy config\launcher.local.example.json to " +
-        "config\launcher.local.json and set 'workspace' to the directory this server " +
-        "may touch, or set the TIANCHENG_WORKSPACE environment variable. " +
-        "There is deliberately no built-in default: the workspace is the security boundary.")
+    throw ("No workspace is configured. Set 'workspace' in " +
+        "config\launcher.local.json or set TIANCHENG_WORKSPACE. " +
+        "There is deliberately no built-in default.")
 }
 
 $envPath = Join-Path $PSScriptRoot '.env'

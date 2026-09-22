@@ -6,13 +6,14 @@ from collections.abc import Callable
 import hashlib
 import json
 from pathlib import PureWindowsPath
-from typing import Any, TypeVar
+from typing import Any, Literal, TypeVar
 
 from mcp.server import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
 
 from . import __version__
+from .agent_adapters import CodexOptionsInput
 from .jobs import JobCancelled
 from .service import TianChengService
 
@@ -448,7 +449,7 @@ def create_server(service: TianChengService) -> MCPServer:
 
     @external_tool(
         description=(
-            "Request a temporary capability for an absolute directory outside the workspace. "
+            "Request a temporary capability for an absolute directory outside the configured workspace. "
             "The request remains pending until approve_external_access receives the one-time "
             "challenge and explicit confirmation='批准'. This does not grant access by itself."
         ),
@@ -1226,7 +1227,12 @@ def create_server(service: TianChengService) -> MCPServer:
                 "inspect, close. attach accepts only an agent_catalog conversation_ref; callers "
                 "cannot supply a native session id or history path. cwd must be inside the "
                 "TianCheng workspace or a directory the static access policy already covers, "
-                "and the sandbox is limited to read-only or workspace-write."
+                "and the sandbox defaults to workspace-write; callers may explicitly select "
+                "read-only. Codex sessions "
+                "may provide schema-validated codex_defaults: model selects native -m, "
+                "reasoning_effort sets model_reasoning_effort, route selects the registered "
+                "provider route for each run, and repeatable config/enable/disable values keep "
+                "their supplied order. Secrets and executable argv are never accepted here."
             ),
             annotations=EXECUTION,
         )
@@ -1235,21 +1241,24 @@ def create_server(service: TianChengService) -> MCPServer:
             session_id: str = "",
             profile: str = "codex-default",
             cwd: str = ".",
-            sandbox: str = "read-only",
+            sandbox: str = "workspace-write",
             conversation_ref: str = "",
+            codex_defaults: CodexOptionsInput | None = None,
         ) -> dict[str, Any]:
             if action == "create":
                 return call_label(
                     "agent_session_create",
                     cwd,
-                    lambda: service.agent_session_create(profile, cwd, sandbox),
+                    lambda: service.agent_session_create(
+                        profile, cwd, sandbox, codex_defaults
+                    ),
                 )
             if action == "attach":
                 return call_label(
                     "agent_session_attach",
                     "<agent-conversation>",
                     lambda: service.agent_session_attach(
-                        conversation_ref, profile, sandbox
+                        conversation_ref, profile, sandbox, codex_defaults
                     ),
                 )
             if action == "list":
@@ -1270,7 +1279,15 @@ def create_server(service: TianChengService) -> MCPServer:
             description=(
                 "Run the prompt in a managed local agent session. Actions: start, inspect, "
                 "events, result, cancel. start returns immediately with run_id/process_id; "
-                "events supports bounded cursor paging and wait_ms up to 10000 ms."
+                "events supports bounded cursor paging and wait_ms up to 10000 ms. Codex start "
+                "accepts schema-validated codex_options that override session defaults, and "
+                "codex_action selects continue, fork, or review. Use codex_options.model, "
+                "reasoning_effort, and route for native per-run routing; null clears a session "
+                "default. review_* options apply only when codex_action is review. For "
+                "action=start, max_runtime_seconds sets the hard lifetime of this Agent run. "
+                "Omit it for the recommended 3600-second (1 hour) default; accepted values are "
+                "1 through 10800 seconds (3 hours). Reaching the limit terminates the Agent "
+                "process tree. Use start_process instead for generic longer-lived processes."
             ),
             annotations=EXECUTION,
         )
@@ -1284,12 +1301,21 @@ def create_server(service: TianChengService) -> MCPServer:
             max_bytes: int = 65536,
             wait_ms: int = 0,
             reason: str = "",
+            codex_options: CodexOptionsInput | None = None,
+            codex_action: Literal["continue", "fork", "review"] = "continue",
+            max_runtime_seconds: int | None = None,
         ) -> dict[str, Any]:
             if action == "start":
                 return call_label(
                     "agent_run_start",
                     "<agent-session>",
-                    lambda: service.agent_run_start(session_id, prompt),
+                    lambda: service.agent_run_start(
+                        session_id,
+                        prompt,
+                        codex_options,
+                        codex_action,
+                        max_runtime_seconds,
+                    ),
                 )
             if action == "inspect":
                 return call_label(

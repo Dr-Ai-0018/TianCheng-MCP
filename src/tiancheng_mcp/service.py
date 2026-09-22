@@ -17,7 +17,7 @@ import tempfile
 import threading
 import time
 import uuid
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path, PureWindowsPath
 from typing import Any, TypeVar
@@ -25,15 +25,22 @@ from urllib.parse import urlsplit, urlunsplit
 
 from . import __version__
 from .agent_catalog import AgentCatalog
+from .agent_adapters import (
+    merge_codex_options,
+    normalize_codex_options,
+    summarize_codex_options,
+)
 from .agent_sources import _SENSITIVE_COMPONENTS, AgentSourcePolicy
 from .agents import (
     MAX_AGENT_EVENTS,
     MAX_AGENT_RUNS_PER_SESSION,
     MAX_AGENT_SESSIONS,
+    AgentProfile,
     AgentProfileRegistry,
     AgentRunState,
     AgentSessionState,
     NormalizedEvent,
+    load_agent_profile_definitions,
     new_run_id,
     new_session_id,
     redact_text,
@@ -54,6 +61,7 @@ MAX_COMMAND_OUTPUT_BYTES = 1024 * 1024
 DEFAULT_MANAGED_OUTPUT_BYTES = 512 * 1024
 MAX_MANAGED_OUTPUT_BYTES = 2 * 1024 * 1024
 MAX_MANAGED_PROCESSES = 32
+MAX_AGENT_RUNTIME_SECONDS = 3 * 60 * 60
 DEFAULT_GIT_OUTPUT_BYTES = 512 * 1024
 MAX_LIST_DEPTH = 5
 MAX_LIST_ENTRIES = 1000
@@ -96,7 +104,22 @@ _PROTECTED_ENVIRONMENT_NAMES = frozenset(
         "OPENAI_SECRET_KEY",
     }
 )
+def _desktop_codex_roots() -> tuple[Path, ...]:
+    """Install roots of the Codex Desktop app's private, versioned builds."""
+    roots: list[Path] = []
+    for name in ("LOCALAPPDATA", "APPDATA", "PROGRAMFILES", "PROGRAMFILES(X86)"):
+        base = os.environ.get(name)
+        if not base:
+            continue
+        try:
+            roots.append((Path(base) / "OpenAI" / "Codex").resolve())
+        except OSError:
+            continue
+    return tuple(roots)
+
+
 _EXEC_ENVIRONMENT_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_AGENT_ENVIRONMENT_OVERRIDE_NAMES = frozenset({"AWZ_ROUTE"})
 _DEFAULT_SEARCH_EXCLUDES = (
     "!**/.git/**",
     "!**/.tiancheng-trash/**",
@@ -558,6 +581,8 @@ class TianChengService:
         agent_catalog_path: str | Path | None = None,
         enable_agent_catalog: bool = True,
         allow_policy_hot_reload: bool = False,
+        agent_profile_config_path: str | Path | None = None,
+        agent_env_file: str | Path | None = None,
     ) -> None:
         self.jail = WorkspaceJail(workspace, create=True)
         self.access_policy_path = Path(access_policy_path) if access_policy_path else (
@@ -611,10 +636,29 @@ class TianChengService:
         self._agent_only_commands = (
             self._discover_agent_only_commands() if allow_exec else {}
         )
-        self.agent_profiles = AgentProfileRegistry(
-            {**self._exec_commands, **self._agent_only_commands}
-        )
         project_root = Path(__file__).resolve().parents[2]
+        profile_definitions = None
+        inherit_default_profiles = True
+        if agent_profile_config_path is not None:
+            profile_config_location = self._server_owned_config_path(
+                agent_profile_config_path, "Agent profile config"
+            )
+            if profile_config_location.exists():
+                profile_config = load_agent_profile_definitions(
+                    profile_config_location
+                )
+                profile_definitions = profile_config.profiles
+                inherit_default_profiles = profile_config.inherit_defaults
+        self.agent_profiles = AgentProfileRegistry(
+            {**self._exec_commands, **self._agent_only_commands},
+            profile_definitions=profile_definitions,
+            inherit_default_profiles=inherit_default_profiles,
+        )
+        for profile_name in self.agent_profiles.names():
+            credential_env = self.agent_profiles.get(profile_name).credential_env
+            if credential_env is not None:
+                self._validate_passthrough_env((credential_env,))
+        self._agent_credentials = self._load_agent_credentials(agent_env_file)
         self.agent_source_policy_path = (
             Path(agent_source_policy_path)
             if agent_source_policy_path is not None
@@ -663,8 +707,8 @@ class TianChengService:
         try:
             return AccessPolicy.load(self.access_policy_path, self.jail.root)
         except AccessPolicyError as exc:
-            # The default policy is machine-specific (it is rooted at the
-            # configured workspace).  A caller may intentionally use a temporary or
+            # The default policy is machine-specific (normally rooted at
+            # the configured workspace). A caller may intentionally use a temporary or
             # alternate workspace for tests/development.  In that case a
             # policy whose root does not match must not expose its external
             # rules; fall back to the jail-only policy.  Explicit policy paths
@@ -674,6 +718,56 @@ class TianChengService:
             ):
                 return AccessPolicy.default(self.jail.root)
             raise
+
+    def _server_owned_config_path(self, path: str | Path, label: str) -> Path:
+        location = Path(path).resolve(strict=False)
+        if location == self.jail.root or self.jail.root in location.parents:
+            raise ValueError(f"{label} must be stored outside the workspace")
+        return location
+
+    def _load_agent_credentials(self, path: str | Path | None) -> dict[str, str]:
+        """Read only profile-declared credentials from a local dotenv file."""
+
+        selected = {
+            profile.credential_env
+            for profile in (
+                self.agent_profiles.get(name) for name in self.agent_profiles.names()
+            )
+            if profile.credential_env is not None
+        }
+        if path is None or not selected:
+            return {}
+        location = self._server_owned_config_path(path, "Agent environment file")
+        if not location.exists():
+            return {}
+        if not location.is_file():
+            raise ValueError("Agent environment file must be a regular file")
+        values: dict[str, str] = {}
+        selected_casefold = {name.casefold(): name for name in selected}
+        for line_number, line in enumerate(
+            location.read_text(encoding="utf-8-sig").splitlines(), start=1
+        ):
+            if not line.strip() or line.lstrip().startswith("#"):
+                continue
+            match = re.fullmatch(
+                r"\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*", line
+            )
+            if match is None:
+                continue
+            configured_name = selected_casefold.get(match.group(1).casefold())
+            if configured_name is None:
+                continue
+            if configured_name in values:
+                raise ValueError(
+                    f"Duplicate profile credential in agent environment file at line {line_number}"
+                )
+            value = match.group(2)
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+                value = value[1:-1]
+            if "\x00" in value:
+                raise ValueError("Profile credential cannot contain NUL")
+            values[configured_name] = value
+        return values
 
     def _grant_reaper_loop(self) -> None:
         while not self._grant_reaper_stop.wait(0.25):
@@ -925,6 +1019,7 @@ class TianChengService:
                 sorted(self._exec_commands) if self.allow_exec else []
             ),
             "available_agent_profiles": list(self.agent_profiles.names()),
+            "agent_profile_metadata": list(self.agent_profiles.profile_summaries()),
             "available_agent_providers": list(self.agent_profiles.providers()),
             "agent_sources": self.agent_source_policy.summary(),
             "git_available": self.git_executable is not None,
@@ -3123,15 +3218,32 @@ class TianChengService:
                 candidate = Path(command_file).resolve().parent / "node_modules/npm/bin" / script_name
                 if candidate.is_file():
                     discovered[name] = [*node, str(candidate)]
-        codex_executable = shutil.which("codex.exe") or shutil.which("codex")
+        # Require the npm-managed launcher.  It supplies
+        # CODEX_MANAGED_PACKAGE_ROOT so the native runtime resolves its own
+        # codex-resources (sandbox setup helper and command runner), while the
+        # Codex Desktop app ships a different build of those same helpers.  The
+        # two provision one machine-wide Windows sandbox, so each build rejects
+        # the other's elevated-sandbox marker and every sandboxed command
+        # re-runs the elevated provisioning helper, raising a UAC prompt.  PATH
+        # order alone decides what ``which`` reports, so a Desktop update that
+        # prepends its bin directory would silently swap the build this service
+        # spawns; refuse it by location instead.  Leaving ``codex``
+        # undiscovered surfaces as an unavailable command, which is far easier
+        # to diagnose than a UAC prompt on every call.
+        codex_executable = shutil.which("codex") or shutil.which("codex.exe")
         if codex_executable:
             codex_path = Path(codex_executable).resolve()
-            if codex_path.suffix.casefold() in {".cmd", ".ps1"}:
+            from_desktop = any(
+                codex_path.is_relative_to(root) for root in _desktop_codex_roots()
+            )
+            if from_desktop:
+                pass  # Never mix a Desktop build with the npm-managed release.
+            elif codex_path.suffix.casefold() in {".cmd", ".ps1"}:
                 codex_script = codex_path.parent / "node_modules/@openai/codex/bin/codex.js"
                 node = discovered.get("node")
                 if node and codex_script.is_file():
                     discovered["codex"] = [*node, str(codex_script)]
-            else:
+            elif os.name != "nt":
                 discovered["codex"] = [str(codex_path)]
         for command in discovered.values():
             executable = Path(command[0]).resolve()
@@ -3161,7 +3273,12 @@ class TianChengService:
         return discovered
 
     def _execution_environment(
-        self, *, include_passthrough_env: bool = True
+        self,
+        *,
+        include_passthrough_env: bool = True,
+        profile_credential_env: str | None = None,
+        overrides: Mapping[str, str] | None = None,
+        codex_home: str | None = None,
     ) -> dict[str, str]:
         system_root = os.environ.get("SystemRoot", r"C:\Windows")
         executable_directories = {
@@ -3197,6 +3314,30 @@ class TianChengService:
                 value = os.environ.get(name)
                 if value is not None:
                     environment[name] = value
+        if profile_credential_env is not None:
+            # A process-level value wins over the optional dotenv fallback.
+            # Crucially, only the credential bound to the selected profile is
+            # copied into this child environment.
+            value = os.environ.get(profile_credential_env)
+            if value is None:
+                value = self._agent_credentials.get(profile_credential_env)
+            if value is not None:
+                environment[profile_credential_env] = value
+        for name, value in (overrides or {}).items():
+            if name not in _AGENT_ENVIRONMENT_OVERRIDE_NAMES:
+                raise PermissionError(
+                    f"Per-run environment variable {name!r} is not adapter-owned"
+                )
+            if not isinstance(value, str) or "\x00" in value or len(value) > 4096:
+                raise ValueError(
+                    f"Per-run environment variable {name!r} must be bounded text"
+                )
+            environment[name] = value
+        if codex_home is not None:
+            # This value comes only from a server-owned AgentProfile.  It is a
+            # dedicated parameter rather than an arbitrary env map so MCP
+            # callers cannot select or overwrite another profile's home.
+            environment["CODEX_HOME"] = codex_home
         return environment
 
     def _prepare_exec_command(self, key: str, arguments: list[str]) -> list[str]:
@@ -3357,6 +3498,9 @@ class TianChengService:
         max_runtime_seconds: int,
         output_limit_bytes: int,
         include_passthrough_env: bool = True,
+        profile_credential_env: str | None = None,
+        environment_overrides: Mapping[str, str] | None = None,
+        codex_home: str | None = None,
         stdin_enabled: bool = True,
         policy_root: Path | None = None,
     ) -> dict[str, Any]:
@@ -3415,7 +3559,10 @@ class TianChengService:
             prepared,
             cwd=str(working_directory),
             env=self._execution_environment(
-                include_passthrough_env=include_passthrough_env
+                include_passthrough_env=include_passthrough_env,
+                profile_credential_env=profile_credential_env,
+                overrides=environment_overrides,
+                codex_home=codex_home,
             ),
             # Agent adapters pass the complete prompt as an argument.  Giving
             # Codex/Claude an open pipe here makes them wait forever for
@@ -3572,6 +3719,62 @@ class TianChengService:
         resolved = scoped.resolve(relative, must_exist=True, expect="directory")
         return scoped.relative(resolved), str(root)
 
+    def _authorize_agent_codex_home(self, profile: AgentProfile) -> Path | None:
+        """Validate a profile-frozen Codex home without exposing it to callers."""
+
+        raw = profile.codex_home
+        if raw is None:
+            return None
+        if profile.provider != "codex":
+            raise ValueError("Only Codex agent profiles may declare codex_home")
+        if not isinstance(raw, str) or not raw or "\x00" in raw:
+            raise ValueError("Agent profile codex_home must be non-empty text")
+        if not self._is_absolute_request(raw):
+            raise ValueError("Agent profile codex_home must be an absolute path")
+        candidate = _canonical_target(raw)
+        if candidate.parent == candidate:
+            raise PermissionError("Agent profile codex_home cannot be a filesystem root")
+        if not candidate.is_dir():
+            raise FileNotFoundError("Agent profile codex_home must already exist")
+
+        project_root = Path(__file__).resolve().parents[2]
+        protected = (project_root, self.audit_directory, self.access_policy_path.parent)
+        for reserved in protected:
+            reserved_path = Path(reserved).resolve(strict=False)
+            if (
+                candidate == reserved_path
+                or reserved_path in candidate.parents
+                or candidate in reserved_path.parents
+            ):
+                raise PermissionError(
+                    "Agent profile codex_home cannot contain server code, policy, or logs"
+                )
+        for name in ("SystemRoot", "ProgramFiles", "ProgramFiles(x86)", "ProgramData"):
+            value = os.environ.get(name)
+            if not value:
+                continue
+            system_path = Path(value).resolve(strict=False)
+            if candidate == system_path or system_path in candidate.parents:
+                raise PermissionError("Agent profile codex_home cannot be a system directory")
+        for part in candidate.parts:
+            if part.casefold() in _SENSITIVE_COMPONENTS:
+                raise PermissionError(
+                    "Agent profile codex_home contains a forbidden sensitive path component"
+                )
+
+        decision = self.access_policy.authorize(candidate, "write")
+        if decision.requires_approval:
+            raise PermissionError(
+                "Agent profile codex_home requires a no-approval writable access-policy rule"
+            )
+        containing_jail = (
+            self.jail
+            if decision.rule_path == self.jail.root
+            else WorkspaceJail(decision.rule_path, create=False)
+        )
+        relative = candidate.relative_to(decision.rule_path).as_posix() or "."
+        return containing_jail.resolve(relative, must_exist=True, expect="directory")
+
     def _agent_working_directory(self, session: AgentSessionState) -> Path:
         """Resolve a session cwd, re-authorizing whitelisted roots every time."""
 
@@ -3589,21 +3792,123 @@ class TianChengService:
         scoped = WorkspaceJail(root, create=False)
         return scoped.resolve(session.cwd, must_exist=True, expect="directory")
 
+    def _resolve_codex_option_path(
+        self,
+        session: AgentSessionState,
+        raw_path: str,
+        *,
+        operation: str,
+        must_exist: bool,
+        expect: str,
+    ) -> str:
+        """Resolve one Codex CLI path through the same static policy boundary."""
+
+        working_directory = self._agent_working_directory(session)
+        requested = (
+            Path(raw_path)
+            if self._is_absolute_request(raw_path)
+            else working_directory / raw_path
+        )
+        decision = self.access_policy.authorize(str(requested), operation)
+        if decision.requires_approval:
+            raise PermissionError(
+                "Codex option path requires explicit external approval"
+            )
+        root = decision.rule_path
+        if root is None:
+            raise PermissionError("Codex option path is not covered by access policy")
+        scoped = self.jail if root == self.jail.root else WorkspaceJail(root, create=False)
+        try:
+            relative = decision.path.relative_to(root).as_posix() or "."
+        except ValueError as exc:
+            raise WorkspaceSecurityError(
+                "Codex option path escaped its authorized root"
+            ) from exc
+        return str(
+            scoped.resolve(
+                relative,
+                must_exist=must_exist,
+                expect=expect,
+            )
+        )
+
+    def _prepare_codex_options(
+        self,
+        session: AgentSessionState,
+        options: Mapping[str, Any] | None,
+    ) -> dict[str, Any]:
+        normalized = normalize_codex_options(options)
+        if session.provider != "codex":
+            if normalized:
+                raise NotImplementedError(
+                    "Provider-specific Codex options require a Codex profile"
+                )
+            return {}
+        prepared = dict(normalized)
+        prepared["images"] = tuple(
+            self._resolve_codex_option_path(
+                session,
+                path,
+                operation="read",
+                must_exist=True,
+                expect="file",
+            )
+            for path in normalized.get("images", ())
+        )
+        prepared["add_dirs"] = tuple(
+            self._resolve_codex_option_path(
+                session,
+                path,
+                operation="write",
+                must_exist=True,
+                expect="directory",
+            )
+            for path in normalized.get("add_dirs", ())
+        )
+        if "output_schema" in normalized:
+            prepared["output_schema"] = self._resolve_codex_option_path(
+                session,
+                normalized["output_schema"],
+                operation="read",
+                must_exist=True,
+                expect="file",
+            )
+        if "output_last_message" in normalized:
+            prepared["output_last_message"] = self._resolve_codex_option_path(
+                session,
+                normalized["output_last_message"],
+                operation="write",
+                must_exist=False,
+                expect="file",
+            )
+        return prepared
+
     def agent_session_create(
-        self, profile: str = "codex-default", cwd: str = ".", sandbox: str = "read-only"
+        self,
+        profile: str = "codex-default",
+        cwd: str = ".",
+        sandbox: str = "workspace-write",
+        codex_defaults: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         selected = self.agent_profiles.get(profile)
         self.agent_profiles.require_capability(selected, "create")
         selected.validate_sandbox(sandbox)
         stored_cwd, policy_root = self._authorize_agent_cwd(cwd, sandbox)
+        self._authorize_agent_codex_home(selected)
+        normalized_defaults = normalize_codex_options(codex_defaults)
+        if any(key.startswith("review_") for key in normalized_defaults):
+            raise ValueError("review options are per-run and cannot be session defaults")
         session = AgentSessionState(
             session_id=new_session_id(),
             profile=selected.name,
             cwd=stored_cwd,
             sandbox=sandbox,
             provider=selected.provider,
+            runtime_home_isolated=selected.codex_home is not None,
             policy_root=policy_root,
+            codex_defaults=normalized_defaults,
         )
+        self._prepare_codex_options(session, session.codex_defaults)
         with self._agent_lock:
             if len(self._agent_sessions) >= MAX_AGENT_SESSIONS:
                 raise RuntimeError(
@@ -3616,12 +3921,17 @@ class TianChengService:
         self,
         conversation_ref: str,
         profile: str = "codex-default",
-        sandbox: str = "read-only",
+        sandbox: str = "workspace-write",
+        codex_defaults: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         catalog = self._require_agent_catalog()
         selected = self.agent_profiles.get(profile)
         self.agent_profiles.require_capability(selected, "attach")
         selected.validate_sandbox(sandbox)
+        self._authorize_agent_codex_home(selected)
+        normalized_defaults = normalize_codex_options(codex_defaults)
+        if any(key.startswith("review_") for key in normalized_defaults):
+            raise ValueError("review options are per-run and cannot be session defaults")
         record = catalog.authorize_attachment(
             self.agent_source_policy, conversation_ref
         )
@@ -3655,10 +3965,13 @@ class TianChengService:
             policy_root=policy_root,
             sandbox=sandbox,
             provider=selected.provider,
+            runtime_home_isolated=selected.codex_home is not None,
             native_session_id=str(record["native_session_id"]),
             conversation_ref=str(record["conversation_ref"]),
             source_id=str(record["source_id"]),
+            codex_defaults=normalized_defaults,
         )
+        self._prepare_codex_options(session, session.codex_defaults)
         with self._agent_lock:
             if len(self._agent_sessions) >= MAX_AGENT_SESSIONS:
                 raise RuntimeError(
@@ -3678,6 +3991,7 @@ class TianChengService:
             "session_id": session.session_id,
             "provider": session.provider,
             "profile": session.profile,
+            "runtime_home_isolated": session.runtime_home_isolated,
             "cwd": session.cwd,
             # None means the workspace; otherwise the whitelisted rule root the
             # cwd is relative to, so the caller can tell where work lands.
@@ -3689,6 +4003,7 @@ class TianChengService:
             "origin": "catalog" if session.conversation_ref else "new",
             "conversation_ref": session.conversation_ref,
             "source_id": session.source_id,
+            "codex_defaults": summarize_codex_options(session.codex_defaults),
             "closed": session.closed,
             "run_count": len(session.runs),
             "active_run_count": active,
@@ -3731,13 +4046,27 @@ class TianChengService:
                 self._refresh_agent_run(session, run)
         return self._agent_session_payload(session)
 
-    def agent_run_start(self, session_id: str, prompt: str) -> dict[str, Any]:
+    def agent_run_start(
+        self,
+        session_id: str,
+        prompt: str,
+        codex_options: Mapping[str, Any] | None = None,
+        codex_action: str = "continue",
+        max_runtime_seconds: int | None = None,
+    ) -> dict[str, Any]:
         session = self._get_agent_session(session_id)
         with session.lock:
-            return self._agent_run_start_locked(session, prompt)
+            return self._agent_run_start_locked(
+                session, prompt, codex_options, codex_action, max_runtime_seconds
+            )
 
     def _agent_run_start_locked(
-        self, session: AgentSessionState, prompt: str
+        self,
+        session: AgentSessionState,
+        prompt: str,
+        codex_options: Mapping[str, Any] | None = None,
+        codex_action: str = "continue",
+        max_runtime_seconds: int | None = None,
     ) -> dict[str, Any]:
         if session.closed:
             raise PermissionError("Agent session is closed")
@@ -3745,6 +4074,18 @@ class TianChengService:
         adapter = self.agent_profiles.adapter_for_profile(profile)
         if profile.provider != session.provider or adapter.provider != session.provider:
             raise RuntimeError("Agent session provider binding does not match its profile")
+        if codex_action not in {"continue", "fork", "review"}:
+            raise ValueError("codex_action must be continue, fork, or review")
+        if session.provider != "codex" and codex_action != "continue":
+            raise NotImplementedError("Codex actions require a Codex profile")
+        effective_max_runtime_seconds = _bounded_int(
+            profile.max_runtime_seconds
+            if max_runtime_seconds is None
+            else max_runtime_seconds,
+            minimum=1,
+            maximum=MAX_AGENT_RUNTIME_SECONDS,
+            label="max_runtime_seconds",
+        )
         with self._agent_lock:
             existing_runs = list(session.runs.values())
         for existing in existing_runs:
@@ -3761,6 +4102,15 @@ class TianChengService:
         if session.conversation_ref is not None:
             self._reauthorize_attached_session(session)
         working_directory = self._agent_working_directory(session)
+        codex_home = self._authorize_agent_codex_home(profile)
+        effective_codex_options = merge_codex_options(
+            session.codex_defaults,
+            codex_options,
+        )
+        prepared_codex_options = self._prepare_codex_options(
+            session,
+            effective_codex_options,
+        )
         prefix = self._agent_only_commands.get(profile.command) or self._exec_commands.get(
             profile.command
         )
@@ -3773,6 +4123,8 @@ class TianChengService:
             cwd=str(working_directory),
             sandbox=session.sandbox,
             native_session_id=session.native_session_id,
+            invocation_options=prepared_codex_options,
+            action=codex_action,
         )
         if command[: len(prefix)] != prefix or len(command) <= len(prefix):
             raise RuntimeError("Agent adapter returned an invalid executable prefix")
@@ -3781,9 +4133,16 @@ class TianChengService:
             profile.command,
             command,
             working_directory,
-            max_runtime_seconds=profile.max_runtime_seconds,
+            max_runtime_seconds=effective_max_runtime_seconds,
             output_limit_bytes=profile.max_output_bytes,
-            include_passthrough_env=profile.pass_configured_environment,
+            include_passthrough_env=False,
+            profile_credential_env=profile.credential_env,
+            environment_overrides=(
+                {"AWZ_ROUTE": str(prepared_codex_options["route"])}
+                if "route" in prepared_codex_options
+                else None
+            ),
+            codex_home=str(codex_home) if codex_home is not None else None,
             stdin_enabled=False,
             policy_root=(
                 None if session.policy_root is None else Path(session.policy_root)
@@ -3794,6 +4153,8 @@ class TianChengService:
             session.session_id,
             started["process_id"],
             parser=parser,
+            invocation_summary=summarize_codex_options(effective_codex_options),
+            action=codex_action,
         )
         with self._agent_lock:
             session.runs[run.run_id] = run
@@ -3812,6 +4173,9 @@ class TianChengService:
             "native_session_id": session.native_session_id,
             "thread_id": session.thread_id,
             "next_seq": 0,
+            "codex_options": dict(run.invocation_summary),
+            "codex_action": run.action,
+            "max_runtime_seconds": started["max_runtime_seconds"],
         }
 
     def _reauthorize_attached_session(self, session: AgentSessionState) -> None:
@@ -3868,6 +4232,13 @@ class TianChengService:
     ) -> None:
         candidate = run.parser.native_session_id
         if not candidate:
+            return
+        if run.invocation_summary.get("ephemeral"):
+            return
+        if run.action in {"fork", "review"}:
+            session.native_session_id = candidate
+            session.conversation_ref = None
+            session.source_id = None
             return
         if (
             session.conversation_ref is not None
@@ -4005,9 +4376,12 @@ class TianChengService:
                 "result_ready": run.state not in {"queued", "running"},
                 "has_result": run.parser.final_message is not None,
                 "error": run.error_summary,
+                "codex_options": dict(run.invocation_summary),
+                "codex_action": run.action,
                 "created_at": _iso_timestamp(run.created_epoch),
                 "ended_at": _iso_timestamp(run.ended_epoch) if run.ended_epoch else None,
                 "runtime_seconds": status["runtime_seconds"],
+                "max_runtime_seconds": status["max_runtime_seconds"],
                 "exit_code": status.get("exit_code"),
             }
 

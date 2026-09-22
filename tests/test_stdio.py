@@ -193,6 +193,41 @@ async def test_exec_tool_is_registered_only_when_enabled(
         assert tools["git_push"].annotations.open_world_hint is True
         session_properties = tools["agent_session"].input_schema["properties"]
         assert "conversation_ref" in session_properties
+        assert "codex_home" not in session_properties
+        assert session_properties["sandbox"]["default"] == "workspace-write"
+        session_option_ref = next(
+            branch["$ref"]
+            for branch in session_properties["codex_defaults"]["anyOf"]
+            if "$ref" in branch
+        )
+        session_option_schema = tools["agent_session"].input_schema["$defs"][
+            session_option_ref.rsplit("/", 1)[-1]
+        ]
+        assert {"model", "config", "search", "output_schema"} <= set(
+            session_option_schema["properties"]
+        )
+        run_properties = tools["agent_run"].input_schema["properties"]
+        assert "codex_home" not in run_properties
+        assert "max_runtime_seconds" in run_properties
+        run_option_ref = next(
+            branch["$ref"]
+            for branch in run_properties["codex_options"]["anyOf"]
+            if "$ref" in branch
+        )
+        run_option_schema = tools["agent_run"].input_schema["$defs"][
+            run_option_ref.rsplit("/", 1)[-1]
+        ]
+        assert {"model", "config", "search", "output_schema"} <= set(
+            run_option_schema["properties"]
+        )
+        assert {"review_uncommitted", "review_base", "review_commit"} <= set(
+            run_option_schema["properties"]
+        )
+        assert set(run_properties["codex_action"]["enum"]) == {
+            "continue",
+            "fork",
+            "review",
+        }
         assert {
             "native_session_id",
             "thread_id",

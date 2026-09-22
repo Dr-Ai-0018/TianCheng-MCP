@@ -23,45 +23,14 @@ import argparse
 import asyncio
 import json
 import time
-import os
-import shutil
 from pathlib import Path
 
 from mcp import Client, StdioServerParameters
 
-
-def _powershell() -> Path:
-    """Locate pwsh on PATH, or accept an explicit override.
-
-    Nothing here may point at one particular machine's install: a clone has to
-    work wherever PowerShell 7 happens to live.
-    """
-
-    override = os.environ.get("TIANCHENG_POWERSHELL")
-    if override:
-        return Path(override)
-    found = shutil.which("pwsh")
-    if not found:
-        raise SystemExit(
-            "pwsh (PowerShell 7) was not found on PATH. Install it, or set "
-            "TIANCHENG_POWERSHELL to its full path."
-        )
-    return Path(found)
-
-
-def _workspace() -> Path:
-    """Return the workspace this smoke run may touch."""
-
-    value = os.environ.get("TIANCHENG_WORKSPACE")
-    if not value:
-        raise SystemExit(
-            "Set TIANCHENG_WORKSPACE to the directory this smoke run may use. "
-            "It has no default: the workspace is the security boundary."
-        )
-    return Path(value)
+from local_runtime import powershell_path
 
 REPO = Path(__file__).resolve().parents[1]
-POWERSHELL = None  # resolved lazily by _powershell()
+POWERSHELL = powershell_path(REPO)
 # .tmp/ is git-ignored; the report names real session ids and must not be
 # committed alongside the harness.
 DEFAULT_REPORT = REPO / ".tmp" / "acceptance-result.json"
@@ -342,9 +311,12 @@ async def main() -> None:
     parser.add_argument("--keep", action="store_true", help="skip trash cleanup")
     parser.add_argument("--report", default=str(DEFAULT_REPORT))
     args = parser.parse_args()
+    requested_profiles = [
+        profile.strip() for profile in args.providers.split(",") if profile.strip()
+    ]
 
     parameters = StdioServerParameters(
-        command=str(_powershell()),
+        command=str(POWERSHELL),
         args=[
             "-NoLogo",
             "-NoProfile",
@@ -356,9 +328,6 @@ async def main() -> None:
         ],
         cwd=str(REPO),
         encoding="utf-8",
-        # The SDK gives the child a minimal environment, so the workspace
-        # and any other TIANCHENG_* settings would not reach the server.
-        env=dict(os.environ),
     )
 
     base = f"accept-{time.strftime('%Y%m%dT%H%M%S')}"
@@ -380,14 +349,17 @@ async def main() -> None:
         info = structured(await client.call_tool("workspace_info", {}))
         profiles = info.get("available_agent_profiles", [])
         acc.record(
-            "both_profiles_registered",
-            {"codex-default", "claude-default"} <= set(profiles),
+            "requested_profiles_registered",
+            set(requested_profiles) <= set(profiles),
             profiles,
         )
 
         await acc.must("mkdir", {"path": base, "parents": True})
-        for profile in [p.strip() for p in args.providers.split(",") if p.strip()]:
-            tag = "codex" if "codex" in profile else "claude"
+        for profile in requested_profiles:
+            tag = {
+                "codex-default": "codex",
+                "claude-default": "claude",
+            }.get(profile, profile)
             try:
                 await acc.provider_chain(profile, tag)
             except Exception as exc:

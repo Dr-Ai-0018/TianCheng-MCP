@@ -12,12 +12,16 @@ logs/*.jsonl
 /.env
 /exec-env.allowlist
 /config/launcher.local.json
+/config/agent-profiles.json
 /config/access-policy.json
 /config/agent-sources.json
 /config/access-policy.json.bak
 /config/agent-sources.json.bak
 /config/*-totp.svg
 /state/agent-catalog.sqlite*
+/state/tunnel-supervisor-*.json
+/state/tunnel-supervisor-*.lock
+/state/tunnel-supervisor-*.stop
 dist/
 build/
 /docs/

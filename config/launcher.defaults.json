@@ -5,6 +5,7 @@
   "profileDir": "",
   "powerShell": "",
   "workspace": "",
+  "python": ".venv/Scripts/python.exe",
   "mcpScript": "run-mcp.ps1",
   "mcpExecScript": "run-mcp-exec.ps1",
   "mcpGrantsScript": "run-mcp-grants.ps1",
@@ -15,5 +16,19 @@
   "healthBaseUrl": "http://127.0.0.1:8080",
   "interactiveTimeoutSeconds": 75,
   "doctorBeforeStart": true,
-  "openWebUiOnStart": false
+  "openWebUiOnStart": false,
+  "supervisor": {
+    "enabled": true,
+    "mcpConnectionMaxTtl": "24h",
+    "healthPollSeconds": 5,
+    "startupGraceSeconds": 20,
+    "upstreamErrorThreshold": 3,
+    "upstreamErrorWindowSeconds": 30,
+    "restartBackoffSeconds": [1, 2, 5, 10, 30, 60],
+    "restartBudget": {
+      "maxAttempts": 5,
+      "windowSeconds": 600
+    },
+    "stableResetSeconds": 300
+  }
 }
