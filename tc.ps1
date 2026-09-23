@@ -3,7 +3,7 @@ param(
     [ValidateSet(
         'menu', 'start', 'start-new', 'doctor', 'profiles', 'configure-profile',
         'select-profile', 'edit-profile', 'key', 'key-status', 'status',
-        'set-mode', 'stop', 'restart', 'open-ui', 'settings', 'info', 'install-alias', 'totp-setup', 'policy', 'agents'
+        'set-mode', 'stop', 'restart', 'open-ui', 'settings', 'info', 'install-alias', 'policy', 'agents'
     )]
     [string]$Action = 'menu',
     [string]$Profile,
@@ -1795,10 +1795,6 @@ function Install-Alias {
     & $installer
 }
 
-function Setup-Totp {
-    throw 'TOTP setup was removed in 0.9.1 because the approval flow never validated it. Use the one-time chat challenge flow; do not send a second factor through the model/MCP channel.'
-}
-
 function Show-MainMenu {
     while ($true) {
         $config = Get-LauncherConfig
@@ -1895,7 +1891,6 @@ switch ($Action) {
     'settings' { Edit-SettingsInteractive -Config $config }
     'info' { Show-Info -Config $config }
     'install-alias' { Install-Alias }
-    'totp-setup' { Setup-Totp }
     'policy' { Show-AccessPolicy }
     'agents' {
         if ($Json) { Show-AgentSourceState -Config $config }

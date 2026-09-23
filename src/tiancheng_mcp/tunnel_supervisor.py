@@ -340,10 +340,6 @@ def _terminate_process_tree(process: subprocess.Popen[str]) -> None:
         pass
 
 
-def _is_failure_line(line: str) -> bool:
-    return _classify_failure_line(line) is not None
-
-
 def _classify_failure_line(line: str) -> tuple[str, bool] | None:
     """Return (reason, recover_immediately) for actionable tunnel failures."""
 

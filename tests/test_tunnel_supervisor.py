@@ -15,7 +15,6 @@ from tiancheng_mcp.tunnel_supervisor import (
     SupervisorSettings,
     TunnelSupervisor,
     _classify_failure_line,
-    _is_failure_line,
     load_launcher_config,
     parse_duration,
 )
@@ -74,16 +73,21 @@ def test_profile_lock_can_be_reacquired_without_unlock_error(tmp_path: Path) -> 
 
 
 @pytest.mark.parametrize(
-    "line",
+    ("line", "classification"),
     [
-        "dispatcher received MCP upstream error",
-        "command response deadline reached",
-        '{"status":502,"failure_source":"client_internal",'
-        '"upstream_response_received":false}',
+        ("dispatcher received MCP upstream error", ("repeated_mcp_upstream_failure", False)),
+        ("command response deadline reached", ("repeated_mcp_upstream_failure", False)),
+        (
+            '{"status":502,"failure_source":"client_internal",'
+            '"upstream_response_received":false}',
+            ("client_internal_without_upstream", True),
+        ),
     ],
 )
-def test_failure_log_signatures_are_detected(line: str) -> None:
-    assert _is_failure_line(line) is True
+def test_failure_log_signatures_are_detected(
+    line: str, classification: tuple[str, bool]
+) -> None:
+    assert _classify_failure_line(line) == classification
 
 
 def test_exact_internal_502_is_an_immediate_recovery_signal() -> None:
@@ -106,7 +110,7 @@ def test_exact_internal_502_is_an_immediate_recovery_signal() -> None:
     ],
 )
 def test_control_plane_poll_noise_does_not_trigger_mcp_recovery(line: str) -> None:
-    assert _is_failure_line(line) is False
+    assert _classify_failure_line(line) is None
 
 
 def test_launcher_config_merges_local_override_without_secrets(tmp_path: Path) -> None:

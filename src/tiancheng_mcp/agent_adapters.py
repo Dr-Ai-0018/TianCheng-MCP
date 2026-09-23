@@ -13,7 +13,7 @@ from datetime import UTC, datetime
 import json
 import re
 import time
-from typing import Any, Iterable, Mapping, Protocol, TypedDict, runtime_checkable
+from typing import Any, Mapping, Protocol, TypedDict, runtime_checkable
 
 
 MAX_AGENT_PROMPT_CHARS = 32_000
@@ -421,18 +421,6 @@ class AgentProfile:
     max_output_bytes: int = 512 * 1024
 
     @property
-    def agent(self) -> str:
-        """Compatibility alias retained for 0.8 callers and tests."""
-
-        return self.provider
-
-    @property
-    def codex_profile(self) -> str:
-        """Compatibility alias retained for older internal callers/tests."""
-
-        return self.provider_profile if self.provider == "codex" else ""
-
-    @property
     def codex_config_profile(self) -> str:
         """The Codex CLI ``-p`` profile, distinct from this MCP profile name."""
 
@@ -517,12 +505,6 @@ class CodexJsonlParser:
         self.native_session_id: str | None = None
         self.final_message: str | None = None
 
-    @property
-    def thread_id(self) -> str | None:
-        """Compatibility alias for the provider-neutral native session id."""
-
-        return self.native_session_id
-
     def feed_line(self, line: str) -> NormalizedEvent | None:
         if not isinstance(line, str) or not line.strip():
             return None
@@ -545,7 +527,7 @@ class CodexJsonlParser:
                 if isinstance(candidate, str) and _NATIVE_SESSION_ID.fullmatch(candidate)
                 else None
             )
-            data = {"thread_id": self.native_session_id} if self.native_session_id else {}
+            data = {"native_session_id": self.native_session_id} if self.native_session_id else {}
             summary_value = "Codex thread started"
         elif event_type == "item.completed":
             item = raw.get("item") if isinstance(raw.get("item"), dict) else {}
@@ -578,14 +560,6 @@ class CodexJsonlParser:
         )
         self.next_seq += 1
         return event
-
-    def feed(self, lines: Iterable[str]) -> list[NormalizedEvent]:
-        events: list[NormalizedEvent] = []
-        for line in lines:
-            event = self.feed_line(line)
-            if event is not None:
-                events.append(event)
-        return events
 
     def synthetic_event(
         self,

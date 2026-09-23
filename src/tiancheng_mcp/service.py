@@ -26,8 +26,11 @@ from urllib.parse import urlsplit, urlunsplit
 from . import __version__
 from .agent_catalog import AgentCatalog
 from .agent_adapters import (
+    AgentProfile,
+    NormalizedEvent,
     merge_codex_options,
     normalize_codex_options,
+    redact_text,
     summarize_codex_options,
 )
 from .agent_sources import _SENSITIVE_COMPONENTS, AgentSourcePolicy
@@ -35,15 +38,12 @@ from .agents import (
     MAX_AGENT_EVENTS,
     MAX_AGENT_RUNS_PER_SESSION,
     MAX_AGENT_SESSIONS,
-    AgentProfile,
     AgentProfileRegistry,
     AgentRunState,
     AgentSessionState,
-    NormalizedEvent,
     load_agent_profile_definitions,
     new_run_id,
     new_session_id,
-    redact_text,
 )
 from .audit import AuditLogger
 from .grants import ExternalGrantManager
@@ -463,8 +463,10 @@ class _ManagedProcess:
         kill_job: _WindowsKillJob,
         output_limit: int,
         max_runtime_seconds: int,
+        owner: str = "process",
     ) -> None:
         self.process_id = process_id
+        self.owner = owner
         self.session_id = f"sess_{uuid.uuid4().hex}"
         self.command = command
         self.cwd = cwd
@@ -571,7 +573,6 @@ class TianChengService:
         allow_exec: bool = False,
         passthrough_env: Sequence[str] = (),
         allow_external_grants: bool = False,
-        totp_secret: str | None = None,
         interactive_timeout_seconds: int = DEFAULT_INTERACTIVE_TIMEOUT_SECONDS,
         enable_jobs: bool = True,
         access_policy_path: str | Path | None = None,
@@ -618,7 +619,6 @@ class TianChengService:
         self.external_grants = ExternalGrantManager(
             self.jail.root,
             enabled=allow_external_grants,
-            totp_secret=totp_secret,
             access_policy=self.access_policy,
         )
         self.passthrough_env = self._validate_passthrough_env(passthrough_env)
@@ -878,7 +878,7 @@ class TianChengService:
             "job_list",
             "external_grant_status",
             "revoke_external_access",
-            "cancel_external_access_request",
+            "external_access_cancel",
         } or tool in _LIGHTWEIGHT_TOOLS:
             return self.audited(tool, relative_path, operation)
 
@@ -1404,55 +1404,64 @@ class TianChengService:
             enable_agent_catalog=False,
         )
 
+    def _grant_relative_path(
+        self, grant_id: str, path: str, required_mode: str, *,
+        must_exist: bool = True, expect: str | None = None,
+        allow_root: bool = True,
+    ) -> str:
+        resolved, grant = self.external_grants.resolve(
+            grant_id, path, required_mode=required_mode, must_exist=must_exist,
+            expect=expect, allow_root=allow_root,
+        )
+        return resolved.relative_to(grant.root).as_posix()
+
     def external_list_dir(self, grant_id: str, path: str = ".", depth: int = 1) -> dict[str, Any]:
-        self.external_grants.resolve(grant_id, path, required_mode="read", must_exist=True, expect="directory")
-        return self._external_service(grant_id, "read").list_dir(path, depth)
+        relative = self._grant_relative_path(grant_id, path, "read", expect="directory")
+        return self._external_service(grant_id, "read").list_dir(relative, depth)
 
     def external_stat(self, grant_id: str, path: str) -> dict[str, Any]:
-        self.external_grants.resolve(grant_id, path, required_mode="read", must_exist=True)
-        return self._external_service(grant_id, "read").stat(path)
+        relative = self._grant_relative_path(grant_id, path, "read")
+        return self._external_service(grant_id, "read").stat(relative)
 
     def external_read_text(self, grant_id: str, path: str, start_line: int | None = None, end_line: int | None = None, max_bytes: int = DEFAULT_READ_BYTES) -> dict[str, Any]:
-        self.external_grants.resolve(grant_id, path, required_mode="read", must_exist=True, expect="file")
-        return self._external_service(grant_id, "read").read_text(path, start_line, end_line, max_bytes)
+        relative = self._grant_relative_path(grant_id, path, "read", expect="file")
+        return self._external_service(grant_id, "read").read_text(relative, start_line, end_line, max_bytes)
 
     def external_read_text_chunk(self, grant_id: str, path: str, offset_bytes: int = 0, max_bytes: int = DEFAULT_READ_BYTES) -> dict[str, Any]:
-        self.external_grants.resolve(grant_id, path, required_mode="read", must_exist=True, expect="file")
-        return self._external_service(grant_id, "read").read_text_chunk(path, offset_bytes, max_bytes)
+        relative = self._grant_relative_path(grant_id, path, "read", expect="file")
+        return self._external_service(grant_id, "read").read_text_chunk(relative, offset_bytes, max_bytes)
 
     def external_write_text(self, grant_id: str, path: str, content: str, create_parents: bool = True, expected_sha256: str | None = None) -> dict[str, Any]:
-        self.external_grants.resolve(grant_id, path, required_mode="write", must_exist=False, allow_root=False)
-        return self._external_service(grant_id, "write").write_text(path, content, create_parents, expected_sha256)
+        relative = self._grant_relative_path(grant_id, path, "write", must_exist=False, allow_root=False)
+        return self._external_service(grant_id, "write").write_text(relative, content, create_parents, expected_sha256)
 
     def external_append_text(self, grant_id: str, path: str, content: str, create_parents: bool = True, expected_sha256: str | None = None) -> dict[str, Any]:
-        self.external_grants.resolve(grant_id, path, required_mode="write", must_exist=False, allow_root=False)
-        return self._external_service(grant_id, "write").append_text(path, content, create_parents, expected_sha256)
+        relative = self._grant_relative_path(grant_id, path, "write", must_exist=False, allow_root=False)
+        return self._external_service(grant_id, "write").append_text(relative, content, create_parents, expected_sha256)
 
     def external_mkdir(self, grant_id: str, path: str, parents: bool = True, exist_ok: bool = True) -> dict[str, Any]:
-        self.external_grants.resolve(grant_id, path, required_mode="write", must_exist=False, allow_root=False)
-        return self._external_service(grant_id, "write").mkdir(path, parents, exist_ok)
+        relative = self._grant_relative_path(grant_id, path, "write", must_exist=False, allow_root=False)
+        return self._external_service(grant_id, "write").mkdir(relative, parents, exist_ok)
 
     def external_move(self, grant_id: str, source: str, destination: str) -> dict[str, Any]:
-        self.external_grants.resolve(grant_id, source, required_mode="write", must_exist=True, allow_root=False)
-        self.external_grants.resolve(grant_id, destination, required_mode="write", must_exist=False, allow_root=False)
-        return self._external_service(grant_id, "write").move(source, destination)
+        source_relative = self._grant_relative_path(grant_id, source, "write", allow_root=False)
+        destination_relative = self._grant_relative_path(grant_id, destination, "write", must_exist=False, allow_root=False)
+        return self._external_service(grant_id, "write").move(source_relative, destination_relative)
 
     def external_copy(self, grant_id: str, source: str, destination: str) -> dict[str, Any]:
-        self.external_grants.resolve(grant_id, source, required_mode="write", must_exist=True, allow_root=False)
-        self.external_grants.resolve(grant_id, destination, required_mode="write", must_exist=False, allow_root=False)
-        return self._external_service(grant_id, "write").copy(source, destination)
+        source_relative = self._grant_relative_path(grant_id, source, "write", allow_root=False)
+        destination_relative = self._grant_relative_path(grant_id, destination, "write", must_exist=False, allow_root=False)
+        return self._external_service(grant_id, "write").copy(source_relative, destination_relative)
 
     def external_delete(self, grant_id: str, path: str) -> dict[str, Any]:
-        self.external_grants.resolve(grant_id, path, required_mode="delete", must_exist=True, allow_root=False)
-        return self._external_service(grant_id, "delete").delete(path)
+        relative = self._grant_relative_path(grant_id, path, "delete", allow_root=False)
+        return self._external_service(grant_id, "delete").delete(relative)
 
     def external_glob(
         self, grant_id: str, pattern: str, max_results: int = 200, base_path: str = "."
     ) -> dict[str, Any]:
-        self.external_grants.resolve(
-            grant_id, base_path, required_mode="read", must_exist=True, expect="directory"
-        )
-        return self._external_service(grant_id, "read").glob(pattern, max_results, base_path)
+        relative = self._grant_relative_path(grant_id, base_path, "read", expect="directory")
+        return self._external_service(grant_id, "read").glob(pattern, max_results, relative)
 
     def external_search_text(
         self,
@@ -1465,27 +1474,19 @@ class TianChengService:
         include_hidden: bool = True,
         timeout_seconds: int = 30,
         base_path: str = ".",
+        respect_gitignore: bool = False,
+        include_internal: bool = True,
     ) -> dict[str, Any]:
-        self.external_grants.resolve(
-            grant_id, base_path, required_mode="read", must_exist=True, expect="directory"
-        )
+        relative = self._grant_relative_path(grant_id, base_path, "read", expect="directory")
         return self._external_service(grant_id, "read").search_text(
-            query,
-            glob_pattern,
-            case_sensitive,
-            max_results,
-            max_scan_bytes,
-            include_hidden,
-            False,
-            True,
-            timeout_seconds,
-            base_path,
+            query, glob_pattern, case_sensitive, max_results, max_scan_bytes,
+            include_hidden, respect_gitignore, include_internal, timeout_seconds, relative,
         )
 
     def external_run_command(self, grant_id: str, command: str, args: list[str] | None = None, cwd: str = ".", timeout_seconds: int = 60, max_output_bytes: int = DEFAULT_COMMAND_OUTPUT_BYTES) -> dict[str, Any]:
         scoped = self._external_service(grant_id, "exec")
-        self.external_grants.resolve(grant_id, cwd, required_mode="exec", must_exist=True, expect="directory")
-        return scoped.run_command(command, args, cwd, timeout_seconds, max_output_bytes)
+        relative = self._grant_relative_path(grant_id, cwd, "exec", expect="directory")
+        return scoped.run_command(command, args, relative, timeout_seconds, max_output_bytes)
 
     def _policy_scoped_service(self, path: str, operation: str) -> tuple["TianChengService", str]:
         """Build a short-lived service rooted at a static, non-approval rule."""
@@ -1493,7 +1494,7 @@ class TianChengService:
         decision = self.access_policy.authorize(path, operation)
         if decision.requires_approval:
             raise PermissionError(
-                "This static rule requires approval; use request_external_access first"
+                "This static rule requires approval; use external_access_request first"
             )
         if decision.rule_path is None or decision.rule_path == self.jail.root:
             raise PermissionError("Static policy does not grant external access for this path")
@@ -1520,7 +1521,7 @@ class TianChengService:
         destination_decision = self.access_policy.authorize(destination, operation)
         if source_decision.requires_approval or destination_decision.requires_approval:
             raise PermissionError(
-                "This static rule requires approval; use request_external_access first"
+                "This static rule requires approval; use external_access_request first"
             )
         if source_decision.rule_path is None or source_decision.rule_path != destination_decision.rule_path:
             source_rule = (
@@ -1638,10 +1639,10 @@ class TianChengService:
         finally:
             scoped.shutdown()
 
-    def policy_external_search_text(self, query: str, glob_pattern: str = "**/*", case_sensitive: bool = False, max_results: int = 100, max_scan_bytes: int = 32 * 1024 * 1024, include_hidden: bool = True, timeout_seconds: int = 30, base_path: str = ".") -> dict[str, Any]:
+    def policy_external_search_text(self, query: str, glob_pattern: str = "**/*", case_sensitive: bool = False, max_results: int = 100, max_scan_bytes: int = 32 * 1024 * 1024, include_hidden: bool = True, timeout_seconds: int = 30, base_path: str = ".", respect_gitignore: bool = False, include_internal: bool = True) -> dict[str, Any]:
         scoped, relative = self._policy_scoped_service(base_path, "read")
         try:
-            return scoped.search_text(query, glob_pattern, case_sensitive, max_results, max_scan_bytes, include_hidden, False, True, timeout_seconds, relative)
+            return scoped.search_text(query, glob_pattern, case_sensitive, max_results, max_scan_bytes, include_hidden, respect_gitignore, include_internal, timeout_seconds, relative)
         finally:
             scoped.shutdown()
 
@@ -3503,6 +3504,7 @@ class TianChengService:
         codex_home: str | None = None,
         stdin_enabled: bool = True,
         policy_root: Path | None = None,
+        owner: str = "process",
     ) -> dict[str, Any]:
         if not self.allow_exec:
             raise PermissionError("Command execution is disabled; restart with --allow-exec")
@@ -3583,6 +3585,7 @@ class TianChengService:
             _WindowsKillJob(process),
             output_limit,
             runtime,
+            owner,
         )
         with self._process_lock:
             self._processes[process_id] = record
@@ -3617,12 +3620,24 @@ class TianChengService:
             raise FileNotFoundError("Managed process was not found in this MCP session")
         return record
 
+    def _get_public_process(self, process_id: str) -> _ManagedProcess:
+        record = self._get_managed_process(process_id)
+        if record.owner == "agent_run":
+            raise PermissionError(
+                "Agent run processes are controlled through agent_run "
+                "(inspect, events, or cancel)"
+            )
+        return record
+
     def process_status(self, process_id: str) -> dict[str, Any]:
+        return self._managed_process_status(self._get_public_process(process_id))
+
+    def _process_status(self, process_id: str) -> dict[str, Any]:
         return self._managed_process_status(self._get_managed_process(process_id))
 
     def list_processes(self, include_exited: bool = True) -> dict[str, Any]:
         with self._process_lock:
-            records = list(self._processes.values())
+            records = [record for record in self._processes.values() if record.owner == "process"]
         statuses = [self._managed_process_status(record) for record in records]
         if not include_exited:
             statuses = [status for status in statuses if status["running"]]
@@ -3634,6 +3649,16 @@ class TianChengService:
         }
 
     def process_output(
+        self,
+        process_id: str,
+        stream: str = "both",
+        max_bytes: int = DEFAULT_COMMAND_OUTPUT_BYTES,
+        after_bytes: int = 0,
+    ) -> dict[str, Any]:
+        self._get_public_process(process_id)
+        return self._process_output(process_id, stream, max_bytes, after_bytes)
+
+    def _process_output(
         self,
         process_id: str,
         stream: str = "both",
@@ -3658,7 +3683,7 @@ class TianChengService:
     def process_input(
         self, process_id: str, input_text: str, close_stdin: bool = False
     ) -> dict[str, Any]:
-        record = self._get_managed_process(process_id)
+        record = self._get_public_process(process_id)
         bytes_sent = record.send_input(input_text, close_stdin)
         return {
             **self._managed_process_status(record),
@@ -3999,7 +4024,6 @@ class TianChengService:
             "cwd_scope": "workspace" if session.policy_root is None else "access-policy",
             "sandbox": session.sandbox,
             "native_session_id": session.native_session_id,
-            "thread_id": session.thread_id,
             "origin": "catalog" if session.conversation_ref else "new",
             "conversation_ref": session.conversation_ref,
             "source_id": session.source_id,
@@ -4040,7 +4064,7 @@ class TianChengService:
                 run.cancelled = True
                 run.terminal_override = "cancelled"
                 try:
-                    self.stop_process(run.process_id, force=True)
+                    self._stop_process(run.process_id, force=True)
                 except (FileNotFoundError, RuntimeError):
                     pass
                 self._refresh_agent_run(session, run)
@@ -4147,6 +4171,7 @@ class TianChengService:
             policy_root=(
                 None if session.policy_root is None else Path(session.policy_root)
             ),
+            owner="agent_run",
         )
         run = AgentRunState(
             new_run_id(),
@@ -4168,10 +4193,8 @@ class TianChengService:
             "provider": session.provider,
             "run_id": run.run_id,
             "job_id": None,
-            "process_id": run.process_id,
             "state": initial_state,
             "native_session_id": session.native_session_id,
-            "thread_id": session.thread_id,
             "next_seq": 0,
             "codex_options": dict(run.invocation_summary),
             "codex_action": run.action,
@@ -4249,7 +4272,7 @@ class TianChengService:
                 "Attached agent returned a different native session id"
             )
             try:
-                self.stop_process(run.process_id, force=True)
+                self._stop_process(run.process_id, force=True)
             except (FileNotFoundError, RuntimeError):
                 pass
             return
@@ -4262,7 +4285,7 @@ class TianChengService:
             if profile.provider != session.provider or adapter.provider != session.provider:
                 raise RuntimeError("Agent session provider binding does not match its profile")
             display_name = adapter.display_name
-            output = self.process_output(
+            output = self._process_output(
                 run.process_id,
                 stream="stdout",
                 max_bytes=MAX_COMMAND_OUTPUT_BYTES,
@@ -4288,7 +4311,7 @@ class TianChengService:
                 self._append_agent_event(run, run.parser.feed_line(line))
             self._update_agent_native_binding(session, run)
 
-            status = self.process_status(run.process_id)
+            status = self._process_status(run.process_id)
             if run.terminal_override is not None:
                 run.state = run.terminal_override
             elif status["state"] == "timed_out":
@@ -4310,7 +4333,7 @@ class TianChengService:
             if terminal and run.ended_epoch is None:
                 run.ended_epoch = time.time()
             if terminal and not run.terminal_event_emitted:
-                stderr = self.process_output(
+                stderr = self._process_output(
                     run.process_id,
                     stream="stderr",
                     max_bytes=MAX_COMMAND_OUTPUT_BYTES,
@@ -4366,10 +4389,8 @@ class TianChengService:
                 "session_id": session.session_id,
                 "provider": session.provider,
                 "run_id": run.run_id,
-                "process_id": run.process_id,
                 "state": run.state,
                 "native_session_id": session.native_session_id,
-                "thread_id": session.thread_id,
                 "event_count": len(run.events),
                 "available_from_seq": available_from,
                 "next_seq": run.parser.next_seq,
@@ -4441,7 +4462,6 @@ class TianChengService:
                 "run_id": run.run_id,
                 "state": run.state,
                 "native_session_id": session.native_session_id,
-                "thread_id": session.thread_id,
                 "events": selected,
                 "available_from_seq": available_from,
                 "next_seq": next_seq,
@@ -4484,7 +4504,7 @@ class TianChengService:
             }
         run.cancelled = True
         run.terminal_override = "cancelled"
-        self.stop_process(run.process_id, force=True)
+        self._stop_process(run.process_id, force=True)
         status = self._refresh_agent_run(session, run)
         safe_reason, _ = redact_text(reason or "cancelled by caller", 1024)
         return {
@@ -4494,6 +4514,10 @@ class TianChengService:
         }
 
     def stop_process(self, process_id: str, force: bool = False) -> dict[str, Any]:
+        self._get_public_process(process_id)
+        return self._stop_process(process_id, force)
+
+    def _stop_process(self, process_id: str, force: bool = False) -> dict[str, Any]:
         record = self._get_managed_process(process_id)
         if record.process.poll() is not None:
             return {**self._managed_process_status(record), "already_exited": True}
@@ -4527,7 +4551,7 @@ class TianChengService:
             ]
         for process_id in ids:
             try:
-                self.stop_process(process_id, force=True)
+                self._stop_process(process_id, force=True)
             except Exception:
                 pass
 
@@ -4555,7 +4579,7 @@ class TianChengService:
                         active_runs.append((session, run))
         for session, run in active_runs:
             try:
-                self.stop_process(run.process_id, force=True)
+                self._stop_process(run.process_id, force=True)
                 self._refresh_agent_run(session, run)
             except Exception:
                 run.state = "aborted_on_shutdown"

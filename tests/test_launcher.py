@@ -71,6 +71,13 @@ def run_powershell(
     )
 
 
+def test_removed_totp_setup_is_not_a_launcher_action() -> None:
+    result = run_powershell(PROJECT_ROOT / "tc.ps1", "-Action", "totp-setup")
+    assert result.returncode != 0
+    assert "totp-setup" in result.stderr
+    assert "ValidateSet" in result.stderr
+
+
 def write_test_config(path: Path, *, env_file: Path, profile_dir: Path) -> None:
     workspace = path.parent / "workspace"
     workspace.mkdir(exist_ok=True)

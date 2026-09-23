@@ -2,15 +2,17 @@
 
 本项目遵循 [Semantic Versioning](https://semver.org/)：
 
-- 补丁版本：只修复向后兼容的 bug，或更新文档/测试。
-- 小版本：增加向后兼容的工具、可选参数或运行能力。
-- 大版本：改变现有调用契约、默认安全边界，或需要用户迁移的变更。
+- `0.x` 开发阶段：补丁版本只修复向后兼容的 bug，或更新文档/测试；次版本可以增加能力，也可以包含明确记录的工具或 API 调用契约变更。
+- 每项不兼容变更都须在本文件中说明影响和迁移方法；版本升级不能削弱现有安全边界。
+- 从 `1.0.0` 起：不兼容的公共 API 变更或默认安全边界变更升主版本，向后兼容的新增能力升次版本。
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-09-23
+
 ### Added
 
-- 新增确定性的公开版同步器：只导出 Git 跟踪文件，执行 TianCheng/TianCheng 命名映射，
+- 新增确定性的公开版同步器：只导出 Git 跟踪文件，执行私有版与公开版的命名映射，
   拒绝内部名称、已知机器路径和 local-only Agent profile 残留，并要求源与目标仓库状态可核验。
 - 新增可移植的 launcher/Agent profile 示例；真实工作区、工具路径、Agent runtime home、
   credential 变量名、访问策略、Catalog、状态和日志全部进入 Git 忽略的本机配置层。
@@ -44,6 +46,22 @@
 
 ### Changed
 
+- `external_search_text` 新增 `respect_gitignore` 与 `include_internal` 参数，默认值分别为
+  `false`、`true`，保持既有外部扫描范围；使用 ripgrep 时可缩小搜索范围，Python 回退不保证
+  同样的筛选行为。`mkdir` 与 `external_mkdir` 统一标为非幂等写入，反映 `exist_ok=false` 的调用。
+- `access_policy_reload` 说明现明确其冷重载用途：读取本地修改的策略文件并更新内存快照，
+  不编辑文件，也不代替需要审批的授权流程。
+- 两套授权流程统一使用 request/approve/cancel 动作后缀：临时授权现在使用
+  `external_access_request/approve/cancel`，持久策略使用
+  `access_policy_change_request/approve/cancel`。临时 grant 只在当前 MCP 进程内有效、最多
+  10 分钟；策略批准会持久写入 `access-policy.json` 并立即生效。
+- Agent session/run 的本地返回与归一化事件统一使用 `native_session_id`；Codex 原生 JSONL
+  输入中的 `thread_id` 仍按上游格式解析。
+- Agent run 只能通过 `agent_run` 的 inspect/events/result/cancel 查看和取消；通用
+  `process_status`、`process_output`、`process_input`、`stop_process` 拒绝 Agent 进程，
+  `list_processes` 不再列出它们。调用方应改用 Agent 的 `session_id` 与 `run_id`。
+- 带 `grant_id` 的 `external_*` 工具现在接受授权根内的绝对路径，原有的授权根相对路径仍可用；
+  不带 `grant_id` 时仍要求静态策略覆盖的绝对路径，越界与重解析点仍被拒绝。
 - `tc status` 不再把 `/readyz` 当作 MCP 已通过端到端探测；现在分别报告 Supervisor、Tunnel
   readiness、`MCP Inferred` 与 `MCP Verified`。当前 stdio 无同 transport probe 时 verified
   明确显示 `not-available`，旧的裸 Tunnel 则显示 `unverified`。
@@ -53,6 +71,22 @@
   session/run inspect 仅返回有界、非敏感的 effective options 摘要。
 - Codex 的 root-level `--search` 与 `-a` 按 0.153.0 实际语法放在 `exec` 前；旧调用不传新
   options 时仍生成原有命令。
+
+### Removed
+
+- 移除无效的 `tc totp-setup`、未使用的 `totp_secret` 构造参数及
+  `external_grant_status.totp_configured` 恒假字段。审批仍只依赖会话内的一次性 challenge
+  与用户确认词，challenge 不构成独立的第二因子。
+- 移除 `AgentProfile.agent/codex_profile`、`AgentRegistry.get_adapter`、
+  `CodexJsonlParser.feed` 和 Tunnel 失败布尔包装等旧兼容入口；Python 调用方分别使用
+  `provider/codex_config_profile`、`adapter_for_profile`、`feed_line` 和失败原因分类函数。
+- 工具名 `request_external_access`、`approve_external_access`、
+  `cancel_external_access_request`、`access_policy_change_confirm` 已移除；调用方分别改用
+  `external_access_request`、`external_access_approve`、`external_access_cancel`、
+  `access_policy_change_approve`。`agent_session` / `agent_run` 返回中的 `thread_id` 别名已移除，
+  调用方改读 `native_session_id`。
+- Agent run 的 start/inspect/result/cancel 返回不再暴露内部 `process_id`；调用方使用
+  `agent_run` 的 `session_id` 与 `run_id` 管理生命周期。
 
 ### Security
 

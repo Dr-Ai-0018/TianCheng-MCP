@@ -14,9 +14,7 @@ from tiancheng_mcp.agents import (
     MAX_AGENT_EVENTS,
     AgentProfileRegistry,
     AgentRunState,
-    CodexJsonlParser,
     load_agent_profile_definitions,
-    redact_text,
 )
 from tiancheng_mcp.agent_adapters import (
     AdapterCapabilities,
@@ -25,9 +23,11 @@ from tiancheng_mcp.agent_adapters import (
     ClaudeCodeAdapter,
     ClaudeJsonlParser,
     CodexAdapter,
+    CodexJsonlParser,
     NormalizedEvent,
     merge_codex_options,
     normalize_codex_options,
+    redact_text,
 )
 from tiancheng_mcp.agent_sources import AgentSourcePolicy
 from tiancheng_mcp.policy import AccessPolicy, AccessRule
@@ -372,7 +372,7 @@ def test_codex_native_invocation_options_render_in_cli_0153_order() -> None:
         prompt="",
         cwd="E:/ExampleWorkspace",
         sandbox="read-only",
-        thread_id="thr_source",
+        native_session_id="thr_source",
         invocation_options={"model": "gpt-5.6-sol"},
         action="fork",
     )
@@ -603,9 +603,11 @@ def test_agent_registry_exposes_capabilities_and_stable_unsupported_errors() -> 
         },
     )
     profile = registry.get("codex-default")
-    assert profile.agent == "codex"
-    assert profile.codex_profile == ""
+    assert profile.provider == "codex"
     assert profile.codex_config_profile == ""
+    assert not hasattr(profile, "agent")
+    assert not hasattr(profile, "codex_profile")
+    assert not hasattr(registry, "get_adapter")
     assert registry.profile_summaries() == (
         {
             "profile": "codex-default",
@@ -688,9 +690,13 @@ class _FakeAdapter:
         cwd: str,
         sandbox: str,
         native_session_id: str | None = None,
+        invocation_options: dict[str, object] | None = None,
+        action: str = "continue",
     ) -> list[str]:
         assert profile.provider == self.provider
         assert cwd
+        assert not invocation_options
+        assert action == "continue"
         profile.validate_sandbox(sandbox)
         return [*executable_prefix, native_session_id or "new", prompt]
 
@@ -705,6 +711,8 @@ class _BadPrefixAdapter(_FakeAdapter):
         cwd: str,
         sandbox: str,
         native_session_id: str | None = None,
+        invocation_options: dict[str, object] | None = None,
+        action: str = "continue",
     ) -> list[str]:
         return ["unregistered-executable", prompt]
 
@@ -732,12 +740,13 @@ def test_agent_runtime_uses_registered_adapter_and_provider_binding(
     session = service.agent_session_create(profile="fake-default")
     assert session["provider"] == "fake"
     assert session["native_session_id"] is None
-    assert session["thread_id"] is None
+    assert "thread_id" not in session
     first = service.agent_run_start(session["session_id"], "first")
     completed = _wait_for_run(service, session["session_id"], first["run_id"])
     assert completed["provider"] == "fake"
     assert completed["native_session_id"] == "native_fake_1"
-    assert completed["thread_id"] == "native_fake_1"
+    assert completed["native_session_id"] == "native_fake_1"
+    assert "thread_id" not in completed
     result = service.agent_run_result(session["session_id"], first["run_id"])
     assert result["result"] == "first"
 
@@ -792,16 +801,20 @@ def test_prepared_process_entrypoint_revalidates_prefix_and_workspace(
 
 def test_codex_jsonl_parser_extracts_thread_and_final_message() -> None:
     parser = CodexJsonlParser()
-    events = parser.feed(
-        [
+    assert not hasattr(parser, "feed")
+    events = [
+        event
+        for line in [
             "not json",
             '{"type":"thread.started","thread_id":"thr_123"}',
             '{"type":"item.completed","item":{"type":"agent_message","text":"完成检查"}}',
             '{"type":"turn.completed"}',
         ]
-    )
+        if (event := parser.feed_line(line)) is not None
+    ]
     assert [event.type for event in events] == ["thread_started", "agent_message", "status"]
-    assert parser.thread_id == "thr_123"
+    assert parser.native_session_id == "thr_123"
+    assert events[0].as_dict()["data"] == {"native_session_id": "thr_123"}
     assert parser.final_message == "完成检查"
     assert events[1].as_dict()["data"] == {"text": "完成检查"}
     assert events[-1].seq == 2
@@ -879,7 +892,8 @@ def test_agent_run_mvp_returns_and_pages_normalized_events(workspace, tmp_path) 
         time.sleep(0.05)
     assert page is not None
     assert page["state"] == "succeeded"
-    assert page["thread_id"] == "thr_fake"
+    assert page["native_session_id"] == "thr_fake"
+    assert "thread_id" not in page
     assert [event["type"] for event in page["events"]] == [
         "thread_started",
         "agent_message",
@@ -917,7 +931,10 @@ def test_agent_run_receives_immediate_stdin_eof(workspace, tmp_path) -> None:
     assert service.agent_run_result(session["session_id"], started["run_id"])[
         "result"
     ] == "eof"
-    process = service._get_managed_process(started["process_id"])
+    assert "process_id" not in started
+    process = service._get_managed_process(
+        service._get_agent_run(session["session_id"], started["run_id"])[1].process_id
+    )
     assert process.stdin_closed is True
 
 
@@ -1577,6 +1594,25 @@ def test_agent_cancel_timeout_and_shutdown_are_distinct(workspace, tmp_path) -> 
     cancel_session = cancel_service.agent_session_create()
     cancel_run = cancel_service.agent_run_start(cancel_session["session_id"], "cancel")
     assert cancel_run["max_runtime_seconds"] == 3600
+    assert "process_id" not in cancel_run
+    agent_process_id = cancel_service._get_agent_run(
+        cancel_session["session_id"], cancel_run["run_id"]
+    )[1].process_id
+    assert cancel_service.list_processes()["count"] == 0
+    for operation in (
+        lambda: cancel_service.process_status(agent_process_id),
+        lambda: cancel_service.process_output(agent_process_id),
+        lambda: cancel_service.process_input(agent_process_id, "secret"),
+        lambda: cancel_service.stop_process(agent_process_id, force=True),
+    ):
+        with pytest.raises(PermissionError, match="agent_run"):
+            operation()
+    assert cancel_service.agent_run_inspect(
+        cancel_session["session_id"], cancel_run["run_id"]
+    )["state"] == "running"
+    assert "process_id" not in cancel_service.agent_run_inspect(
+        cancel_session["session_id"], cancel_run["run_id"]
+    )
     with pytest.raises(RuntimeError, match="one active run"):
         cancel_service.agent_run_start(cancel_session["session_id"], "overlap")
     cancelled = cancel_service.agent_run_cancel(
@@ -1616,7 +1652,11 @@ def test_agent_cancel_timeout_and_shutdown_are_distinct(workspace, tmp_path) -> 
         shutdown_session["session_id"], shutdown_run["run_id"]
     )
     assert stopped["state"] == "aborted_on_shutdown"
-    assert shutdown_service.process_status(shutdown_run["process_id"])["running"] is False
+    assert shutdown_service._process_status(
+        shutdown_service._get_agent_run(
+            shutdown_session["session_id"], shutdown_run["run_id"]
+        )[1].process_id
+    )["running"] is False
 
 
 def test_agent_session_serializes_concurrent_starts(workspace, tmp_path, monkeypatch) -> None:

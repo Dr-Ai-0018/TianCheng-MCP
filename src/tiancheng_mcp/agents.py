@@ -1,8 +1,7 @@
 """Provider-neutral local agent runtime state and profile registry.
 
 Provider-specific command construction and event parsing live in
-``agent_adapters``.  Compatibility re-exports keep the 0.8 public Python
-surface stable while the service runtime moves behind the adapter contract.
+``agent_adapters``; runtime state and the profile registry live here.
 """
 
 from __future__ import annotations
@@ -25,7 +24,6 @@ from .agent_adapters import (
     ClaudeCodeAdapter,
     CodexJsonlParser,
     NormalizedEvent,
-    redact_text,
 )
 
 MAX_AGENT_EVENTS = 2_000
@@ -300,12 +298,6 @@ class AgentProfileRegistry:
             raise ValueError("Agent profile provider does not match its adapter")
         return adapter
 
-    def get_adapter(self, provider: str) -> AgentAdapter:
-        if not isinstance(provider, str) or provider not in self._adapters:
-            available = ", ".join(sorted(self._adapters)) or "none"
-            raise ValueError(f"Unknown agent provider; available: {available}")
-        return self._adapters[provider]
-
     def require_capability(
         self, profile: AgentProfile | str, capability: str
     ) -> AgentAdapter:
@@ -369,19 +361,16 @@ class AgentProfileRegistry:
             "resume" if native_session_id else "create"
         )
         adapter = self.require_capability(profile, capability)
-        keyword_arguments: dict[str, Any] = {
-            "prompt": prompt,
-            "cwd": cwd,
-            "sandbox": sandbox,
-            "native_session_id": native_session_id,
-        }
-        # Preserve compatibility with third-party/fake adapters that implement
-        # the 0.9 protocol until they opt into provider-specific options.
-        if invocation_options:
-            keyword_arguments["invocation_options"] = invocation_options
-        if action != "continue":
-            keyword_arguments["action"] = action
-        return adapter.build_command(profile, executable_prefix, **keyword_arguments)
+        return adapter.build_command(
+            profile,
+            executable_prefix,
+            prompt=prompt,
+            cwd=cwd,
+            sandbox=sandbox,
+            native_session_id=native_session_id,
+            invocation_options=invocation_options,
+            action=action,
+        )
 
     def build_codex_command(
         self,
@@ -391,7 +380,7 @@ class AgentProfileRegistry:
         prompt: str,
         cwd: str,
         sandbox: str,
-        thread_id: str | None = None,
+        native_session_id: str | None = None,
         invocation_options: Mapping[str, Any] | None = None,
         action: str = "continue",
     ) -> list[str]:
@@ -403,7 +392,7 @@ class AgentProfileRegistry:
             prompt=prompt,
             cwd=cwd,
             sandbox=sandbox,
-            native_session_id=thread_id,
+            native_session_id=native_session_id,
             invocation_options=invocation_options,
             action=action,
         )
@@ -452,16 +441,6 @@ class AgentSessionState:
     codex_defaults: dict[str, Any] = field(default_factory=dict)
     runs: dict[str, AgentRunState] = field(default_factory=dict)
     lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
-
-    @property
-    def thread_id(self) -> str | None:
-        """Compatibility alias retained for the 0.8 MCP payload contract."""
-
-        return self.native_session_id
-
-    @thread_id.setter
-    def thread_id(self, value: str | None) -> None:
-        self.native_session_id = value
 
 
 def new_session_id() -> str:

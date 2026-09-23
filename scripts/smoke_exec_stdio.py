@@ -74,7 +74,7 @@ async def smoke() -> None:
         if not all(
             (
                 summary["initialize_server"] == "tiancheng-local-mcp",
-                summary["tool_count"] >= 37,
+                summary["tool_count"] == 48,
                 summary["run_command_registered"] is True,
                 summary["exec_policy"] == "guarded-development",
                 summary["python_version_exit_code"] == 0,

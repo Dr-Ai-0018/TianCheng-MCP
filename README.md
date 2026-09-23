@@ -4,14 +4,14 @@
 `<WORKSPACE>` 工作区内的文件与本地 Git 能力；服务端代码、依赖和审计日志位于
 仓库目录，不在 ChatGPT 可写工作区内。
 
-当前版本：`0.9.1`。依赖锁定到官方维护的 MCP Python SDK `2.1.0`，使用当前
+当前版本：`0.10.0`。依赖锁定到官方维护的 MCP Python SDK `2.1.0`，使用当前
 `MCPServer`、`MCPServer.tool()`、`ToolAnnotations` 与 stdio transport API。
 
 - MCP Python SDK：<https://github.com/modelcontextprotocol/python-sdk/tree/v2.1.0>
 - SDK v2 文档：<https://py.sdk.modelcontextprotocol.io/>
 - OpenAI Secure MCP Tunnel：<https://developers.openai.com/api/docs/guides/secure-mcp-tunnels>
 
-版本策略遵循 SemVer：补丁版本（`x.y.Z`）只修复兼容性 bug 或文档/测试问题；小版本（`x.Y.0`）增加向后兼容的工具、参数或运行能力；大版本（`X.0.0`）用于破坏现有调用契约、默认安全边界或需要迁移的变更。每次发布同步更新
+版本策略遵循 SemVer：在 `0.x` 开发阶段，补丁版本（`0.y.Z`）只修复向后兼容的 bug 或更新文档/测试；次版本（`0.Y.0`）可以增加能力，也可以包含明确记录的工具或 API 调用契约变更。每项不兼容变更都须在 CHANGELOG 中说明影响和迁移方法，且不能削弱现有安全边界。从 `1.0.0` 起，不兼容的公共 API 变更或默认安全边界变更升主版本，向后兼容的新增能力升次版本。每次发布同步更新
 `pyproject.toml`、`src/tiancheng_mcp/__init__.py`、`uv.lock`、README 和
 `CHANGELOG.md`。
 
@@ -66,11 +66,11 @@ destructive，`run_command` 同时标为 destructive/open-world。
 
 默认仍严格限制在 `<WORKSPACE>`。使用 `run-mcp-grants.ps1`（或命令行参数
 `--allow-external-grants`）后，ChatGPT 才能申请临时外部目录能力：先调用
-`request_external_access`，让用户在聊天中明确确认后，再提交 `request_id + challenge + confirmation="批准"`
-给 `approve_external_access`。challenge 是一次性随机值，不是密码；当前版本没有 TOTP 验证步骤，
-也不要在同一个模型/MCP 通道中传递任何第二因子。
+`external_access_request`，让用户在聊天中明确确认后，再提交 `request_id + challenge + confirmation="批准"`
+给 `external_access_approve`。challenge 是一次性随机值，不是密码；不要在同一个模型/MCP
+通道中传递任何第二因子。
 授权只存在当前 MCP 进程内存，最多 10 分钟；`external_grant_status` 可查看状态，
-`revoke_external_access` 可由 ChatGPT 主动立即撤销，`cancel_external_access_request`
+`revoke_external_access` 可由 ChatGPT 主动立即撤销，`external_access_cancel`
 可取消尚未批准的请求。MCP/Tunnel 重启后全部失效。
 
 若未来引入第二因子，审批必须走模型与 MCP 均无法读取的独立通道；当前聊天 challenge
@@ -85,10 +85,15 @@ destructive，`run_command` 同时标为 destructive/open-world。
 省略 `grant_id`，直接使用白名单允许的绝对路径，不会绕过现有路径检查或能力限制。默认行为
 仍只有 `<WORKSPACE>`。
 
+传入 `grant_id` 时，`external_*` 的 `path`、`base_path` 和 `cwd` 可以是授权根目录内的
+绝对路径，也可以是相对授权根目录的路径；默认的 `.` 指授权根目录。省略 `grant_id`
+时必须传入静态策略允许的绝对路径。两种方式都拒绝越界路径和重解析点。
+
 TUI 主菜单的“D. 外部路径白名单 / 访问策略”已经可以查看、新增、编辑、启用/禁用和删除规则，
 并提供“测试路径权限”和“验证策略并提示 reload”。保存时会先生成同目录 `.bak` 快照，使用
 临时文件原子替换并尝试收紧 Windows ACL；策略加载器验证失败会自动恢复上一份有效快照。
-保存后可调用 `access_policy_reload` 立即生效，也可以重启 MCP；有审批要求的规则仍必须走 grant 流程。
+保存后可调用 `access_policy_reload` 读取文件并更新运行中 MCP 的策略快照，也可以重启 MCP；
+该工具不会编辑策略文件或批准新的授权，有审批要求的规则仍必须走 grant 流程。
 
 ### 白名单模式与 Agent 工作目录
 
@@ -119,12 +124,14 @@ Agent 的工作目录不再固定为 `<WORKSPACE>`。白名单覆盖的任何目
 
 默认是冷重载：白名单只能在 TUI 里修改，改完重启 MCP 或调用 `access_policy_reload` 生效。
 
-加上 `--allow-policy-hot-reload` 后会额外注册 `access_policy_change`，让人不在电脑前也能
-在对话里扩大授权：
+加上 `--allow-policy-hot-reload` 后会额外注册
+`access_policy_change_request/approve/cancel/status` 四个工具，让人不在电脑前也能
+在对话里扩大授权。临时授权则使用
+`external_access_request/approve/cancel`，不会写入策略文件：
 
-1. 调用方 `request` 提交目录和模式，得到一次性 challenge——**这一步不授予任何权限**；
+1. 调用方用 `access_policy_change_request` 提交目录和模式，得到一次性 challenge——**这一步不授予任何权限**；
 2. 把确切路径和模式念给用户，等用户明确答复；
-3. 用 `approve` 提交 `request_id`、challenge 和 `confirmation='批准'`；
+3. 用 `access_policy_change_approve` 提交 `request_id`、challenge 和 `confirmation='批准'`；
 4. 服务端原子写入 `access-policy.json`（保留 `.bak`）并立即生效，不重启。
 
 以下目标永远拒绝：服务端自身目录（代码、策略、日志）、盘符根目录、Windows 系统目录、
@@ -357,6 +364,9 @@ Python 扩展若完全不检查取消信号，线程无法被 CPython 安全地�
 `start_process` 是显式的常驻进程 API，返回稳定的 `session_id` 和兼容用的 `process_id`；使用
 `process_status`/`process_input`/`process_output` 管理生命周期和增量输出。它不会伪装成
 一次性 job，重复调用会按请求启动新的进程，需由调用方自行避免重复启动。
+Agent run 由 `agent_run` 的 `inspect`、`events`、`result` 和 `cancel` 管理；通用
+`process_*` 工具与 `list_processes` 不访问 Agent 进程，Agent 返回值也不暴露内部
+`process_id`。`job_*` 只管理超过交互预算的后台工具调用，与上述两种生命周期分开。
 
 0.7.1 增加服务器自有的 `codex-default` profile registry 和有界 Codex JSONL 事件解析器，
 作为后续 `agent_session`/`agent_run` 的安全基础；本版本尚未暴露任意 Agent 命令工具。
@@ -369,9 +379,10 @@ session cwd 固定在工作区，sandbox 只允许 `read-only`/`workspace-write`
 stderr、错误摘要和最终消息都会截断并脱敏。尚未支持任意 profile、config override、
 交互式 steer、持久化 task/job 或 `danger-full-access`。
 
-当前 `main` 的 0.9 开发阶段已把通用 session/run runtime 与 provider adapter 分离：
+当前实现已把通用 session/run runtime 与 provider adapter 分离：
 `workspace_info` 会返回服务器已注册 provider 的 machine-readable capabilities，session/run
-同时返回 provider-neutral `native_session_id` 和兼容字段 `thread_id`。未声明的
+只返回 provider-neutral `native_session_id`。Codex 原生 JSONL 里的 `thread_id` 仍由解析器读取，
+但不会作为 TianCheng 的别名返回。未声明的
 Claude runtime、steer/interaction 等能力仍会稳定拒绝。
 
 Agent Profile 名称与 Codex CLI 自己的 config profile 是两层不同概念。服务器内置
@@ -518,6 +529,11 @@ Windows 实机验证 `codex-default` 与 `claude-default` marker 均成功。Cla
 与 `.venv`。可显式设置 `respect_gitignore=false` 或 `include_internal=true`；路径匹配仍由
 服务端二次校验。机器没有 `rg` 时自动回退到有总扫描字节上限的 Python 实现。
 
+`external_search_text` 默认扫描被 `.gitignore` 忽略的文件和内部目录，保持已有外部搜索行为；
+可传 `respect_gitignore=true`、`include_internal=false` 缩小范围。两个筛选开关由 `rg` 实现；
+Python 回退会在结果中报告 `respect_gitignore=false`，无法保证排除内部目录。
+`mkdir` 与 `external_mkdir` 都标为普通写入，因为 `exist_ok=false` 时重复调用会失败。
+
 ## 审计日志
 
 默认文件：
@@ -534,7 +550,7 @@ Windows 实机验证 `codex-default` 与 `claude-default` marker 均成功。Cla
 
 ```powershell
 Set-Location -LiteralPath '<REPO>'
-uv run pytest --basetemp '.tmp-tests' -q
+uv run --frozen python -m pytest --basetemp '.tmp-tests' -q
 ```
 
 测试覆盖正常读写/覆盖、中文路径、BOM/二进制/截断、`..`、绝对路径、其他盘符、UNC、

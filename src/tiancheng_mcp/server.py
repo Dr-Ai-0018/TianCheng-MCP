@@ -120,10 +120,14 @@ def _instructions(service: TianChengService) -> str:
     ]
     if service.external_grants.enabled:
         paragraphs.append(
-            "The external_* tools are the opposite: they take an absolute path "
-            "outside the workspace, and reach it only where the static access "
-            "policy already grants it, or under a grant_id from "
-            "request_external_access. Call access_policy_explain to see whether "
+            "The external_* tools take absolute paths outside the workspace. "
+            "Without grant_id, the path must be covered by a no-approval static "
+            "access policy rule. With a grant_id from external_access_request, an "
+            "absolute path must stay within "
+            "that grant's root; a path relative to the grant root also works, and "
+            "the default '.' means the grant root. Parent traversal, symlinks, "
+            "junctions, and reparse points are refused. Call "
+            "access_policy_explain to see whether "
             "a path is covered before reading it, and workspace_info to list "
             "every granted directory. Git tools are workspace-only; for a "
             "repository outside the workspace use external_run_command with "
@@ -362,7 +366,7 @@ def create_server(service: TianChengService) -> MCPServer:
         )
 
     @mcp.tool(
-        description="Reload and validate access-policy.json atomically; failed reload keeps the current policy.",
+        description="Reload a policy file changed locally (for example through tc policy), including in cold-reload mode. This updates the active in-memory snapshot without editing the file or approving a new access request; an invalid file leaves the current policy active.",
         annotations=WRITE,
     )
     def access_policy_reload() -> dict[str, Any]:
@@ -376,7 +380,10 @@ def create_server(service: TianChengService) -> MCPServer:
                 "tools may use additional local directories. This grants nothing by "
                 "itself: it records the paths and mode and returns a one-time challenge. "
                 "Show the user the exact paths and mode and wait for their reply, then "
-                "call access_policy_change_confirm. The staged capability is frozen here "
+                "call access_policy_change_approve. Use external_access_request for a "
+                "temporary in-memory grant lasting at most 10 minutes; this policy "
+                "change persists in access-policy.json and takes effect immediately. "
+                "The staged capability is frozen here "
                 "and cannot be raised at confirmation time. The server's own code, "
                 "policy and log directories, system directories, filesystem roots, "
                 "credential-named paths, and anything an explicit deny rule covers are "
@@ -408,7 +415,7 @@ def create_server(service: TianChengService) -> MCPServer:
             ),
             annotations=WRITE_IDEMPOTENT,
         )
-        def access_policy_change_confirm(
+        def access_policy_change_approve(
             request_id: str, challenge: str, confirmation: str = ""
         ) -> dict[str, Any]:
             return call_label(
@@ -450,19 +457,21 @@ def create_server(service: TianChengService) -> MCPServer:
     @external_tool(
         description=(
             "Request a temporary capability for an absolute directory outside the configured workspace. "
-            "The request remains pending until approve_external_access receives the one-time "
-            "challenge and explicit confirmation='批准'. This does not grant access by itself."
+            "The request remains pending until external_access_approve receives the one-time "
+            "challenge and explicit confirmation='批准'. This does not grant access by itself. "
+            "The grant lasts only in this MCP session, at most 10 minutes, and expires "
+            "on restart. For persistent access use access_policy_change_request instead."
         ),
         annotations=WRITE_IDEMPOTENT,
     )
-    def request_external_access(
+    def external_access_request(
         path: str,
         mode: str = "read",
         ttl_seconds: int = 600,
         reason: str = "",
     ) -> dict[str, object]:
         return call_label(
-            "request_external_access",
+            "external_access_request",
             "<external-request>",
             lambda: service.request_external_access(path, mode, ttl_seconds, reason),
         )
@@ -470,14 +479,14 @@ def create_server(service: TianChengService) -> MCPServer:
     @external_tool(
         description=(
             "Approve one pending external access request after explicit user confirmation. "
-            "Submit the one-time non-secret challenge returned by request_external_access "
+            "Submit the one-time non-secret challenge returned by external_access_request "
             "and confirmation='批准'. The resulting grant expires automatically."
         ),
         annotations=WRITE,
     )
-    def approve_external_access(request_id: str, challenge: str, confirmation: str = "") -> dict[str, object]:
+    def external_access_approve(request_id: str, challenge: str, confirmation: str = "") -> dict[str, object]:
         return call_label(
-            "approve_external_access",
+            "external_access_approve",
             "<external-request>",
             lambda: service.approve_external_access(request_id, challenge, confirmation),
         )
@@ -508,15 +517,15 @@ def create_server(service: TianChengService) -> MCPServer:
         description="Cancel a pending external access request before it is approved.",
         annotations=DESTRUCTIVE,
     )
-    def cancel_external_access_request(request_id: str) -> dict[str, object]:
+    def external_access_cancel(request_id: str) -> dict[str, object]:
         return call_label(
-            "cancel_external_access_request",
+            "external_access_cancel",
             "<external-request>",
             lambda: service.cancel_external_access_request(request_id),
         )
 
     @external_tool(
-        description="List using grant_id, or an absolute path covered by a no-approval static policy rule.",
+        description="List a directory: with grant_id use an absolute path within its root or a grant-relative path (default '.' is the root); without grant_id supply an absolute path covered by a no-approval static policy rule.",
         annotations=READ_ONLY,
     )
     def external_list_dir(path: str = ".", depth: int = 1, grant_id: str | None = None) -> dict[str, Any]:
@@ -524,61 +533,61 @@ def create_server(service: TianChengService) -> MCPServer:
             return external_call("external_list_dir", grant_id, lambda: service.external_list_dir(grant_id, path, depth))
         return call_label("external_list_dir", "<external-policy>", lambda: service.policy_external_list_dir(path, depth))
 
-    @external_tool(description="Return metadata using grant_id, or an absolute path covered by a no-approval static policy rule.", annotations=READ_ONLY)
+    @external_tool(description="Return metadata: with grant_id use an absolute path within its root or a grant-relative path; without grant_id supply an absolute path covered by a no-approval static policy rule.", annotations=READ_ONLY)
     def external_stat(path: str, grant_id: str | None = None) -> dict[str, Any]:
         if grant_id:
             return external_call("external_stat", grant_id, lambda: service.external_stat(grant_id, path))
         return call_label("external_stat", "<external-policy>", lambda: service.policy_external_stat(path))
 
-    @external_tool(description="Read UTF-8 text using grant_id, or an absolute path covered by a no-approval static policy rule.", annotations=READ_ONLY)
+    @external_tool(description="Read UTF-8 text: with grant_id use an absolute path within its root or a grant-relative path; without grant_id supply an absolute path covered by a no-approval static policy rule.", annotations=READ_ONLY)
     def external_read_text(path: str, start_line: int | None = None, end_line: int | None = None, max_bytes: int = 262144, grant_id: str | None = None) -> dict[str, Any]:
         if grant_id:
             return external_call("external_read_text", grant_id, lambda: service.external_read_text(grant_id, path, start_line, end_line, max_bytes))
         return call_label("external_read_text", "<external-policy>", lambda: service.policy_external_read_text(path, start_line, end_line, max_bytes))
 
-    @external_tool(description="Read a source-byte chunk using grant_id, or an absolute path covered by a no-approval static policy rule.", annotations=READ_ONLY)
+    @external_tool(description="Read a source-byte chunk: with grant_id use an absolute path within its root or a grant-relative path; without grant_id supply an absolute path covered by a no-approval static policy rule.", annotations=READ_ONLY)
     def external_read_text_chunk(path: str, offset_bytes: int = 0, max_bytes: int = 262144, grant_id: str | None = None) -> dict[str, Any]:
         if grant_id:
             return external_call("external_read_text_chunk", grant_id, lambda: service.external_read_text_chunk(grant_id, path, offset_bytes, max_bytes))
         return call_label("external_read_text_chunk", "<external-policy>", lambda: service.policy_external_read_text_chunk(path, offset_bytes, max_bytes))
 
-    @external_tool(description="Create or replace UTF-8 text using grant_id, or an absolute path covered by a no-approval writable static policy rule.", annotations=WRITE_IDEMPOTENT)
+    @external_tool(description="Create or replace UTF-8 text: with grant_id use an absolute path within its root or a grant-relative path; without grant_id supply an absolute path covered by a no-approval writable static policy rule.", annotations=WRITE_IDEMPOTENT)
     def external_write_text(path: str, content: str, create_parents: bool = True, expected_sha256: str | None = None, grant_id: str | None = None, idempotency_key: str | None = None) -> dict[str, Any]:
         if grant_id:
             return external_call("external_write_text", grant_id, lambda: service.external_write_text(grant_id, path, content, create_parents, expected_sha256), idempotency_key=idempotency_key, fingerprint_payload=[grant_id, path, content, create_parents, expected_sha256])
         return call_label("external_write_text", "<external-policy>", lambda: service.policy_external_write_text(path, content, create_parents, expected_sha256), idempotency_key=idempotency_key, idempotency_fingerprint=side_effect_fingerprint("external_write_text", [path, content, create_parents, expected_sha256]))
 
-    @external_tool(description="Append UTF-8 text using grant_id, or an absolute path covered by a no-approval writable static policy rule.", annotations=WRITE)
+    @external_tool(description="Append UTF-8 text: with grant_id use an absolute path within its root or a grant-relative path; without grant_id supply an absolute path covered by a no-approval writable static policy rule.", annotations=WRITE)
     def external_append_text(path: str, content: str, create_parents: bool = True, expected_sha256: str | None = None, grant_id: str | None = None, idempotency_key: str | None = None) -> dict[str, Any]:
         if grant_id:
             return external_call("external_append_text", grant_id, lambda: service.external_append_text(grant_id, path, content, create_parents, expected_sha256), idempotency_key=idempotency_key, fingerprint_payload=[grant_id, path, content, create_parents, expected_sha256])
         return call_label("external_append_text", "<external-policy>", lambda: service.policy_external_append_text(path, content, create_parents, expected_sha256), idempotency_key=idempotency_key, idempotency_fingerprint=side_effect_fingerprint("external_append_text", [path, content, create_parents, expected_sha256]))
 
-    @external_tool(description="Create a directory using grant_id, or an absolute path covered by a no-approval writable static policy rule.", annotations=WRITE_IDEMPOTENT)
+    @external_tool(description="Create a directory: with grant_id use an absolute path within its root or a grant-relative path; without grant_id supply an absolute path covered by a no-approval writable static policy rule. exist_ok=False makes repeated calls fail.", annotations=WRITE)
     def external_mkdir(path: str, parents: bool = True, exist_ok: bool = True, grant_id: str | None = None, idempotency_key: str | None = None) -> dict[str, Any]:
         if grant_id:
             return external_call("external_mkdir", grant_id, lambda: service.external_mkdir(grant_id, path, parents, exist_ok), idempotency_key=idempotency_key, fingerprint_payload=[grant_id, path, parents, exist_ok])
         return call_label("external_mkdir", "<external-policy>", lambda: service.policy_external_mkdir(path, parents, exist_ok), idempotency_key=idempotency_key, idempotency_fingerprint=side_effect_fingerprint("external_mkdir", [path, parents, exist_ok]))
 
-    @external_tool(description="Move or rename using grant_id, or absolute paths covered by one no-approval writable static policy rule; never overwrites.", annotations=WRITE)
+    @external_tool(description="Move or rename: with grant_id use absolute paths within its root or grant-relative paths; without grant_id supply absolute paths covered by one no-approval writable static policy rule. Never overwrites.", annotations=WRITE)
     def external_move(source: str, destination: str, grant_id: str | None = None, idempotency_key: str | None = None) -> dict[str, Any]:
         if grant_id:
             return external_call("external_move", grant_id, lambda: service.external_move(grant_id, source, destination), idempotency_key=idempotency_key, fingerprint_payload=[grant_id, source, destination])
         return call_label("external_move", "<external-policy>", lambda: service.policy_external_move(source, destination), idempotency_key=idempotency_key, idempotency_fingerprint=side_effect_fingerprint("external_move", [source, destination]))
 
-    @external_tool(description="Copy using grant_id, or absolute paths covered by one no-approval writable static policy rule; never overwrites.", annotations=WRITE)
+    @external_tool(description="Copy: with grant_id use absolute paths within its root or grant-relative paths; without grant_id supply absolute paths covered by one no-approval writable static policy rule. Never overwrites.", annotations=WRITE)
     def external_copy(source: str, destination: str, grant_id: str | None = None, idempotency_key: str | None = None) -> dict[str, Any]:
         if grant_id:
             return external_call("external_copy", grant_id, lambda: service.external_copy(grant_id, source, destination), idempotency_key=idempotency_key, fingerprint_payload=[grant_id, source, destination])
         return call_label("external_copy", "<external-policy>", lambda: service.policy_external_copy(source, destination), idempotency_key=idempotency_key, idempotency_fingerprint=side_effect_fingerprint("external_copy", [source, destination]))
 
-    @external_tool(description="Move an item to trash using grant_id, or an absolute path covered by a no-approval writable static policy rule.", annotations=DESTRUCTIVE)
+    @external_tool(description="Move an item to trash: with grant_id use an absolute path within its root or a grant-relative path; without grant_id supply an absolute path covered by a no-approval writable static policy rule.", annotations=DESTRUCTIVE)
     def external_delete(path: str, grant_id: str | None = None, idempotency_key: str | None = None) -> dict[str, Any]:
         if grant_id:
             return external_call("external_delete", grant_id, lambda: service.external_delete(grant_id, path), idempotency_key=idempotency_key, fingerprint_payload=[grant_id, path])
         return call_label("external_delete", "<external-policy>", lambda: service.policy_external_delete(path), idempotency_key=idempotency_key, idempotency_fingerprint=side_effect_fingerprint("external_delete", [path]))
 
-    @external_tool(description="Find paths using grant_id, or an absolute base_path covered by a no-approval static policy rule.", annotations=READ_ONLY)
+    @external_tool(description="Find paths: with grant_id use an absolute base_path within its root or a grant-relative base_path (default '.' is the root); without grant_id supply an absolute base_path covered by a no-approval static policy rule.", annotations=READ_ONLY)
     def external_glob(
         pattern: str, max_results: int = 200, base_path: str = ".", grant_id: str | None = None
     ) -> dict[str, Any]:
@@ -586,7 +595,7 @@ def create_server(service: TianChengService) -> MCPServer:
             return external_call("external_glob", grant_id, lambda: service.external_glob(grant_id, pattern, max_results, base_path))
         return call_label("external_glob", "<external-policy>", lambda: service.policy_external_glob(pattern, max_results, base_path))
 
-    @external_tool(description="Search text using grant_id, or an absolute base_path covered by a no-approval static policy rule.", annotations=READ_ONLY)
+    @external_tool(description="Search text: with grant_id use an absolute base_path within its root or a grant-relative base_path (default '.' is the root); without grant_id supply an absolute base_path covered by a no-approval static policy rule. Defaults scan ignored and internal files; with ripgrep, respect_gitignore=True or include_internal=False narrows results. The Python fallback cannot honor those filters.", annotations=READ_ONLY)
     def external_search_text(
         query: str,
         glob_pattern: str = "**/*",
@@ -597,15 +606,17 @@ def create_server(service: TianChengService) -> MCPServer:
         timeout_seconds: int = 30,
         base_path: str = ".",
         grant_id: str | None = None,
+        respect_gitignore: bool = False,
+        include_internal: bool = True,
     ) -> dict[str, Any]:
         if grant_id:
-            return external_call("external_search_text", grant_id, lambda: service.external_search_text(grant_id, query, glob_pattern, case_sensitive, max_results, max_scan_bytes, include_hidden, timeout_seconds, base_path))
-        return call_label("external_search_text", "<external-policy>", lambda: service.policy_external_search_text(query, glob_pattern, case_sensitive, max_results, max_scan_bytes, include_hidden, timeout_seconds, base_path))
+            return external_call("external_search_text", grant_id, lambda: service.external_search_text(grant_id, query, glob_pattern, case_sensitive, max_results, max_scan_bytes, include_hidden, timeout_seconds, base_path, respect_gitignore, include_internal))
+        return call_label("external_search_text", "<external-policy>", lambda: service.policy_external_search_text(query, glob_pattern, case_sensitive, max_results, max_scan_bytes, include_hidden, timeout_seconds, base_path, respect_gitignore, include_internal))
 
     if service.external_grants.enabled:
 
         @mcp.tool(
-            description="Run an allowlisted command with grant_id, or an absolute cwd covered by a no-approval static exec policy rule.",
+            description="Run an allowlisted command: with grant_id use an absolute cwd within its root or a grant-relative cwd (default '.' is the root); without grant_id supply an absolute cwd covered by a no-approval static exec policy rule.",
             annotations=EXECUTION,
         )
         def external_run_command(
@@ -793,8 +804,8 @@ def create_server(service: TianChengService) -> MCPServer:
 
     @mcp.tool(
         description=(
-            "Remove a file/directory by moving it to .tiancheng-trash. This is marked "
-            "destructive even though the first version does not permanently erase data."
+            "Move a file/directory to .tiancheng-trash for recovery. Only "
+            "trash_purge permanently removes a trashed item."
         ),
         annotations=DESTRUCTIVE,
     )

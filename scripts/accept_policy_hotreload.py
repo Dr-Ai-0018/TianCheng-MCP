@@ -188,7 +188,7 @@ async def main() -> None:
                 "hot_reload_tools_registered",
                 {
                     "access_policy_change_request",
-                    "access_policy_change_confirm",
+                    "access_policy_change_approve",
                     "access_policy_change_cancel",
                     "access_policy_change_status",
                 }
@@ -237,7 +237,7 @@ async def main() -> None:
             c.record("staging_grants_nothing", still_denied)
 
             _, wrong = await c.call(
-                "access_policy_change_confirm",
+                "access_policy_change_approve",
                 {
                     "request_id": staged["request_id"],
                     "challenge": staged["challenge"],
@@ -247,7 +247,7 @@ async def main() -> None:
             c.record("wrong_confirmation_refused", wrong)
 
             approved = await c.must(
-                "access_policy_change_confirm",
+                "access_policy_change_approve",
                 {
                     "request_id": staged["request_id"],
                     "challenge": staged["challenge"],
@@ -288,7 +288,7 @@ async def main() -> None:
                 {"paths": [str(project)], "mode": "write"},
             )
             await c.must(
-                "access_policy_change_confirm",
+                "access_policy_change_approve",
                 {
                     "request_id": staged["request_id"],
                     "challenge": staged["challenge"],
@@ -385,7 +385,7 @@ async def main() -> None:
                 {"paths": [str(project)], "mode": "browse"},
             )
             await c.must(
-                "access_policy_change_confirm",
+                "access_policy_change_approve",
                 {
                     "request_id": staged["request_id"],
                     "challenge": staged["challenge"],

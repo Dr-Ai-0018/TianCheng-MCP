@@ -17,7 +17,6 @@ logs/*.jsonl
 /config/agent-sources.json
 /config/access-policy.json.bak
 /config/agent-sources.json.bak
-/config/*-totp.svg
 /state/agent-catalog.sqlite*
 /state/tunnel-supervisor-*.json
 /state/tunnel-supervisor-*.lock

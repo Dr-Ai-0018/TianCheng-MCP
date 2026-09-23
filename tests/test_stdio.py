@@ -254,6 +254,8 @@ async def test_exec_tool_is_registered_only_when_enabled(
         )
         assert inspected["session_id"] == created["session_id"]
         assert inspected["closed"] is False
+        assert "thread_id" not in created
+        assert "thread_id" not in inspected
         closed = _structured(
             await client.call_tool(
                 "agent_session",
@@ -399,16 +401,42 @@ async def test_external_access_description_matches_challenge_flow(
             "--audit-dir",
             str(tmp_path / "grants-audit"),
             "--allow-external-grants",
+            "--allow-policy-hot-reload",
         ],
         cwd=str(Path(__file__).resolve().parents[1]),
         encoding="utf-8",
     )
     async with Client(parameters, mode="legacy", raise_exceptions=True) as client:
         tools = {tool.name: tool for tool in (await client.list_tools()).tools}
-        description = tools["request_external_access"].description or ""
+        assert {"external_access_request", "external_access_approve", "external_access_cancel"} <= set(tools)
+        assert {"request_external_access", "approve_external_access", "cancel_external_access_request"}.isdisjoint(tools)
+        assert {
+            "access_policy_change_request",
+            "access_policy_change_approve",
+            "access_policy_change_cancel",
+            "access_policy_change_status",
+        } <= set(tools)
+        assert "access_policy_change_confirm" not in tools
+        description = tools["external_access_request"].description or ""
         assert "six-digit TOTP" not in description
         assert "one-time challenge" in description
         assert "confirmation='批准'" in description
+        assert "access_policy_change_request" in description
+        policy_description = tools["access_policy_change_request"].description or ""
+        assert "external_access_request" in policy_description
+        assert "persists in access-policy.json" in policy_description
+        assert "first version" not in (tools["delete"].description or "")
+        assert "trash_purge" in (tools["delete"].description or "")
+        search_properties = tools["external_search_text"].input_schema["properties"]
+        assert search_properties["respect_gitignore"]["default"] is False
+        assert search_properties["include_internal"]["default"] is True
+        for name in (
+            "list_dir", "stat", "read_text", "read_text_chunk", "write_text",
+            "append_text", "mkdir", "move", "copy", "delete", "glob", "search_text",
+        ):
+            assert tools[name].annotations == tools[f"external_{name}"].annotations
+        assert tools["mkdir"].annotations.idempotent_hint is False
+        assert "cold-reload mode" in (tools["access_policy_reload"].description or "")
 
 
 @pytest.mark.asyncio

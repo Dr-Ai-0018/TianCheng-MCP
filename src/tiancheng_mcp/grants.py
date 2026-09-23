@@ -115,13 +115,8 @@ class ExternalGrantManager:
         workspace_root: Path,
         *,
         enabled: bool = False,
-        totp_secret: str | None = None,
         access_policy: AccessPolicy | None = None,
     ) -> None:
-        # Compatibility-only input for 0.9 callers. The old value was never
-        # validated by approve(), so retaining it as security state would be
-        # misleading. It is deliberately ignored and can be removed in 1.0.
-        del totp_secret
         self.workspace_root = workspace_root.resolve(strict=True)
         self.enabled = enabled
         self.access_policy = access_policy
@@ -244,7 +239,6 @@ class ExternalGrantManager:
             return {
                 "enabled": self.enabled,
                 "approval_mode": "conversation_challenge",
-                "totp_configured": False,
                 "pending": [self._pending_payload(item) for item in self._pending.values()],
                 "active": [self._grant_payload(item) for item in self._active.values()],
             }
@@ -274,8 +268,16 @@ class ExternalGrantManager:
             raise PermissionError("Grant does not allow command execution")
         raw = "." if relative_path in (None, "") else str(relative_path)
         windows = PureWindowsPath(raw.replace("/", "\\"))
-        if windows.drive or windows.root or windows.is_absolute() or any(part == ".." for part in windows.parts):
-            raise WorkspaceSecurityError("External grant paths must be relative and cannot contain '..'")
+        if any(part == ".." for part in windows.parts):
+            raise WorkspaceSecurityError("External grant paths cannot contain '..'")
+        if windows.is_absolute() or Path(raw).is_absolute():
+            try:
+                raw = str(Path(raw).relative_to(grant.root))
+            except ValueError as exc:
+                raise WorkspaceSecurityError("External path escapes the grant root") from exc
+            windows = PureWindowsPath(raw.replace("/", "\\"))
+        elif windows.drive or windows.root:
+            raise WorkspaceSecurityError("External grant path must be relative or absolute")
         for part in windows.parts:
             _validate_component(part)
         candidate = grant.root.joinpath(*[part for part in windows.parts if part not in {"", "."}])

@@ -83,7 +83,7 @@ async def smoke() -> None:
         trash_path = WORKSPACE / Path(deleted["trash_path"])
         summary = {
             "initialize_server": client.server_info.name if client.server_info else None,
-                "tool_count": len(names),
+            "tool_count": len(names),
             "run_command_registered": "run_command" in names,
             "created_path": written["path"],
             "read_matches": read["content"] == expected,
@@ -95,7 +95,7 @@ async def smoke() -> None:
         if not all(
             (
                 summary["initialize_server"] == "tiancheng-local-mcp",
-                summary["tool_count"] == 30,
+                summary["tool_count"] == 31,
                 summary["run_command_registered"] is False,
                 summary["read_matches"] is True,
                 summary["trash_exists"] is True,
