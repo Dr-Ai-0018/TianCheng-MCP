@@ -4,7 +4,7 @@
 `<WORKSPACE>` 工作区内的文件与本地 Git 能力；服务端代码、依赖和审计日志位于
 仓库目录，不在 ChatGPT 可写工作区内。
 
-当前版本：`0.10.0`。依赖锁定到官方维护的 MCP Python SDK `2.1.0`，使用当前
+当前版本：`0.10.1`。依赖锁定到官方维护的 MCP Python SDK `2.1.0`，使用当前
 `MCPServer`、`MCPServer.tool()`、`ToolAnnotations` 与 stdio transport API。
 
 - MCP Python SDK：<https://github.com/modelcontextprotocol/python-sdk/tree/v2.1.0>
@@ -203,6 +203,14 @@ tc
 - 管理 UI、非敏感启动器设置和显式 Dev profile；
 - “E. 本地 Agent / 会话源管理”可探测 Codex/Claude CLI 与固定历史根，并由用户显式添加、启停、删除、验证、刷新或重建 metadata Catalog；
 - `tc -Action info|profiles|key-status|status|agents -Json` 非交互诊断。
+
+启动前会检查当前 Profile 是否已在运行，以及本机健康监听端口是否被占用。端口冲突时会提示
+检查占用进程，避免重复开新窗口；菜单无法识别运行进程但检测到端口占用时也不会显示为
+`Running: none`。它不会自动结束占用进程或改用别的端口。
+
+工具名称变更后，应重启本机 MCP，并在 ChatGPT 的 TianCheng MCP 连接中执行 Refresh、
+新开对话核对工具列表。本机新启动的 stdio MCP 会重新注册工具；`tc` 没有能清除
+ChatGPT 端工具快照的本地缓存操作。
 
 首次运行时，本机尚无 profile；进入 **Profile 管理 → 创建或重建 Profile**，填写现有
 `tunnel_...` ID 即可。安全模式为默认选择。Exec 模式需要输入两次醒目确认，并在以后

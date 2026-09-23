@@ -682,6 +682,7 @@ function Start-TunnelForeground {
     if (-not (Test-ProfileExists -Config $Config -Name $Name)) {
         throw "Profile '$Name' does not exist. Create it from the profile menu first."
     }
+    Assert-TunnelCanStart -Config $Config -Name $Name
     Confirm-ExecProfile -Config $Config -Name $Name -AlreadyAllowed $ExecAlreadyAllowed
     $key = Import-ControlPlaneKey -Config $Config
     if (-not $key.Configured) {
@@ -693,11 +694,6 @@ function Start-TunnelForeground {
         if ($doctorExit -ne 0) {
             throw 'Doctor failed; Tunnel was not started.'
         }
-    }
-    $existing = @(Get-RunningTunnelRecords -Config $Config | Where-Object Profile -eq $Name)
-    $existingSupervisors = @(Get-RunningSupervisorRecords -Config $Config | Where-Object Profile -eq $Name)
-    if ($existing.Count -gt 0 -or $existingSupervisors.Count -gt 0) {
-        throw "Profile '$Name' is already running. Use tc status or tc restart."
     }
     Write-Host "`n正在启动 Tunnel；它会自动拉起 TianCheng MCP。按 Ctrl+C 停止。" -ForegroundColor Green
     $supervisorEnabled = Test-SupervisorEnabled -Config $Config
@@ -727,6 +723,10 @@ function Start-TunnelForeground {
 function Start-TunnelWindow {
     param([hashtable]$Config, [string]$Name, [bool]$ExecAlreadyAllowed)
 
+    if (-not (Test-ProfileExists -Config $Config -Name $Name)) {
+        throw "Profile '$Name' does not exist. Create it from the profile menu first."
+    }
+    Assert-TunnelCanStart -Config $Config -Name $Name
     Confirm-ExecProfile -Config $Config -Name $Name -AlreadyAllowed $ExecAlreadyAllowed
     $key = Import-ControlPlaneKey -Config $Config
     if (-not $key.Configured) {
@@ -742,7 +742,7 @@ function Start-TunnelWindow {
         $arguments += '-AllowExecProfile'
     }
     Start-Process -FilePath ([string]$Config.powerShell) -ArgumentList $arguments -WindowStyle Normal
-    Write-Host "已在新窗口启动 '$Name'。" -ForegroundColor Green
+    Write-Host "已在新窗口发起 '$Name' 启动；请在新窗口确认 Doctor 和运行结果。" -ForegroundColor Green
 }
 
 function Get-HealthStatus {
@@ -754,6 +754,60 @@ function Get-HealthStatus {
         return @{ Reachable = $true; Ready = $response.StatusCode -eq 200; StatusCode = $response.StatusCode }
     } catch {
         return @{ Reachable = $false; Ready = $false; StatusCode = $null }
+    }
+}
+
+function Get-HealthListenerConflict {
+    param([hashtable]$Config)
+
+    $uri = [Uri][string]$Config.healthBaseUrl
+    $address = $null
+    if ($uri.Host -eq 'localhost') {
+        $address = [System.Net.IPAddress]::Loopback
+    } elseif (-not [System.Net.IPAddress]::TryParse($uri.Host, [ref]$address)) {
+        return $null
+    }
+    if (-not [System.Net.IPAddress]::IsLoopback($address)) { return $null }
+
+    $listener = [System.Net.Sockets.TcpListener]::new($address, [int]$uri.Port)
+    try {
+        $listener.Server.ExclusiveAddressUse = $true
+        $listener.Start()
+        return $null
+    } catch [System.Net.Sockets.SocketException] {
+        if ($_.Exception.SocketErrorCode -ne [System.Net.Sockets.SocketError]::AddressAlreadyInUse) {
+            throw
+        }
+        $owner = $null
+        try {
+            $owner = Get-NetTCPConnection -LocalPort $uri.Port -State Listen -ErrorAction Stop |
+                Where-Object { $_.LocalAddress -in @($uri.Host, '0.0.0.0', '::') } |
+                Select-Object -First 1
+        } catch { }
+        return [PSCustomObject]@{
+            Endpoint = '{0}:{1}' -f $uri.Host, $uri.Port
+            Port = [int]$uri.Port
+            ProcessId = if ($null -ne $owner) { [int]$owner.OwningProcess } else { $null }
+        }
+    } finally {
+        $listener.Stop()
+    }
+}
+
+function Assert-TunnelCanStart {
+    param([hashtable]$Config, [string]$Name)
+
+    $existing = @(Get-RunningTunnelRecords -Config $Config | Where-Object Profile -eq $Name)
+    $supervisors = @(Get-RunningSupervisorRecords -Config $Config | Where-Object Profile -eq $Name)
+    if ($existing.Count -gt 0 -or $supervisors.Count -gt 0) {
+        throw "Profile '$Name' 已在运行；请先检查状态，不要重复启动。"
+    }
+    $conflict = Get-HealthListenerConflict -Config $Config
+    if ($null -ne $conflict) {
+        $ownerText = if ($null -ne $conflict.ProcessId) { "（PID $($conflict.ProcessId)）" } else { '' }
+        throw ("健康端口 $($conflict.Endpoint) 已被占用$ownerText。请检查冲突进程，" +
+            "例如运行 netstat -ano -p tcp | findstr :$($conflict.Port)；" +
+            "确认是否已有 Tunnel 在运行，不要重复启动或直接结束未知进程。")
     }
 }
 
@@ -1801,7 +1855,14 @@ function Show-MainMenu {
         $selected = Resolve-SelectedProfile -Config $config -Requested $Profile
         $key = Get-KeyRecord -Config $config
         $modeLabel = Get-ProfileMode -Config $config -Name $selected
-        $runningProfiles = @(Get-RunningTunnelRecords -Config $config | ForEach-Object Profile | Sort-Object -Unique)
+        $runningProfiles = @(
+            @(Get-RunningTunnelRecords -Config $config | ForEach-Object Profile) +
+            @(Get-RunningSupervisorRecords -Config $config | ForEach-Object Profile) |
+                Sort-Object -Unique
+        )
+        $listenerConflict = if ($runningProfiles.Count -eq 0) {
+            Get-HealthListenerConflict -Config $config
+        } else { $null }
         Clear-Host
         Write-Host '╔══════════════════════════════════════╗' -ForegroundColor Cyan
         Write-Host '║       天澄 Local MCP 控制台          ║' -ForegroundColor Cyan
@@ -1817,7 +1878,10 @@ function Show-MainMenu {
             Write-Host '能力提示：仅工作区文件与本地 Git，命令执行关闭。' -ForegroundColor DarkGray
         }
         Write-Host "MCP 自动转后台等待: $($config.interactiveTimeoutSeconds)s" -ForegroundColor DarkGray
-        Write-Host "Running: $(if ($runningProfiles.Count) { $runningProfiles -join ', ' } else { 'none' })" -ForegroundColor DarkGray
+        $runningLabel = if ($runningProfiles.Count) { $runningProfiles -join ', ' }
+            elseif ($null -ne $listenerConflict) { "未识别到 Profile；健康端口 $($listenerConflict.Endpoint) 已占用" }
+            else { 'none' }
+        Write-Host "Running: $runningLabel" -ForegroundColor DarkGray
         Write-Host
         Write-Host '  1. 一键检查并启动 MCP + Tunnel'
         Write-Host '  2. 在新窗口启动 MCP + Tunnel'

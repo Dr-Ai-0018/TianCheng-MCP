@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import socket
 import subprocess
 from pathlib import Path
 
@@ -97,6 +98,47 @@ def write_test_config(path: Path, *, env_file: Path, profile_dir: Path) -> None:
         ),
         encoding="utf-8",
     )
+
+
+def test_launcher_reports_busy_health_port_before_starting(tmp_path: Path) -> None:
+    config = tmp_path / "launcher.json"
+    write_test_config(config, env_file=tmp_path / ".env", profile_dir=tmp_path / "profiles")
+    profile = tmp_path / "test-profile.yaml"
+    profile.write_text("run-mcp.ps1\n", encoding="utf-8")
+    (tmp_path / "profiles.json").write_text(
+        json.dumps([{"name": "test-profile", "path": str(profile)}]), encoding="utf-8"
+    )
+    tunnel_stub = tmp_path / "tunnel-client.ps1"
+    tunnel_stub.write_text(
+        "if ($args[0] -eq 'profiles' -and $args[1] -eq 'list') {\n"
+        "    Get-Content -LiteralPath (Join-Path $PSScriptRoot 'profiles.json') -Raw\n"
+        "    exit 0\n"
+        "}\n"
+        "Write-Output 'UNEXPECTED_TUNNEL_CALL'\nexit 2\n",
+        encoding="utf-8",
+    )
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        port = listener.getsockname()[1]
+        payload = json.loads(config.read_text(encoding="utf-8"))
+        payload.update(
+            tunnelClient=str(tunnel_stub),
+            defaultProfile="test-profile",
+            healthBaseUrl=f"http://127.0.0.1:{port}",
+        )
+        config.write_text(json.dumps(payload), encoding="utf-8")
+
+        for action in ("start", "start-new"):
+            result = run_powershell(
+                PROJECT_ROOT / "tc.ps1", "-Action", action, "-ConfigPath", str(config)
+            )
+            output = result.stdout + result.stderr
+            assert result.returncode != 0, output
+            assert f"127.0.0.1:{port}" in output
+            assert "请检查冲突进程" in output
+            assert "UNEXPECTED_TUNNEL_CALL" not in output
+            assert "已在新窗口启动" not in output
 
 
 def test_launcher_info_and_process_key_status_never_print_secret(tmp_path: Path) -> None:

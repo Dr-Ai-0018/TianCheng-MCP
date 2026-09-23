@@ -1289,7 +1289,7 @@ def create_server(service: TianChengService) -> MCPServer:
         @mcp.tool(
             description=(
                 "Run the prompt in a managed local agent session. Actions: start, inspect, "
-                "events, result, cancel. start returns immediately with run_id/process_id; "
+                "events, result, cancel. start returns immediately with run_id; "
                 "events supports bounded cursor paging and wait_ms up to 10000 ms. Codex start "
                 "accepts schema-validated codex_options that override session defaults, and "
                 "codex_action selects continue, fork, or review. Use codex_options.model, "
