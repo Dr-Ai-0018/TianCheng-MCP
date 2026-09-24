@@ -20,5 +20,21 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - run: uv lock --check
       - run: uv sync --frozen --extra test
-      - run: uv run python -m pytest
+      - run: uv run python -m pytest --junitxml=pytest-results.xml
+      - name: Annotate pytest failures
+        if: failure()
+        shell: pwsh
+        run: |
+          if (-not (Test-Path pytest-results.xml)) { return }
+          [xml]$report = Get-Content pytest-results.xml -Raw
+          foreach ($suite in $report.testsuites.testsuite) {
+            foreach ($case in $suite.testcase) {
+              foreach ($problem in @($case.failure) + @($case.error)) {
+                if ($null -eq $problem) { continue }
+                $message = "$($case.classname).$($case.name): $($problem.message)"
+                $message = $message -replace '[\r\n]+', ' '
+                Write-Output "::error::$message"
+              }
+            }
+          }
       - run: uv build
