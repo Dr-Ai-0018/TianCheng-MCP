@@ -184,7 +184,7 @@ def _outside_directory(name: str = "new-project"):
     for these tests has to live elsewhere.
     """
 
-    base = Path(tempfile.mkdtemp(prefix="tc-policy-"))
+    base = Path(tempfile.mkdtemp(prefix="tc-policy-")).resolve(strict=True)
     target = base / name
     target.mkdir()
     try:

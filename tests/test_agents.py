@@ -986,7 +986,7 @@ def test_agent_run_receives_immediate_stdin_eof(workspace, tmp_path) -> None:
 
 def test_isolated_agent_profile_freezes_and_injects_isolated_codex_home(monkeypatch) -> None:
     with tempfile.TemporaryDirectory(prefix="tc-agent-home-") as temporary:
-        root = Path(temporary)
+        root = Path(temporary).resolve(strict=True)
         workspace = root / "workspace"
         home = workspace / "AgentHomes" / "IsolatedCodex"
         room = workspace / "Rooms" / "示例目录"
@@ -1051,7 +1051,7 @@ def test_isolated_agent_profile_freezes_and_injects_isolated_codex_home(monkeypa
 
 def test_isolated_codex_home_is_validated_at_create_and_each_run() -> None:
     with tempfile.TemporaryDirectory(prefix="tc-agent-home-policy-") as temporary:
-        root = Path(temporary)
+        root = Path(temporary).resolve(strict=True)
         workspace = root / "workspace"
         home = workspace / "AgentHomes" / "IsolatedCodex"
         home.mkdir(parents=True)
