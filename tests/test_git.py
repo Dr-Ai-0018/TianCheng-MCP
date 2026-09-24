@@ -78,7 +78,7 @@ def test_remote_git_end_to_end_with_workspace_local_bare_remote(
     service.git_add(["hello.txt"], repo="repo")
     service.git_commit("first", repo="repo")
 
-    bare = service.run_command("git", ["init", "--bare", "remote.git"], cwd="repo")
+    bare = service.run_command("git", ["init", "--bare", "-b", "main", "remote.git"], cwd="repo")
     assert bare["exit_code"] == 0
     added = service.git_remote_add("origin", "remote.git", repo="repo")
     assert added["remote"] == "origin"

@@ -240,6 +240,16 @@ async def test_exec_tool_is_registered_only_when_enabled(
         )
         assert denied_attach.is_error is True
 
+        available = _structured(await client.call_tool("workspace_info", {}))[
+            "available_agent_profiles"
+        ]
+        if not available:
+            unavailable = await client.call_tool(
+                "agent_session", {"action": "create", "sandbox": "read-only"}
+            )
+            assert unavailable.is_error is True
+            return
+
         created = _structured(
             await client.call_tool(
                 "agent_session",
