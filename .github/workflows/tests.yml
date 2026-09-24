@@ -20,5 +20,5 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - run: uv lock --check
       - run: uv sync --frozen --extra test
-      - run: uv run pytest
+      - run: uv run python -m pytest
       - run: uv build
