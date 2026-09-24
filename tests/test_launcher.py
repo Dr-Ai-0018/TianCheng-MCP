@@ -72,6 +72,11 @@ def run_powershell(
     )
 
 
+def without_proxy_environment() -> dict[str, str]:
+    excluded = {"http_proxy", "https_proxy", "no_proxy"}
+    return {key: value for key, value in os.environ.items() if key.casefold() not in excluded}
+
+
 def test_removed_totp_setup_is_not_a_launcher_action() -> None:
     result = run_powershell(PROJECT_ROOT / "tc.ps1", "-Action", "totp-setup")
     assert result.returncode != 0
@@ -345,6 +350,114 @@ def test_settings_menu_persists_supervisor_and_transport_ttl(tmp_path: Path) -> 
     assert saved["supervisor"]["enabled"] is False
     assert saved["supervisor"]["mcpConnectionMaxTtl"] == "2h"
     assert saved["supervisor"]["restartBudget"]["maxAttempts"] == 5
+
+
+def test_settings_menu_edits_proxy_without_printing_credentials(tmp_path: Path) -> None:
+    config = tmp_path / "launcher.json"
+    write_test_config(config, env_file=tmp_path / ".env", profile_dir=tmp_path / "profiles")
+    payload = json.loads(config.read_text(encoding="utf-8"))
+    payload["proxy"] = {
+        "http": "http://old-user:old-pass@127.0.0.1:8000",
+        "noProxy": "old.internal",
+        "agent": "off",
+    }
+    config.write_text(json.dumps(payload), encoding="utf-8")
+    new_url = "socks5h://new-user:p%40ss@127.0.0.1:7891"
+    result = run_powershell(
+        PROJECT_ROOT / "tc.ps1",
+        "-Action", "settings", "-ConfigPath", str(config), "-NoPause",
+        input_text="\n" * 8 + f"y\n2\n{new_url}\n3\nnew.internal\n4\nselective\n0\n",
+        environment=without_proxy_environment(),
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "old-user" not in result.stdout + result.stderr
+    assert "old-pass" not in result.stdout + result.stderr
+    assert "new-user" not in result.stdout + result.stderr
+    assert "p%40ss" not in result.stdout + result.stderr
+    assert "http://127.0.0.1:8000" in result.stdout
+    assert "socks5h://127.0.0.1:7891" in result.stdout
+    saved = json.loads(config.read_text(encoding="utf-8"))
+    assert saved["proxy"] == {
+        "http": "http://old-user:old-pass@127.0.0.1:8000",
+        "https": new_url,
+        "noProxy": "new.internal",
+        "agent": "selective",
+    }
+
+
+def test_settings_menu_can_clear_one_proxy_without_touching_other(tmp_path: Path) -> None:
+    config = tmp_path / "launcher.json"
+    write_test_config(config, env_file=tmp_path / ".env", profile_dir=tmp_path / "profiles")
+    payload = json.loads(config.read_text(encoding="utf-8"))
+    payload["proxy"] = {
+        "http": "http://user:password@127.0.0.1:8000",
+        "https": "socks5h://127.0.0.1:7891",
+        "agent": "off",
+    }
+    config.write_text(json.dumps(payload), encoding="utf-8")
+    result = run_powershell(
+        PROJECT_ROOT / "tc.ps1",
+        "-Action", "settings", "-ConfigPath", str(config), "-NoPause",
+        input_text="\n" * 8 + "y\n5\n0\n",
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "password" not in result.stdout + result.stderr
+    saved = json.loads(config.read_text(encoding="utf-8"))
+    assert saved["proxy"]["http"] == ""
+    assert saved["proxy"]["https"] == "socks5h://127.0.0.1:7891"
+    assert saved["proxy"]["agent"] == "off"
+
+
+def test_proxy_action_opens_direct_menu_without_general_settings(tmp_path: Path) -> None:
+    config = tmp_path / "launcher.json"
+    write_test_config(config, env_file=tmp_path / ".env", profile_dir=tmp_path / "profiles")
+    result = run_powershell(
+        PROJECT_ROOT / "tc.ps1",
+        "-Action", "proxy", "-ConfigPath", str(config), "-NoPause",
+        input_text="4\nalways\n0\n",
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    saved = json.loads(config.read_text(encoding="utf-8"))
+    assert saved["proxy"]["agent"] == "always"
+    assert "tunnel-client [" not in result.stdout
+
+
+def test_proxy_menu_probe_reports_failure_without_credentials(tmp_path: Path) -> None:
+    config = tmp_path / "launcher.json"
+    write_test_config(config, env_file=tmp_path / ".env", profile_dir=tmp_path / "profiles")
+    payload = json.loads(config.read_text(encoding="utf-8"))
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        unused_port = listener.getsockname()[1]
+    payload["proxy"] = {
+        "http": f"http://user:secret@127.0.0.1:{unused_port}",
+        "agent": "selective",
+    }
+    config.write_text(json.dumps(payload), encoding="utf-8")
+    result = run_powershell(
+        PROJECT_ROOT / "tc.ps1", "-Action", "proxy", "-ConfigPath", str(config),
+        "-NoPause", input_text="8\n0\n",
+        environment=without_proxy_environment(),
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "ConnectError" in result.stdout
+    assert "127.0.0.1" in result.stdout
+    assert "user" not in result.stdout + result.stderr
+    assert "secret" not in result.stdout + result.stderr
+
+
+def test_proxy_menu_invalid_input_returns_to_menu_without_saving(tmp_path: Path) -> None:
+    config = tmp_path / "launcher.json"
+    write_test_config(config, env_file=tmp_path / ".env", profile_dir=tmp_path / "profiles")
+    before = config.read_bytes()
+    result = run_powershell(
+        PROJECT_ROOT / "tc.ps1", "-Action", "proxy", "-ConfigPath", str(config),
+        "-NoPause", input_text="1\ninvalid-proxy\n4\ninvalid-mode\n0\n",
+        environment=without_proxy_environment(),
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert config.read_bytes() == before
+    assert "invalid-proxy" not in result.stdout + result.stderr
 
 
 def test_supervisor_disabled_selects_legacy_direct_launch_mode(tmp_path: Path) -> None:

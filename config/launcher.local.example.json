@@ -2,5 +2,11 @@
   "workspace": "<ABSOLUTE_WORKSPACE_PATH>",
   "tunnelClient": "",
   "powerShell": "",
-  "profileDir": ""
+  "profileDir": "",
+  "proxy": {
+    "http": "",
+    "https": "",
+    "noProxy": "",
+    "agent": "off"
+  }
 }

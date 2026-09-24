@@ -8,6 +8,26 @@
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-09-24
+
+### Added
+
+- 出站代理 URL 现支持 `socks5://` 和 `socks5h://`；项目安装包含 SOCKS 所需的
+  `socksio`，HTTP 与 HTTPS 目标可分别配置 HTTP 或 SOCKS5 代理。
+- 可选出站代理配置：启动进程的 HTTP_PROXY/HTTPS_PROXY/NO_PROXY（含小写）优先于
+  launcher 配置；loopback 自动直连。Agent 默认不继承代理；`proxy.agent` 支持
+  `off`、`selective`、`always`，且不覆盖子进程已有变量。旧值 `inherit` 继续按
+  `always` 解释。
+- `selective` 模式下，`agent_session(create|attach)` 可用 `use_proxy=true` 选择本次
+  session 的代理注入；其他模式不暴露此参数，服务端固定应用全局策略。session 返回
+  `proxy_enabled`，`workspace_info` 返回代理模式与是否配置的非敏感状态。
+- `tc` 出站代理菜单显示有效代理的协议、主机、端口、认证标记和来源；手动检测时经
+  对应代理访问 `api.ipify.org` 并显示出口 IP 或错误类别，不在打开菜单时自动请求。
+
+### Fixed
+
+- 去除代理菜单重复状态行；将出口 IP 检测直接使用的 `httpx2` 列为显式依赖。
+
 ## [0.10.1] - 2026-09-23
 
 ### Changed

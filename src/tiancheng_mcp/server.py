@@ -1232,36 +1232,42 @@ def create_server(service: TianChengService) -> MCPServer:
                 lambda: service.stop_process(process_id, force),
             )
 
-        @mcp.tool(
-            description=(
-                "Manage a server-owned local agent session. Actions: create, attach, list, "
-                "inspect, close. attach accepts only an agent_catalog conversation_ref; callers "
-                "cannot supply a native session id or history path. cwd must be inside the "
-                "TianCheng workspace or a directory the static access policy already covers, "
-                "and the sandbox defaults to workspace-write; callers may explicitly select "
-                "read-only. Codex sessions "
-                "may provide schema-validated codex_defaults: model selects native -m, "
-                "reasoning_effort sets model_reasoning_effort, route selects the registered "
-                "provider route for each run, and repeatable config/enable/disable values keep "
-                "their supplied order. Secrets and executable argv are never accepted here."
-            ),
-            annotations=EXECUTION,
+        agent_proxy_mode = service.agent_proxy_mode
+        agent_proxy_help = {
+            "off": "Agent proxy mode is off: the existing isolated child environment is used; callers cannot enable proxy injection.",
+            "selective": "Agent proxy mode is selective: create or attach may set use_proxy=true for this session when a proxy is configured; false is the default.",
+            "always": "Agent proxy mode is always: all new Agent sessions receive the configured proxy when available; callers cannot disable it.",
+        }[agent_proxy_mode]
+        agent_session_description = (
+            "Manage a server-owned local agent session. Actions: create, attach, list, "
+            "inspect, close. attach accepts only an agent_catalog conversation_ref; callers "
+            "cannot supply a native session id or history path. cwd must be inside the "
+            "TianCheng workspace or a directory the static access policy already covers, "
+            "and the sandbox defaults to workspace-write; callers may explicitly select "
+            "read-only. Codex sessions "
+            "may provide schema-validated codex_defaults: model selects native -m, "
+            "reasoning_effort sets model_reasoning_effort, route selects the registered "
+            "provider route for each run, and repeatable config/enable/disable values keep "
+            "their supplied order. Secrets and executable argv are never accepted here. "
+            + agent_proxy_help
         )
-        def agent_session(
+
+        def agent_session_action(
             action: str,
-            session_id: str = "",
-            profile: str = "codex-default",
-            cwd: str = ".",
-            sandbox: str = "workspace-write",
-            conversation_ref: str = "",
-            codex_defaults: CodexOptionsInput | None = None,
+            session_id: str,
+            profile: str,
+            cwd: str,
+            sandbox: str,
+            conversation_ref: str,
+            codex_defaults: CodexOptionsInput | None,
+            use_proxy: bool = False,
         ) -> dict[str, Any]:
             if action == "create":
                 return call_label(
                     "agent_session_create",
                     cwd,
                     lambda: service.agent_session_create(
-                        profile, cwd, sandbox, codex_defaults
+                        profile, cwd, sandbox, codex_defaults, use_proxy
                     ),
                 )
             if action == "attach":
@@ -1269,7 +1275,7 @@ def create_server(service: TianChengService) -> MCPServer:
                     "agent_session_attach",
                     "<agent-conversation>",
                     lambda: service.agent_session_attach(
-                        conversation_ref, profile, sandbox, codex_defaults
+                        conversation_ref, profile, sandbox, codex_defaults, use_proxy
                     ),
                 )
             if action == "list":
@@ -1280,11 +1286,42 @@ def create_server(service: TianChengService) -> MCPServer:
                 )
             if action == "close":
                 return call_label(
-                    "agent_session_close", "<agent-session>", lambda: service.agent_session_close(session_id)
+                    "agent_session_close", "<agent-session>",
+                    lambda: service.agent_session_close(session_id),
                 )
-            raise ValueError(
-                "action must be create, attach, list, inspect, or close"
-            )
+            raise ValueError("action must be create, attach, list, inspect, or close")
+
+        if agent_proxy_mode == "selective":
+            @mcp.tool(description=agent_session_description, annotations=EXECUTION)
+            def agent_session(
+                action: str,
+                session_id: str = "",
+                profile: str = "codex-default",
+                cwd: str = ".",
+                sandbox: str = "workspace-write",
+                conversation_ref: str = "",
+                codex_defaults: CodexOptionsInput | None = None,
+                use_proxy: bool = False,
+            ) -> dict[str, Any]:
+                return agent_session_action(
+                    action, session_id, profile, cwd, sandbox,
+                    conversation_ref, codex_defaults, use_proxy,
+                )
+        else:
+            @mcp.tool(description=agent_session_description, annotations=EXECUTION)
+            def agent_session(
+                action: str,
+                session_id: str = "",
+                profile: str = "codex-default",
+                cwd: str = ".",
+                sandbox: str = "workspace-write",
+                conversation_ref: str = "",
+                codex_defaults: CodexOptionsInput | None = None,
+            ) -> dict[str, Any]:
+                return agent_session_action(
+                    action, session_id, profile, cwd, sandbox,
+                    conversation_ref, codex_defaults,
+                )
 
         @mcp.tool(
             description=(

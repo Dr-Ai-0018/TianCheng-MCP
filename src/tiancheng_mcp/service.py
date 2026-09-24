@@ -24,6 +24,7 @@ from typing import Any, TypeVar
 from urllib.parse import urlsplit, urlunsplit
 
 from . import __version__
+from .proxy import add_agent_proxy
 from .agent_catalog import AgentCatalog
 from .agent_adapters import (
     AgentProfile,
@@ -584,6 +585,8 @@ class TianChengService:
         allow_policy_hot_reload: bool = False,
         agent_profile_config_path: str | Path | None = None,
         agent_env_file: str | Path | None = None,
+        agent_proxy_environment: Mapping[str, str] | None = None,
+        agent_proxy_mode: str | None = None,
     ) -> None:
         self.jail = WorkspaceJail(workspace, create=True)
         self.access_policy_path = Path(access_policy_path) if access_policy_path else (
@@ -622,6 +625,14 @@ class TianChengService:
             access_policy=self.access_policy,
         )
         self.passthrough_env = self._validate_passthrough_env(passthrough_env)
+        self._agent_proxy_environment = dict(agent_proxy_environment or {})
+        self.agent_proxy_mode = (
+            agent_proxy_mode
+            if agent_proxy_mode is not None
+            else ("always" if self._agent_proxy_environment else "off")
+        )
+        if self.agent_proxy_mode not in {"off", "selective", "always"}:
+            raise ValueError("agent_proxy_mode must be off, selective, or always")
         self.git_executable = shutil.which("git")
         self.rg_executable = shutil.which("rg")
         if self.rg_executable:
@@ -1015,6 +1026,8 @@ class TianChengService:
                 "guarded-development" if self.allow_exec else "disabled"
             ),
             "explicit_env_passthrough_enabled": bool(self.passthrough_env),
+            "agent_proxy_mode": self.agent_proxy_mode,
+            "agent_proxy_configured": bool(self._agent_proxy_environment),
             "available_exec_commands": (
                 sorted(self._exec_commands) if self.allow_exec else []
             ),
@@ -3280,6 +3293,7 @@ class TianChengService:
         profile_credential_env: str | None = None,
         overrides: Mapping[str, str] | None = None,
         codex_home: str | None = None,
+        include_agent_proxy: bool = False,
     ) -> dict[str, str]:
         system_root = os.environ.get("SystemRoot", r"C:\Windows")
         executable_directories = {
@@ -3339,6 +3353,8 @@ class TianChengService:
             # dedicated parameter rather than an arbitrary env map so MCP
             # callers cannot select or overwrite another profile's home.
             environment["CODEX_HOME"] = codex_home
+        if include_agent_proxy:
+            add_agent_proxy(environment, self._agent_proxy_environment)
         return environment
 
     def _prepare_exec_command(self, key: str, arguments: list[str]) -> list[str]:
@@ -3505,6 +3521,7 @@ class TianChengService:
         stdin_enabled: bool = True,
         policy_root: Path | None = None,
         owner: str = "process",
+        agent_proxy: bool = False,
     ) -> dict[str, Any]:
         if not self.allow_exec:
             raise PermissionError("Command execution is disabled; restart with --allow-exec")
@@ -3565,6 +3582,7 @@ class TianChengService:
                 profile_credential_env=profile_credential_env,
                 overrides=environment_overrides,
                 codex_home=codex_home,
+                include_agent_proxy=owner == "agent_run" and agent_proxy,
             ),
             # Agent adapters pass the complete prompt as an argument.  Giving
             # Codex/Claude an open pipe here makes them wait forever for
@@ -3914,6 +3932,7 @@ class TianChengService:
         cwd: str = ".",
         sandbox: str = "workspace-write",
         codex_defaults: Mapping[str, Any] | None = None,
+        use_proxy: bool = False,
     ) -> dict[str, Any]:
         selected = self.agent_profiles.get(profile)
         self.agent_profiles.require_capability(selected, "create")
@@ -3928,6 +3947,7 @@ class TianChengService:
             profile=selected.name,
             cwd=stored_cwd,
             sandbox=sandbox,
+            proxy_enabled=self._session_proxy_enabled(use_proxy),
             provider=selected.provider,
             runtime_home_isolated=selected.codex_home is not None,
             policy_root=policy_root,
@@ -3948,6 +3968,7 @@ class TianChengService:
         profile: str = "codex-default",
         sandbox: str = "workspace-write",
         codex_defaults: Mapping[str, Any] | None = None,
+        use_proxy: bool = False,
     ) -> dict[str, Any]:
         catalog = self._require_agent_catalog()
         selected = self.agent_profiles.get(profile)
@@ -3989,6 +4010,7 @@ class TianChengService:
             cwd=stored_cwd,
             policy_root=policy_root,
             sandbox=sandbox,
+            proxy_enabled=self._session_proxy_enabled(use_proxy),
             provider=selected.provider,
             runtime_home_isolated=selected.codex_home is not None,
             native_session_id=str(record["native_session_id"]),
@@ -4004,6 +4026,15 @@ class TianChengService:
                 )
             self._agent_sessions[session.session_id] = session
         return self._agent_session_payload(session)
+
+    def _session_proxy_enabled(self, requested: bool) -> bool:
+        if self.agent_proxy_mode == "always":
+            return bool(self._agent_proxy_environment)
+        if self.agent_proxy_mode == "selective":
+            if not isinstance(requested, bool):
+                raise TypeError("use_proxy must be a boolean")
+            return requested and bool(self._agent_proxy_environment)
+        return False
 
     @staticmethod
     def _agent_session_payload(session: AgentSessionState) -> dict[str, Any]:
@@ -4023,6 +4054,7 @@ class TianChengService:
             "cwd_policy_root": session.policy_root,
             "cwd_scope": "workspace" if session.policy_root is None else "access-policy",
             "sandbox": session.sandbox,
+            "proxy_enabled": session.proxy_enabled,
             "native_session_id": session.native_session_id,
             "origin": "catalog" if session.conversation_ref else "new",
             "conversation_ref": session.conversation_ref,
@@ -4172,6 +4204,7 @@ class TianChengService:
                 None if session.policy_root is None else Path(session.policy_root)
             ),
             owner="agent_run",
+            agent_proxy=session.proxy_enabled,
         )
         run = AgentRunState(
             new_run_id(),

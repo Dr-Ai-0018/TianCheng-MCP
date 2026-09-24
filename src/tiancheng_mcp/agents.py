@@ -426,6 +426,7 @@ class AgentSessionState:
     profile: str
     cwd: str
     sandbox: str
+    proxy_enabled: bool = False
     provider: str = "codex"
     runtime_home_isolated: bool = False
     # None means cwd is relative to the TianCheng workspace. Otherwise cwd is

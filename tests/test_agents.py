@@ -762,6 +762,52 @@ def test_agent_runtime_uses_registered_adapter_and_provider_binding(
         service.agent_run_start(session["session_id"], "must fail closed")
 
 
+@pytest.mark.parametrize(
+    ("mode", "requested", "expected"),
+    [
+        ("off", True, False),
+        ("selective", False, False),
+        ("selective", True, True),
+        ("always", False, True),
+    ],
+)
+def test_agent_session_proxy_policy_reaches_only_selected_children(
+    workspace, tmp_path, mode: str, requested: bool, expected: bool
+) -> None:
+    script = tmp_path / "proxy_agent.py"
+    script.write_text(
+        "import os,sys\n"
+        "print('SESSION:native_proxy_test', flush=True)\n"
+        "print('MESSAGE:' + str(os.environ.get('HTTP_PROXY')), flush=True)\n",
+        encoding="utf-8",
+    )
+    service = TianChengService(
+        workspace,
+        tmp_path / "audit",
+        allow_exec=True,
+        access_policy=AccessPolicy.default(workspace),
+        agent_source_policy=AgentSourcePolicy.empty(),
+        enable_agent_catalog=False,
+        agent_proxy_mode=mode,
+        agent_proxy_environment={"HTTP_PROXY": "http://proxy.test:8000"},
+    )
+    try:
+        service._exec_commands["fake-agent"] = [sys.executable, str(script)]
+        service.agent_profiles = AgentProfileRegistry(
+            service._exec_commands, adapters=(_FakeAdapter(),)
+        )
+        created = service.agent_session_create(profile="fake-default", use_proxy=requested)
+        assert created["proxy_enabled"] is expected
+        started = service.agent_run_start(created["session_id"], "check")
+        _wait_for_run(service, created["session_id"], started["run_id"])
+        result = service.agent_run_result(created["session_id"], started["run_id"])
+        assert result["result"] == (
+            "http://proxy.test:8000" if expected else "None"
+        )
+    finally:
+        service.shutdown()
+
+
 def test_agent_runtime_rejects_adapter_executable_prefix_changes(
     workspace, tmp_path
 ) -> None:

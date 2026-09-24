@@ -3,7 +3,7 @@ param(
     [ValidateSet(
         'menu', 'start', 'start-new', 'doctor', 'profiles', 'configure-profile',
         'select-profile', 'edit-profile', 'key', 'key-status', 'status',
-        'set-mode', 'stop', 'restart', 'open-ui', 'settings', 'info', 'install-alias', 'policy', 'agents'
+        'set-mode', 'stop', 'restart', 'open-ui', 'settings', 'proxy', 'info', 'install-alias', 'policy', 'agents'
     )]
     [string]$Action = 'menu',
     [string]$Profile,
@@ -25,6 +25,7 @@ $ErrorActionPreference = 'Stop'
 
 $script:ProjectRoot = $PSScriptRoot
 $script:WorkspaceCache = ''
+$script:ProxyProbeResult = $null
 $script:DefaultsPath = Join-Path $PSScriptRoot 'config\launcher.defaults.json'
 $script:LocalConfigPath = if ($ConfigPath) {
     [System.IO.Path]::GetFullPath($ConfigPath)
@@ -1122,10 +1123,217 @@ function Open-AdminUi {
     Start-Process $url
 }
 
+function Get-ProxyOverrides {
+    $local = Read-JsonHashtable -Path $script:LocalConfigPath
+    $proxy = @{}
+    if ($local.ContainsKey('proxy') -and $local.proxy -is [System.Collections.IDictionary]) {
+        foreach ($entry in $local.proxy.GetEnumerator()) {
+            $proxy[$entry.Key] = $entry.Value
+        }
+    }
+    return $proxy
+}
+
+function Show-ProxySummary {
+    param([System.Collections.IDictionary]$Overrides)
+
+    $defaults = Read-JsonHashtable -Path $script:DefaultsPath
+    $local = if ($null -eq $Overrides) { Get-ProxyOverrides } else { $Overrides }
+    $defaultProxy = if ($defaults.ContainsKey('proxy') -and
+        $defaults.proxy -is [System.Collections.IDictionary]) { $defaults.proxy } else { @{} }
+    Write-Host '出站代理（显示主机/端口；隐藏用户名和密码）：' -ForegroundColor Cyan
+    $hasProxy = $false
+    foreach ($field in @('http', 'https', 'noProxy')) {
+        $names = switch ($field) {
+            'http' { @('HTTP_PROXY', 'http_proxy') }
+            'https' { @('HTTPS_PROXY', 'https_proxy') }
+            'noProxy' { @('NO_PROXY', 'no_proxy') }
+        }
+        $value = $null
+        $source = '默认'
+        foreach ($name in $names) {
+            $candidate = [Environment]::GetEnvironmentVariable($name, 'Process')
+            if ($null -ne $candidate) {
+                $value = $candidate
+                $source = '进程环境'
+                break
+            }
+        }
+        if ($null -eq $value -and $local.ContainsKey($field)) {
+            $value = [string]$local[$field]
+            $source = '本机配置'
+        }
+        if ($null -eq $value -and $defaultProxy.ContainsKey($field)) {
+            $value = [string]$defaultProxy[$field]
+        }
+        if ($field -ne 'noProxy' -and -not [string]::IsNullOrEmpty($value)) {
+            $hasProxy = $true
+        }
+        $label = if ([string]::IsNullOrEmpty($value)) { '未配置' }
+            elseif ($field -eq 'noProxy') {
+                $count = @($value.Split(',') | Where-Object { $_.Trim() }).Count
+                "已配置（$count 条直连规则）"
+            }
+            else {
+                $uri = $null
+                if ([uri]::TryCreate($value, [UriKind]::Absolute, [ref]$uri)) {
+                    $auth = if ($uri.UserInfo) { '，含认证' } else { '' }
+                    $port = if ($uri.IsDefaultPort) { '' } else { ":$($uri.Port)" }
+                    "已配置 $($uri.Scheme)://$($uri.Host)$port$auth"
+                } else { 'URL 格式无效' }
+            }
+        Write-Host "  $field : $label [$source]"
+    }
+    $agent = if ($local.ContainsKey('agent')) { [string]$local.agent }
+        elseif ($defaultProxy.ContainsKey('agent')) { [string]$defaultProxy.agent }
+        else { 'off' }
+    if ($agent -eq 'inherit') { $agent = 'always' }
+    $agentLabel = switch ($agent) {
+        'off' { '全局 Agent 透传网络：保持现有隔离环境，不注入项目代理' }
+        'selective' { '自选 Agent 代理注入：创建/附加 session 时可选 use_proxy=true' }
+        'always' { '全局 Agent 代理启用：所有新 session 自动注入项目代理' }
+        default { 'Agent 模式配置无效' }
+    }
+    Write-Host "  Agent 模式: $agentLabel"
+    if (-not $hasProxy -and $agent -ne 'off') {
+        Write-Host '  当前没有可注入的代理；Agent 模式仅在配置代理后起作用。' -ForegroundColor Yellow
+    }
+    if ($null -ne $script:ProxyProbeResult) {
+        foreach ($field in @('http', 'https')) {
+            $result = $script:ProxyProbeResult[$field]
+            if ($null -eq $result) { continue }
+            $status = switch ($result.status) {
+                'ok' { "连通，出口 IP $($result.egress_ip)" }
+                'failed' { "失败（$($result.reason)）" }
+                default { '未配置' }
+            }
+            Write-Host "  $field 检测: $status"
+        }
+    } else {
+        Write-Host '  连通性: 未检测（选 8 手动检测，向 api.ipify.org 查询出口 IP）'
+    }
+}
+
+function Test-ConfiguredProxy {
+    $config = Get-LauncherConfig
+    $python = [string]$config.python
+    if (-not (Test-Path -LiteralPath $python -PathType Leaf)) {
+        Write-Host 'Python 不可用，无法检测代理。' -ForegroundColor Yellow
+        return
+    }
+    try {
+        $output = & $python -m tiancheng_mcp.proxy_probe `
+            --defaults $script:DefaultsPath --local $script:LocalConfigPath 2>$null
+        if ($LASTEXITCODE -ne 0) { throw 'probe failed' }
+        $result = $output | ConvertFrom-Json -AsHashtable
+        if ($result.ContainsKey('error')) { throw 'invalid proxy config' }
+        $script:ProxyProbeResult = $result
+    } catch {
+        Write-Host '代理检测无法完成；请检查 Python 环境和代理配置。' -ForegroundColor Yellow
+    }
+}
+
+function Assert-ProxyUrl {
+    param([Parameter(Mandatory)][string]$Value)
+
+    $uri = $null
+    if ($Value.Length -gt 4096 -or $Value -match '\s' -or
+        -not [uri]::TryCreate($Value, [UriKind]::Absolute, [ref]$uri) -or
+        $uri.Scheme -notin @('http', 'https', 'socks5', 'socks5h') -or
+        [string]::IsNullOrWhiteSpace($uri.Host) -or
+        $uri.AbsolutePath -ne '/' -or $uri.Query -or $uri.Fragment) {
+        throw '代理 URL 无效；请使用 http://、https://、socks5:// 或 socks5h://，并对凭据特殊字符做 URL 编码。'
+    }
+}
+
+function Read-ProxyUrl {
+    param([Parameter(Mandatory)][string]$Prompt)
+
+    if ([Console]::IsInputRedirected) {
+        # Read-Host echoes redirected input, while -AsSecureString waits for
+        # an interactive terminal. Read only the next line from the supplied
+        # stream and never write its contents to the host.
+        Write-Host "$Prompt（从重定向输入读取）"
+        return [Console]::In.ReadLine()
+    }
+    return (Read-SecretText -Prompt $Prompt)
+}
+
+function Edit-ProxySettingsInteractive {
+    $proxy = Get-ProxyOverrides
+    $changed = $false
+    $script:ProxyProbeResult = $null
+    while ($true) {
+        Show-ProxySummary -Overrides $proxy
+        Write-Host '  1. 设置 HTTP 目标的代理 URL'
+        Write-Host '  2. 设置 HTTPS 目标的代理 URL'
+        Write-Host '  3. 设置 NO_PROXY 直连列表'
+        Write-Host '  4. 选择 Agent 模式（off/selective/always）'
+        Write-Host '  5. 清除本机 HTTP 代理'
+        Write-Host '  6. 清除本机 HTTPS 代理'
+        Write-Host '  7. 清除本机 NO_PROXY'
+        Write-Host '  8. 检测已保存代理的连通性与出口 IP'
+        Write-Host '  0. 保存并返回'
+        $choice = Read-Host '代理设置'
+        switch ($choice) {
+            '1' {
+                $value = Read-ProxyUrl -Prompt 'HTTP 目标代理 URL'
+                try { Assert-ProxyUrl -Value $value; $proxy.http = $value; $changed = $true }
+                catch { Write-Host '代理 URL 无效，请检查协议、主机、端口与凭据的 URL 编码。' -ForegroundColor Yellow }
+                finally { $value = $null }
+            }
+            '2' {
+                $value = Read-ProxyUrl -Prompt 'HTTPS 目标代理 URL'
+                try { Assert-ProxyUrl -Value $value; $proxy.https = $value; $changed = $true }
+                catch { Write-Host '代理 URL 无效，请检查协议、主机、端口与凭据的 URL 编码。' -ForegroundColor Yellow }
+                finally { $value = $null }
+            }
+            '3' {
+                $value = Read-Host 'NO_PROXY（逗号分隔，输入空行=清除）'
+                if ($null -eq $value -or $value.Length -gt 4096 -or $value -match '[\x00-\x1f]') {
+                    Write-Host 'NO_PROXY 必须是最多 4096 字符的单行文本。' -ForegroundColor Yellow
+                    continue
+                }
+                $proxy.noProxy = $value
+                $changed = $true
+            }
+            '4' {
+                Write-Host 'off = 全局 Agent 透传网络：保持原有环境，不注入项目代理'
+                Write-Host 'selective = 自选：仅 use_proxy=true 的新 session 注入代理'
+                Write-Host 'always = 全局启用：所有新 session 注入代理，不能逐个关闭'
+                $value = Read-Host 'Agent 模式：off / selective / always'
+                if ($value -notin @('off', 'selective', 'always')) {
+                    Write-Host '只能输入 off、selective 或 always。' -ForegroundColor Yellow
+                    continue
+                }
+                $proxy.agent = $value
+                $changed = $true
+            }
+            '5' { $proxy.http = ''; $changed = $true }
+            '6' { $proxy.https = ''; $changed = $true }
+            '7' { $proxy.noProxy = ''; $changed = $true }
+            '8' {
+                if ($changed) {
+                    Write-Host '先选 0 保存，再重新进入菜单检测新配置。' -ForegroundColor Yellow
+                } else { Test-ConfiguredProxy }
+            }
+            '0' {
+                if ($changed) {
+                    Save-LauncherOverrides -Changes @{ proxy = $proxy }
+                    Write-Host '代理设置已保存；重启 MCP/Tunnel 后生效。' -ForegroundColor Green
+                }
+                return
+            }
+            default { Write-Host '无效选择。' -ForegroundColor Yellow }
+        }
+        if ($changed) { $script:ProxyProbeResult = $null }
+    }
+}
+
 function Edit-SettingsInteractive {
     param([hashtable]$Config)
 
-    Write-Host '直接回车表示保持现值。配置不包含 API key。' -ForegroundColor DarkGray
+    Write-Host '直接回车表示保持现值；代理凭据不会显示在菜单中。' -ForegroundColor DarkGray
     $interactiveTimeout = if ($Config.ContainsKey('interactiveTimeoutSeconds')) {
         [int]$Config.interactiveTimeoutSeconds
     } else { 75 }
@@ -1184,6 +1392,11 @@ function Edit-SettingsInteractive {
     if ($changes.Count -gt 0) {
         Save-LauncherOverrides -Changes $changes
         Write-Host '启动器设置已保存。' -ForegroundColor Green
+    }
+    Show-ProxySummary
+    $proxyChoice = Read-Host '管理出站代理？y/N'
+    if ($proxyChoice -match '^(?i)y(?:es)?$') {
+        Edit-ProxySettingsInteractive
     }
 }
 
@@ -1892,7 +2105,8 @@ function Show-MainMenu {
         Write-Host '  7. API Key 管理'
         Write-Host '  8. 状态（含 Git/GCM/gh）'
         Write-Host '  9. 打开 Tunnel 管理 UI'
-        Write-Host '  A. 启动器设置'
+        Write-Host '  A. 启动器设置 / 出站代理'
+        Write-Host '  P. 出站代理设置'
         Write-Host '  B. 安装/修复 tc 快捷命令'
         Write-Host '  D. 外部路径白名单 / 访问策略'
         Write-Host '  E. 本地 Agent / 会话源管理'
@@ -1909,6 +2123,7 @@ function Show-MainMenu {
                 '8' { Show-Status -Config $config; Pause-Tq }
                 '9' { Open-AdminUi -Config $config; Pause-Tq }
                 { $_ -match '^(?i)a$' } { Edit-SettingsInteractive -Config $config; Pause-Tq }
+                { $_ -match '^(?i)p$' } { Edit-ProxySettingsInteractive; Pause-Tq }
                 { $_ -match '^(?i)b$' } { Install-Alias; Pause-Tq }
                 { $_ -match '^(?i)d$' } { Show-AccessPolicyMenu }
                 { $_ -match '^(?i)e$' } { Show-AgentSourceMenu -Config $config }
@@ -1953,6 +2168,7 @@ switch ($Action) {
     'status' { Show-Status -Config $config }
     'open-ui' { Open-AdminUi -Config $config }
     'settings' { Edit-SettingsInteractive -Config $config }
+    'proxy' { Edit-ProxySettingsInteractive }
     'info' { Show-Info -Config $config }
     'install-alias' { Install-Alias }
     'policy' { Show-AccessPolicy }

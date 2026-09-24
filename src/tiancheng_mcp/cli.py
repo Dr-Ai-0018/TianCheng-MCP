@@ -8,6 +8,7 @@ import os
 import sys
 from pathlib import Path
 
+from .proxy import ProxySettings
 from .server import create_server
 from .service import TianChengService
 
@@ -79,6 +80,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional dotenv source; only profile-declared credential names are read",
     )
     parser.add_argument(
+        "--launcher-local-config",
+        default=str(PROJECT_ROOT / "config" / "launcher.local.json"),
+        help="Local launcher config used for optional outbound proxy settings",
+    )
+    parser.add_argument(
         "--allow-policy-hot-reload",
         action="store_true",
         help=(
@@ -109,6 +115,11 @@ def main(argv: list[str] | None = None) -> None:
         level=logging.WARNING,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    proxy = ProxySettings.load(
+        PROJECT_ROOT / "config" / "launcher.defaults.json",
+        Path(args.launcher_local_config),
+    )
+    proxy.apply_to_process()
     service = TianChengService(
         workspace=args.workspace,
         audit_directory=args.audit_dir,
@@ -122,6 +133,8 @@ def main(argv: list[str] | None = None) -> None:
         agent_profile_config_path=args.agent_profiles,
         agent_env_file=args.agent_env_file,
         allow_policy_hot_reload=args.allow_policy_hot_reload,
+        agent_proxy_environment=proxy.agent_environment(),
+        agent_proxy_mode=proxy.agent,
     )
     try:
         create_server(service).run(transport="stdio")

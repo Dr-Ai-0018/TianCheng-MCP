@@ -19,6 +19,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import IO, Callable, Iterable
 
+from .proxy import ProxySettings
 from .service import _WindowsKillJob
 
 
@@ -513,7 +514,11 @@ class TunnelSupervisor:
 
     def _ready(self) -> bool:
         try:
-            with urllib.request.urlopen(
+            # The admin listener is loopback-only. Never send this probe to a
+            # configured proxy, even when the host has proxy env variables.
+            with urllib.request.build_opener(
+                urllib.request.ProxyHandler({})
+            ).open(
                 f"{self.config.health_base_url}/readyz", timeout=2
             ) as response:
                 return response.status == 200
@@ -671,6 +676,9 @@ def main(argv: Iterable[str] | None = None) -> int:
     args = _build_parser().parse_args(list(argv) if argv is not None else None)
     try:
         config = load_launcher_config(args.defaults.resolve(), args.local_config.resolve())
+        ProxySettings.load(
+            args.defaults.resolve(), args.local_config.resolve()
+        ).apply_to_process()
         if _PROFILE_PATTERN.fullmatch(args.profile) is None:
             raise ValueError("invalid profile name")
         if args.check:
