@@ -35,3 +35,20 @@ def isolate_fixture_credential_env(monkeypatch: pytest.MonkeyPatch) -> None:
     # host environment, and a test that needs a value still sets its own.
     for name in _FIXTURE_CREDENTIAL_ENV:
         monkeypatch.delenv(name, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def isolate_service_local_agent_state(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Service defaults point at ignored, machine-owned files in the checkout.
+    # Tests that need a specific policy or catalog pass it explicitly; all
+    # other service instances must not depend on a developer's local ACL/data.
+    original_init = TianChengService.__init__
+
+    def init_with_test_state(self: TianChengService, *args, **kwargs) -> None:
+        kwargs.setdefault("agent_source_policy_path", tmp_path / "agent-sources.json")
+        kwargs.setdefault("agent_catalog_path", tmp_path / "agent-catalog.sqlite3")
+        original_init(self, *args, **kwargs)
+
+    monkeypatch.setattr(TianChengService, "__init__", init_with_test_state)

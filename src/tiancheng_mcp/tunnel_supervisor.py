@@ -439,8 +439,19 @@ class TunnelSupervisor:
     def _tee(self, stream: IO[str], output: IO[str], generation: int) -> None:
         try:
             for line in iter(stream.readline, ""):
-                output.write(line)
-                output.flush()
+                # A redirected Windows console may not encode all UTF-8 log
+                # characters. Keep draining and classifying even if display fails.
+                try:
+                    try:
+                        output.write(line)
+                    except UnicodeEncodeError:
+                        encoding = getattr(output, "encoding", None) or "ascii"
+                        output.write(line.encode(encoding, errors="backslashreplace").decode(encoding))
+                    output.flush()
+                except (OSError, ValueError):
+                    # Closed/broken output is not a tunnel failure. Dropping the
+                    # display copy must not disable recovery or block its pipe.
+                    pass
                 classified = _classify_failure_line(line)
                 if classified is None or generation != self.generation:
                     continue

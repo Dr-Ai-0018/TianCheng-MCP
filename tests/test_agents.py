@@ -306,7 +306,7 @@ def test_profile_config_rejects_ambiguous_or_unknown_auth(
         load_agent_profile_definitions(config)
 
 
-def test_codex_native_invocation_options_render_in_cli_0153_order() -> None:
+def test_codex_native_invocation_options_render_for_exec() -> None:
     registry = AgentProfileRegistry(["codex"])
     profile = registry.get("codex-default")
     command = registry.build_codex_command(
@@ -316,7 +316,7 @@ def test_codex_native_invocation_options_render_in_cli_0153_order() -> None:
         cwd="E:/ExampleWorkspace",
         sandbox="workspace-write",
         invocation_options={
-            "ask_for_approval": "never",
+            "ask_for_approval": "on-request",
             "search": True,
             "model": "gpt-5.6-luna",
             "reasoning_effort": "max",
@@ -332,24 +332,25 @@ def test_codex_native_invocation_options_render_in_cli_0153_order() -> None:
             "add_dirs": ["E:/ExampleWorkspace/extra"],
             "thread_source": "tiancheng-mcp",
             "skip_git_repo_check": True,
-            "ignore_user_config": True,
-            "ignore_rules": True,
+            "ignore_user_config": False,
+            "ignore_rules": False,
             "output_schema": "E:/ExampleWorkspace/schema.json",
             "color": "never",
             "output_last_message": "E:/ExampleWorkspace/result.txt",
         },
     )
-    assert command[:5] == ["codex", "-a", "never", "--search", "exec"]
-    assert command[5:11] == [
-        "--json",
-        "-s",
-        "workspace-write",
+    assert command[:6] == ["codex", "--search", "exec", "--json", "-c", 'approval_policy="on-request"']
+    assert command[6:9] == [
         "-C",
         "E:/ExampleWorkspace",
         "-m",
     ]
+    assert "-s" not in command
+    assert "-a" not in command
+    assert "--ignore-user-config" not in command
+    assert "--ignore-rules" not in command
     assert command[-1] == "检查参数"
-    assert command.count("-c") == 4
+    assert command.count("-c") == 5
     assert command[command.index("-m") + 1] == "gpt-5.6-luna"
     assert "model_reasoning_effort=\"max\"" in command
     assert "model_provider=\"example-provider\"" in command
@@ -398,6 +399,37 @@ def test_codex_native_invocation_options_render_in_cli_0153_order() -> None:
         "Native option review",
         "只看并发问题",
     ]
+
+
+
+@pytest.mark.parametrize("action", ["new", "continue", "fork", "review"])
+@pytest.mark.parametrize("policy", ["never", "on-request"])
+def test_codex_approval_request_reaches_exec_config(action, policy):
+    registry = AgentProfileRegistry(["codex"])
+    command = registry.build_codex_command(
+        registry.get("codex-default"), ["codex"], prompt="check",
+        cwd="E:/ExampleWorkspace", sandbox="read-only",
+        native_session_id="thread-id" if action in {"continue", "fork"} else None,
+        invocation_options={"ask_for_approval": policy},
+        action="continue" if action == "new" else action,
+    )
+    assert "-a" not in command
+    assert command[command.index("-c") + 1] == 'approval_policy=' + json.dumps(policy)
+    assert command[command.index("-s") + 1] == "read-only"
+    assert not any("approvals_reviewer" in arg for arg in command)
+
+
+def test_auto_review_rejects_conflicting_approval_and_sandbox():
+    registry = AgentProfileRegistry(["codex"])
+    for sandbox, options, error in (
+        ("workspace-write", {"approve_for_me": True, "ask_for_approval": "never"}, "conflicts"),
+        ("read-only", {"approve_for_me": True}, "requires"),
+    ):
+        with pytest.raises(ValueError, match=error):
+            registry.build_codex_command(
+                registry.get("codex-default"), ["codex"], prompt="check",
+                cwd="E:/ExampleWorkspace", sandbox=sandbox, invocation_options=options,
+            )
 
 
 def test_codex_options_validate_merge_clear_and_high_risk_flags() -> None:
@@ -587,7 +619,7 @@ def test_agent_registry_exposes_capabilities_and_stable_unsupported_errors() -> 
             "display_name": "Codex",
             "available": True,
             "profiles": ["codex-default"],
-            "tested_cli_version": "0.153.0",
+            "tested_cli_version": None,
             "capabilities": {
                 "create": True,
                 "attach": True,
@@ -597,6 +629,7 @@ def test_agent_registry_exposes_capabilities_and_stable_unsupported_errors() -> 
                 "cancel": True,
                 "steer": False,
                 "interaction": False,
+                "manual_approval": True,
                 "fork": True,
                 "review": True,
             },
@@ -614,6 +647,7 @@ def test_agent_registry_exposes_capabilities_and_stable_unsupported_errors() -> 
             "provider": "codex",
             "auth_mode": "existing-login",
             "runtime_home_isolated": False,
+            "windows_home_preflight": "none",
         },
     )
     assert registry.adapter_for_profile(profile).provider == "codex"
@@ -1029,6 +1063,7 @@ def test_isolated_agent_profile_freezes_and_injects_isolated_codex_home(monkeypa
                 "provider": "codex",
                 "auth_mode": "env",
                 "runtime_home_isolated": True,
+                "windows_home_preflight": "none",
             } in info["agent_profile_metadata"]
 
             session = service.agent_session_create(
@@ -1041,6 +1076,8 @@ def test_isolated_agent_profile_freezes_and_injects_isolated_codex_home(monkeypa
             assert "codex_home" not in inspected
 
             started = service.agent_run_start(session["session_id"], "wake up")
+            assert started["runtime_context"]["windows_home_preflight"] == "not_requested"
+            assert started["runtime_context"]["windows_home_preflight_policy"] == "none"
             completed = _wait_for_run(service, session["session_id"], started["run_id"])
             assert completed["state"] == "succeeded"
             result = service.agent_run_result(session["session_id"], started["run_id"])
@@ -1928,3 +1965,61 @@ def test_attach_resumes_history_from_a_whitelisted_directory(
             service.agent_session_attach(record["conversation_ref"])
     finally:
         service.shutdown()
+
+
+@pytest.mark.parametrize("config", [
+    'notify=["tiancheng-review-nonexistent-command"]', 'notify=[]',
+    'notify.command="unused"', 'NOTIFY=[]',
+    'windows.sandbox="unelevated"', 'windows={sandbox="mxc"}',
+    'permissions.custom.filesystem={"/"="write"}',
+    'permissions={custom={network={enabled=true}}}',
+    'default_permissions=":danger-full-access"',
+    'approvals_reviewer="user"', 'include_permissions_instructions=false',
+    'features={elevated_windows_sandbox=false}', 'features={}',
+    'features.elevated_windows_sandbox=false',
+    'features.enable_experimental_windows_sandbox=true',
+    'features.experimental_windows_sandbox=true',
+    'features.windows_sandbox_service=false',
+    'features.use_linux_sandbox_bwrap=false',
+    'features.exec_permission_approvals=false',
+    'features.request_permissions=true', 'features.request_permissions_tool=true',
+    'features.guardian_approval=false', 'features.write_stdin_approval=false',
+    'features.codex_hooks=true', 'features.hooks=true', 'features.plugin_hooks=true',
+    'WINDOWS.sandbox="unelevated"',
+])
+def test_codex_security_config_is_server_owned(config):
+    with pytest.raises(PermissionError, match="server-side policy"):
+        normalize_codex_options({"config": [config]})
+
+
+@pytest.mark.parametrize("option", ["enable", "disable"])
+@pytest.mark.parametrize("feature", [
+    "elevated_windows_sandbox", "enable_experimental_windows_sandbox",
+    "experimental_windows_sandbox", "windows_sandbox_service",
+    "use_linux_sandbox_bwrap", "exec_permission_approvals",
+    "request_permissions", "request_permissions_tool",
+    "guardian_approval", "write_stdin_approval", "codex_hooks", "hooks", "plugin_hooks",
+    "ELEVATED_WINDOWS_SANDBOX", "elevated_windows_sandbox.extra",
+])
+def test_codex_security_feature_flags_are_server_owned(option, feature):
+    with pytest.raises(PermissionError, match="server-side policy"):
+        normalize_codex_options({option: [feature]})
+
+
+def test_codex_nonsecurity_features_and_typed_approval_remain_available():
+    normalized = normalize_codex_options({
+        "config": ["features.example=true"], "enable": ["example_two"],
+        "disable": ["example_three"], "ask_for_approval": "never",
+    })
+    assert normalized["config"] == ("features.example=true",)
+    assert normalized["enable"] == ("example_two",)
+    assert normalized["disable"] == ("example_three",)
+    assert normalized["ask_for_approval"] == "never"
+
+
+@pytest.mark.parametrize("option", ["ignore_rules", "ignore_user_config"])
+def test_codex_cannot_skip_host_rules_or_config(option):
+    with pytest.raises(PermissionError, match="server-side policy"):
+        normalize_codex_options({option: True})
+    assert normalize_codex_options({option: False}) == {option: False}
+    assert normalize_codex_options({option: None}, allow_null=True) == {option: None}

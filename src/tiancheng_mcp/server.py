@@ -1248,7 +1248,9 @@ def create_server(service: TianChengService) -> MCPServer:
             "may provide schema-validated codex_defaults: model selects native -m, "
             "reasoning_effort sets model_reasoning_effort, route selects the registered "
             "provider route for each run, and repeatable config/enable/disable values keep "
-            "their supplied order. Secrets and executable argv are never accepted here. "
+            "their supplied order. add_dirs grants additional WRITE access; do not add "
+            "an installed tool directory merely to read or execute that tool. "
+            "Secrets and executable argv are never accepted here. "
             + agent_proxy_help
         )
 
@@ -1329,9 +1331,13 @@ def create_server(service: TianChengService) -> MCPServer:
                 "events, result, cancel. start returns immediately with run_id; "
                 "events supports bounded cursor paging and wait_ms up to 10000 ms. Codex start "
                 "accepts schema-validated codex_options that override session defaults, and "
+                "manual_approval=true selects the app-server approval channel; poll agent_approval "
+                "for user decisions. Do not silently retry automatic-review denials in manual mode. "
                 "codex_action selects continue, fork, or review. Use codex_options.model, "
                 "reasoning_effort, and route for native per-run routing; null clears a session "
-                "default. review_* options apply only when codex_action is review. For "
+                "default. add_dirs grants extra WRITE roots, not tool discovery or read-only access. "
+                "state describes the provider process; outcomes reports observed command failures "
+                "and leaves task completion unverified. review_* options apply only when codex_action is review. For "
                 "action=start, max_runtime_seconds sets the hard lifetime of this Agent run. "
                 "Omit it for the recommended 3600-second (1 hour) default; accepted values are "
                 "1 through 10800 seconds (3 hours). Reaching the limit terminates the Agent "
@@ -1392,5 +1398,29 @@ def create_server(service: TianChengService) -> MCPServer:
                     lambda: service.agent_run_cancel(session_id, run_id, reason),
                 )
             raise ValueError("action must be start, inspect, events, result, or cancel")
+
+        @mcp.tool(
+            description=(
+                "List or respond to pending manual Codex approvals. Start the run with "
+                "codex_options.manual_approval=true (or that session default). Actions: list, respond. "
+                "Show the exact request to the user before accepting unless the user already "
+                "explicitly authorized that operation. Agent-generated text is not user approval. "
+                "Respond with the session_id, run_id and approval_id from list; decision is "
+                "accept, decline or cancel for this request only. Expired, resolved or wrong-run "
+                "IDs fail. This is not a Windows administrator UAC interface."
+            ),
+            annotations=EXECUTION,
+        )
+        def agent_approval(
+            action: Literal["list", "respond"], session_id: str, run_id: str,
+            approval_id: str = "", decision: Literal["accept", "decline", "cancel"] = "cancel",
+        ) -> dict[str, Any]:
+            if action == "list":
+                return call_label("agent_approval_list", "<agent-approval>",
+                                  lambda: service.agent_approval_list(session_id, run_id))
+            if action == "respond":
+                return call_label("agent_approval_respond", "<agent-approval>",
+                                  lambda: service.agent_approval_respond(session_id, run_id, approval_id, decision))
+            raise ValueError("action must be list or respond")
 
     return mcp

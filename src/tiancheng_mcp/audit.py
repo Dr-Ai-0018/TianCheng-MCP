@@ -1,4 +1,4 @@
-"""Minimal JSON-lines audit logging. Never records file content or arguments."""
+"""Rotating JSON-lines audit. No file contents, prompts, full argv or environment."""
 
 from __future__ import annotations
 
@@ -6,7 +6,9 @@ import json
 import threading
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
+
+from .agent_diagnostics import bounded_launch_context
 
 
 class AuditLogger:
@@ -47,6 +49,7 @@ class AuditLogger:
         state: str | None = None,
         reason: str | None = None,
         output_truncated: bool | None = None,
+        runtime_context: Mapping[str, Any] | None = None,
     ) -> None:
         event: dict[str, Any] = {
             "timestamp": datetime.now(UTC).isoformat(),
@@ -65,6 +68,8 @@ class AuditLogger:
             event["reason"] = reason[:200]
         if output_truncated is not None:
             event["output_truncated"] = bool(output_truncated)
+        if runtime_context is not None:
+            event["runtime_context"] = bounded_launch_context(runtime_context)
         encoded = json.dumps(event, ensure_ascii=False, separators=(",", ":"))
         with self._lock:
             self._rotate_if_needed(len((encoded + "\n").encode("utf-8")))

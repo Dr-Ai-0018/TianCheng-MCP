@@ -15,6 +15,7 @@
       "provider": "codex",
       "provider_profile": "isolated",
       "codex_home": "<ABSOLUTE_CODEX_HOME>",
+      "windows_home_preflight": "require-existing",
       "auth": {
         "mode": "env",
         "credential_env": "EXAMPLE_AGENT_KEY"

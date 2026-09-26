@@ -18,6 +18,18 @@ def _structured(result: object) -> dict:
     return value
 
 
+def _isolated_server_config_args(tmp_path: Path) -> list[str]:
+    # A stdio server is a separate process, so pytest's in-process fixtures do
+    # not protect it from ignored, machine-owned config in the source checkout.
+    return [
+        "--agent-sources", str(tmp_path / "isolated-agent-sources.json"),
+        "--agent-catalog", str(tmp_path / "isolated-catalog.sqlite3"),
+        "--agent-profiles", str(tmp_path / "isolated-agent-profiles.json"),
+        "--agent-env-file", str(tmp_path / "isolated-agent.env"),
+        "--launcher-local-config", str(tmp_path / "isolated-launcher.json"),
+    ]
+
+
 def test_exception_group_is_flattened_to_bounded_message() -> None:
     group = ExceptionGroup("outer", [ValueError("safe detail"), RuntimeError("ignored")])
     message = _exception_group_message(group)
@@ -38,13 +50,7 @@ async def test_stdio_initialize_tools_list_and_file_smoke(
             str(workspace),
             "--audit-dir",
             str(tmp_path / "stdio-audit"),
-            # Keep this instance isolated from the developer's own configured
-            # history sources, so the assertions below describe the shipped
-            # defaults rather than one machine's local setup.
-            "--agent-sources",
-            str(tmp_path / "isolated-agent-sources.json"),
-            "--agent-catalog",
-            str(tmp_path / "isolated-catalog.sqlite3"),
+            *_isolated_server_config_args(tmp_path),
         ],
         cwd=str(Path(__file__).resolve().parents[1]),
         encoding="utf-8",
@@ -162,6 +168,7 @@ async def test_exec_tool_is_registered_only_when_enabled(
             "--audit-dir",
             str(tmp_path / "exec-audit"),
             "--allow-exec",
+            *_isolated_server_config_args(tmp_path),
         ],
         cwd=str(Path(__file__).resolve().parents[1]),
     )
@@ -185,6 +192,7 @@ async def test_exec_tool_is_registered_only_when_enabled(
             "stop_process",
             "agent_session",
             "agent_run",
+            "agent_approval",
         } <= set(tools)
         annotations = tools["run_command"].annotations
         assert annotations.destructive_hint is True
@@ -203,10 +211,14 @@ async def test_exec_tool_is_registered_only_when_enabled(
         session_option_schema = tools["agent_session"].input_schema["$defs"][
             session_option_ref.rsplit("/", 1)[-1]
         ]
-        assert {"model", "config", "search", "output_schema"} <= set(
+        assert {"model", "config", "search", "output_schema", "manual_approval"} <= set(
             session_option_schema["properties"]
         )
         run_properties = tools["agent_run"].input_schema["properties"]
+        approval_properties = tools["agent_approval"].input_schema["properties"]
+        assert set(approval_properties["action"]["enum"]) == {"list", "respond"}
+        assert set(approval_properties["decision"]["enum"]) == {"accept", "decline", "cancel"}
+        assert "command" not in approval_properties
         assert "codex_home" not in run_properties
         assert "max_runtime_seconds" in run_properties
         run_option_ref = next(
@@ -412,6 +424,7 @@ async def test_external_access_description_matches_challenge_flow(
             str(tmp_path / "grants-audit"),
             "--allow-external-grants",
             "--allow-policy-hot-reload",
+            *_isolated_server_config_args(tmp_path),
         ],
         cwd=str(Path(__file__).resolve().parents[1]),
         encoding="utf-8",
@@ -479,6 +492,7 @@ async def test_static_policy_external_tools_accept_absolute_paths(
             "--allow-external-grants",
             "--access-policy",
             str(policy),
+            *_isolated_server_config_args(tmp_path),
         ],
         cwd=str(Path(__file__).resolve().parents[1]),
         encoding="utf-8",
@@ -554,6 +568,7 @@ async def test_static_policy_read_only_external_stdio_smoke(
             "-m", "tiancheng_mcp", "--workspace", str(workspace),
             "--audit-dir", str(tmp_path / "readonly-audit"),
             "--allow-external-grants", "--access-policy", str(policy),
+            *_isolated_server_config_args(tmp_path),
         ],
         cwd=str(Path(__file__).resolve().parents[1]),
         encoding="utf-8",

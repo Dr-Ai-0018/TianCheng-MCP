@@ -8,6 +8,41 @@
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-09-26
+
+### Added
+
+- Codex Agent 可显式设置 `codex_options.manual_approval=true`，通过 `agent_approval(list/respond)`
+  处理原生运行时实际提出的审批申请。调用方须把申请交给用户决定；安全策略已允许的操作不会
+  强制产生申请。切换人工模式不代表自动拒绝后转交人工，也不代替 Windows UAC。
+
+### Fixed
+
+- 静态白名单文件工具创建的临时服务不再加载无关的本机 Agent Catalog 配置，避免该配置不可读时误使外部文件操作失败。
+
+### Security / Changed
+
+- 通用 Codex `config` 现在也拒绝旧式 `notify` 外部命令配置，包括清空或子键覆盖。
+  该入口与 hooks 一样保留给服务端，不能由远程请求设置可执行命令；需要通知的部署应使用
+  宿主受控配置。这项兼容性收紧随次版本发布，不更改既有宿主通知配置。
+- 服务端 v1/v2 profile 新增 `windows_home_preflight=none|require-existing`，省略默认 none。
+  原来对所有 Windows 显式 home 的检查收窄为宿主明确选择 require-existing；该值只适用于
+  Codex 显式 home，远程请求不可覆盖，不推断/改变原生 backend。依赖原自动检查的部署需
+  停服后为目标 profile 加入 require-existing，再启动新代码。回退也须停服并恢复匹配的
+  本机配置，旧 loader 不接受新字段；单独回退 Git 不足以撤销迁移。此契约变更随次版本发布。
+  workspace_info 的 profile 元数据及持久启动诊断分别显示策略和执行结果。
+- Windows 选择 require-existing 的 Agent 在启动前拒绝缺失、不可读取或明显损坏的既有沙箱状态，
+  持久记录 `preflight_blocked` 和固定原因码；不启动 Provider、读取凭据或自动 setup。
+  此策略下新 home 需由宿主先审查初始化方案；none 不增加此限制，非 Windows 不执行检查。
+  无明显异常仍标为 `not_verified`，不代表凭据有效或多 home 安全；默认 home 行为保持。
+- 收紧远程 Codex 调用的配置契约：拒绝通用 `config` 覆盖 `windows`、`permissions`、
+  `default_permissions`、`approvals_reviewer`、`include_permissions_instructions`；拒绝沙箱、
+  权限、审批及 hooks 相关 feature 的配置/启停，以及 `features={...}` 整表赋值。
+- `ignore_rules=true`、`ignore_user_config=true` 现在被拒绝，避免调用方跳过宿主规则和基础配置。
+  这是有意的兼容性收紧，须随次版本发布；依赖这些选项的调用应移除对应远程覆盖，并由宿主
+  在受控配置中确定安全策略。普通 feature 使用 `features.<name>=...` 逐键配置。
+  结构化 `ask_for_approval`/`approve_for_me` 接口和普通模型、推理选项仍按现有规则工作。
+
 ## [0.11.0] - 2026-09-24
 
 ### Added

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "tiancheng-local-mcp"
-version = "0.11.0"
+version = "0.12.0"
 description = "A Windows-first, workspace-jailed local MCP server for TianCheng"
 readme = "README.md"
 requires-python = ">=3.12"

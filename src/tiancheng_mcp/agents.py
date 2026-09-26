@@ -16,6 +16,8 @@ from typing import Any
 import time
 import uuid
 
+from .agent_preflight import validate_windows_home_preflight
+
 from .agent_adapters import (
     AgentAdapter,
     AgentEventParser,
@@ -37,6 +39,7 @@ _PROFILE_FIELDS_V1 = {
     "provider",
     "provider_profile",
     "codex_home",
+    "windows_home_preflight",
     "credential_env",
 }
 _PROFILE_FIELDS_V2 = {
@@ -44,6 +47,7 @@ _PROFILE_FIELDS_V2 = {
     "provider",
     "provider_profile",
     "codex_home",
+    "windows_home_preflight",
     "auth",
     "enabled",
 }
@@ -119,6 +123,9 @@ def load_agent_profile_definitions(path: str | Path) -> AgentProfileConfig:
             raise ValueError(f"Invalid codex_home for agent profile {name}")
         if codex_home is not None and provider != "codex":
             raise ValueError(f"codex_home requires provider=codex for agent profile {name}")
+        windows_home_preflight = validate_windows_home_preflight(
+            raw.get("windows_home_preflight", "none"), provider=provider, codex_home=codex_home,
+        )
         enabled = raw.get("enabled", True)
         if not isinstance(enabled, bool):
             raise ValueError(f"Invalid enabled flag for agent profile {name}")
@@ -155,6 +162,7 @@ def load_agent_profile_definitions(path: str | Path) -> AgentProfileConfig:
                 "provider": provider,
                 "provider_profile": provider_profile,
                 "codex_home": codex_home,
+                "windows_home_preflight": windows_home_preflight,
                 "credential_env": credential_env,
                 "auth_mode": auth_mode,
                 "enabled": enabled,
@@ -254,6 +262,10 @@ class AgentProfileRegistry:
                 enabled = definition.get("enabled", True)
                 if not isinstance(enabled, bool):
                     raise ValueError(f"Invalid enabled flag for agent profile {name}")
+                windows_home_preflight = validate_windows_home_preflight(
+                    definition.get("windows_home_preflight", "none"),
+                    provider=provider, codex_home=definition.get("codex_home"),
+                )
                 if not enabled:
                     self._profiles.pop(name, None)
                     self._profile_adapters.pop(name, None)
@@ -273,6 +285,7 @@ class AgentProfileRegistry:
                     command=adapter.command,
                     provider_profile=str(definition["provider_profile"]),
                     codex_home=definition.get("codex_home"),
+                    windows_home_preflight=windows_home_preflight,
                     credential_env=credential_env,
                     auth_mode=str(auth_mode),
                 )
@@ -341,6 +354,7 @@ class AgentProfileRegistry:
                 "provider": profile.provider,
                 "auth_mode": profile.auth_mode,
                 "runtime_home_isolated": profile.codex_home is not None,
+                "windows_home_preflight": profile.windows_home_preflight,
             }
             for profile in sorted(self._profiles.values(), key=lambda item: item.name)
         )
@@ -416,6 +430,12 @@ class AgentRunState:
     terminal_event_emitted: bool = False
     error_summary: str | None = None
     invocation_summary: dict[str, Any] = field(default_factory=dict)
+    runtime_context: dict[str, Any] = field(default_factory=dict)
+    commands_observed: int = 0
+    command_failures: int = 0
+    commands_unknown: int = 0
+    provider_errors_observed: int = 0
+    output_gap_observed: bool = False
     action: str = "continue"
     lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
 

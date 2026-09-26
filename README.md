@@ -4,7 +4,7 @@
 `<WORKSPACE>` 工作区内的文件与本地 Git 能力；服务端代码、依赖和审计日志位于
 仓库目录，不在 ChatGPT 可写工作区内。
 
-当前版本：`0.11.0`。依赖锁定到官方维护的 MCP Python SDK `2.1.0`，使用当前
+当前版本：`0.12.0`。依赖锁定到官方维护的 MCP Python SDK `2.1.0`，使用当前
 `MCPServer`、`MCPServer.tool()`、`ToolAnnotations` 与 stdio transport API。
 
 - MCP Python SDK：<https://github.com/modelcontextprotocol/python-sdk/tree/v2.1.0>
@@ -441,13 +441,34 @@ Agent Profile 名称与 Codex CLI 自己的 config profile 是两层不同概念
 provider 的内置 profile，再按同名覆盖、新名追加、`enabled=false` 禁用；因此只配置 Codex
 不会再误删内置 `claude-default`。配置文件缺失时安全回退到内置 profile，文件存在但字段、
 provider 或认证声明无效时则拒绝启动，不会静默降级。配置只允许声明 provider、真正传给
-Codex `-p` 的 `provider_profile`、专用 `codex_home` 和受控 `auth`，不能声明 executable、
+Codex `-p` 的 `provider_profile`、专用 `codex_home`、`windows_home_preflight` 检查策略和受控 `auth`，不能声明 executable、
 argv 或任意环境变量表。示例中的隔离 profile 展示了如何绑定独立 `CODEX_HOME`；调用方只能
 选择已经由服务端注册的名称，不能在 `agent_session` 或 `agent_run` 中提交、覆盖或读取这些绑定。
 该目录必须已经存在，且每次创建 session 和启动 run 时都要重新通过无审批的可写
 access-policy、系统/敏感/服务目录和 reparse 检查。`workspace_info.agent_profile_metadata`
-只返回 `runtime_home_isolated` 与 `auth_mode`，session inspect 只返回前者；两者都不暴露
+只返回 `runtime_home_isolated`、`auth_mode` 与 `windows_home_preflight` 策略，session inspect 只返回前者；两者都不暴露
 runtime home 路径、环境变量名或凭据。
+v1/v2 profile 配置均支持 `windows_home_preflight`，仅接受 `none`（省略时的默认值）和
+`require-existing`。后者要求 `provider=codex` 且显式绑定 `codex_home`，由宿主在采用既有
+Windows elevated 状态布局时选择；它不推断或修改原生实际 backend，远程 session/run 不能覆盖。
+无效类型/值会拒绝加载，包括已禁用或 Provider 不可用的配置。
+Windows 上，选择 `require-existing` 的 profile 每次启动 run 前会检查既有沙箱状态：
+`.sandbox/setup_marker.json` 必须是可读取的非空 JSON 对象（最大 64 KiB），
+`.sandbox-secrets/sandbox_users.json` 必须具有可访问的非空普通文件元数据；状态目录和文件拒绝 reparse point。
+发现缺失、读取失败或明显损坏时，在创建 Provider 进程前拒绝，并记录
+`agent_launch.state=preflight_blocked` 和 `runtime_context.windows_home_preflight` 原因码。
+这项检查不读取凭据内容、不尝试登录、不运行 setup，也不自动修复；选择此策略的新建 home
+会被拦住，需先由宿主审查其初始化方案。
+检查无上述异常时只返回 `not_verified`：不验证 marker 与原生版本兼容、凭据有效性、
+账户更新时间或多 home 一致性，也不能保证之后原生运行不会触发 setup。
+`none` 不执行此检查，也不额外限制新 home；原生自身的启动/setup 行为仍由其配置决定。
+诊断 `runtime_context.windows_home_preflight_policy` 记录服务端选择，`windows_home_preflight`
+记录结果：`not_requested` 表示选择 none，`not_applicable` 表示 require-existing 在非 Windows
+运行，其他值为 `not_verified` 或拒绝原因。默认/父环境 home 不支持选择 require-existing。
+这不是系统隔离或防并发变更的边界，也不证明未选检查的其他 backend 已通过兼容性验收。
+升级时，依赖旧的自动检查的部署须在停服期间，为目标 profile 显式加入 require-existing，
+再加载新代码；应保留配置原文与 ACL。回退时也须先停服，恢复与旧代码匹配的配置、回退代码，
+确认二者相容后再启动；旧的严格 loader 会拒绝新字段，单独 Git revert 无法恢复本机配置。
 `agent_session(create|attach)` 默认使用 `workspace-write`；只有显式传入
 `sandbox="read-only"` 才创建只读 session。
 
@@ -464,12 +485,89 @@ Codex CLI 当前使用独立 profile 文件：基础 `config.toml` 可声明 `[m
 传给 `codex -p <name>` 的差异配置必须写在同一 `CODEX_HOME` 下的 `<name>.config.toml`，并使用
 顶层 `model`/`model_provider` 等字段；不要再写旧式 `[profiles.<name>]` 表。
 
-当前 Codex 运行参数契约以稳定版 `codex-cli 0.153.0` 为已测试基线。`agent_session` 的
+若希望 CLI、Desktop 和多个 Agent 共用现有 Codex home，可省略 Agent 的 `codex_home`，
+使用 `provider_profile` 选择该 home 下的配置文件；`windows_home_preflight` 应省略或设为
+`none`。部署前核对后台继承的 `CODEX_HOME`，没有该变量时才使用用户默认目录。
+每个 profile 可以声明自己的 provider 与 `env_key`，无需合并 API 凭据。`--profile` 是配置
+选择器，不提供会话或文件权限隔离；共用 home 的记录可能出现在同一个客户端列表中。
+切换目录不会自动迁移旧 home 的历史。Windows elevated 模式下，独立 home 也不等于独立的
+机器级沙箱账户；不要通过轮流重新初始化多个 home 来处理状态冲突。
+
+Codex 不再展示固定的历史测试版本；兼容字段 `tested_cli_version` 返回 `null`。
+`agent_run` 的 `runtime_context` 记录启动器路径/哈希、可识别的 npm 包版本、home 来源、cwd
+和请求的附加写根。启动器包版本不等于已观测到原生二进制版本；未观测的运行时版本和最终沙箱策略明确标注。
+`add_dirs` 是额外**可写目录**，不要为了读取或执行 WizTree 等工具而把安装目录加入其中；
+工具输出应写入已授权的任务工作区。home 优先使用服务端 profile，未指定时沿用父进程
+`CODEX_HOME`，否则由 Codex 选择用户默认目录；独立 home 不保证机器级账户隔离。
+`state=succeeded` 仍表示 Provider 进程正常退出，`outcomes` 单独给出观测到的命令失败计数；
+没有命令事件、结果未知或输出丢失时不推断工具成功。任务产物仍需独立验收。
+这些诊断只保留白名单字段，不包含 prompt、完整 argv 或环境变量；会话结束前可通过 inspect/result 获取。
+通过授权和环境准备后，Agent 进程创建前后会向现有轮转审计日志写入 `agent_launch` 事件，
+使用同一个 `runtime_context.launch_id` 关联 `prepared`、`spawned` 或 `spawn_failed`。
+持久诊断包含有界的路径、启动器身份和请求策略；失败仅记录异常类型，不记录异常正文。
+`prepared/spawned` 只表示启动阶段，不能代表任务成功。更早的授权/配置失败仍由原有工具审计记录，
+不宣称已保存完整启动条件；审计写入失败不会改变运行结果。
+
+`ask_for_approval` 通过 `exec -c approval_policy=...` 传递，避免根命令的交互式 `-a`
+未被 `exec` 继承。不会为匹配请求而改变 reviewer；原生 headless 默认值、AutoReview 和
+管理策略仍可能影响最终结果。`runtime_context.requested_approval_policy` 仅表示请求，
+`resolved_approval_policy=not_observed` 表示尚未观测实际策略。`approve_for_me` 自带
+workspace-write 选择，不再重复传 `-s`；与 `ask_for_approval=never` 同用时会明确拒绝。
+
+需要自动审查额外权限请求时，在 `agent_session(create)` 的 `codex_defaults` 中明确设置
+`{"approve_for_me": true, "ask_for_approval": "on-request"}`，并选择 `sandbox=workspace-write`。
+这两个字段也可放入 `agent_run(start).codex_options`，仅覆盖当前运行。只设置
+`ask_for_approval=on-request` 不会选择自动 reviewer。自动审查可以批准或拒绝请求，
+不等于关闭沙箱。需要由 MCP 调用方转交人工决定时，使用下方的显式人工审批模式。
+
+也可由宿主在某个原生 `<name>.config.toml` 的顶层设置
+`approval_policy = "on-request"` 与 `approvals_reviewer = "auto_review"`，作为该 profile 的默认值。
+这时无需每次传 `approve_for_me`；诊断中的 `requested_auto_review=false` 仅表示本轮没有
+显式传该开关，不代表原生配置禁用了自动审查。最终策略应以实际运行记录为准。
+
+### Codex 人工审批通道
+
+在 `agent_session(create).codex_defaults` 或 `agent_run(start).codex_options` 中设置
+`manual_approval=true`，该轮通过原生 app-server stdio 启动，审批交给用户，保留会话的
+沙箱范围。与 `approve_for_me=true` 或 `ask_for_approval=never` 冲突时拒绝启动。
+普通调用继续使用原有 exec 路径；人工模式仅支持 `continue`（新会话或续接），第一版支持
+model、reasoning_effort、route 和审批选项；不支持的选项/profile 设置会明确拒绝，不会静默丢弃。
+`manual_approval=true` 只负责接管实际产生的审批申请；沙箱已允许的操作会直接执行，
+`agent_approval(list)` 返回 `count=0` 属于正常情况，不能据此认定人工审批闭环已经通过。
+
+1. 用现有 `agent_run(events/result)` 轮询；`approval_requested` 事件和
+   `pending_approval_count` 表示存在申请。
+2. 调用 `agent_approval(action="list", session_id=..., run_id=...)` 获取完整命令/文件变更、
+   原因、申请 ID、有效期及 `allowed_decisions`，向用户展示。申请内容由执行中的 Agent 产生，
+   不是用户授权；除非用户已明确授权该操作，否则必须先取得用户决定。
+3. 调用 `agent_approval(action="respond", session_id=..., run_id=..., approval_id=...,
+   decision="accept")` 回传单次决定。拒绝/取消使用原生申请实际提供的 `decline` 或 `cancel`；
+   不提供的决定会被拒绝。`submitted` 表示已写入原生连接，执行结果仍需继续轮询确认。
+
+申请限定在当前 session/run/native thread/turn，重复、串会话、已取消或过期的回复无效。
+每项申请最多等待五分钟，轮询时清理过期请求，整个进程始终受 run 的硬超时约束。
+关闭、取消或服务重启后旧申请不能恢复。仅支持命令与文件变更审批；未知交互请求、不可完整展示
+的申请和要求持久 grantRoot 的文件变更申请会拒绝/取消，不开放任意 RPC、永久前缀批准或 UAC 操作。
+
+人工模式不会自动重试被自动审查拒绝的操作。需要用户介入时，明确授权后可对同一会话的新一轮
+选择人工模式；恢复默认路径则设置 `manual_approval=false`。这不是自动拒绝后的隐式放行。
+更新服务后，MCP 客户端需要重新获取工具 schema，才能显示新工具和 `manual_approval` 字段。
+
+`agent_session` 的
 `codex_defaults` 保存会话默认值，`agent_run(start)` 的 `codex_options` 可逐轮覆盖；设置为
 `null` 可清除某个默认值。原生 `model`、`reasoning_effort`、有序 `config`、feature 开关、
 image/add-dir/output 路径、approval/search、OSS provider 以及其他 `codex exec` flags 均由
 结构化字段表达，不接受完整 command、argv、executable 或任意环境变量表。`route` 只映射到
-该 run 的 `AWZ_ROUTE`，不会修改父进程、`.env` 或本机 Codex profile：
+该 run 的 `AWZ_ROUTE`，不会修改父进程、`.env` 或本机 Codex profile。
+
+沙箱后端、权限配置和 reviewer 由服务端管理：通用 `config` 不接受 `windows`、`permissions`、
+`default_permissions`、`approvals_reviewer`、`include_permissions_instructions` 等安全设置。
+旧式 `notify` 也是外部命令入口，由服务端管理；远程 `config` 不能设置、清空或覆盖它。
+沙箱、权限、审批和 hooks 相关 feature（包括兼容名称）在 `config`、`enable`、`disable` 三个入口均被拒绝；
+`features={...}` 整表覆盖也被拒绝，普通 feature 仍可逐键设置。
+`ignore_rules=true` 和 `ignore_user_config=true` 也被拒绝，避免跳过已有规则和基础配置；
+`false` 或清除默认值的 `null` 保持可用。这些校验在启动 Provider 前执行，
+不会替用户修改本机配置。结构化调用示例：
 
 ```json
 {

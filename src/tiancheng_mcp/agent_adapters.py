@@ -15,11 +15,12 @@ import re
 import time
 from typing import Any, Mapping, Protocol, TypedDict, runtime_checkable
 
+from .agent_preflight import validate_windows_home_preflight
+
 
 MAX_AGENT_PROMPT_CHARS = 32_000
 MAX_EVENT_SUMMARY_BYTES = 8 * 1024
 MAX_EVENT_DATA_BYTES = 16 * 1024
-CODEX_TESTED_CLI_VERSION = "0.153.0"
 _ALLOWED_SANDBOXES = frozenset({"read-only", "workspace-write"})
 _NATIVE_SESSION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}")
 _CODEX_CONFIG_KEY = re.compile(r"[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*")
@@ -28,7 +29,13 @@ _CODEX_THREAD_SOURCE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
 _CODEX_PROTECTED_CONFIG_ROOTS = frozenset(
     {
         "approval_policy",
+        "approvals_reviewer",
+        "default_permissions",
+        "include_permissions_instructions",
+        "permissions",
+        "windows",
         "hooks",
+        "notify",
         "mcp_servers",
         "model_providers",
         "plugins",
@@ -36,6 +43,25 @@ _CODEX_PROTECTED_CONFIG_ROOTS = frozenset(
         "sandbox_mode",
         "sandbox_workspace_write",
         "shell_environment_policy",
+    }
+)
+# These features select a sandbox backend or change permission/approval tools.
+# Reserve both current names and schema-listed compatibility names to the host.
+_CODEX_PROTECTED_FEATURES = frozenset(
+    {
+        "elevated_windows_sandbox",
+        "enable_experimental_windows_sandbox",
+        "experimental_windows_sandbox",
+        "windows_sandbox_service",
+        "use_linux_sandbox_bwrap",
+        "exec_permission_approvals",
+        "request_permissions",
+        "request_permissions_tool",
+        "guardian_approval",
+        "write_stdin_approval",
+        "codex_hooks",
+        "hooks",
+        "plugin_hooks",
     }
 )
 _CODEX_SECRET_CONFIG_SEGMENTS = frozenset(
@@ -70,6 +96,7 @@ _CODEX_OPTION_KEYS = frozenset(
         "ask_for_approval",
         "search",
         "approve_for_me",
+        "manual_approval",
         "add_dirs",
         "dangerously_bypass_approvals_and_sandbox",
         "dangerously_bypass_hook_trust",
@@ -102,7 +129,7 @@ _SECRET_PATTERNS = (
 
 
 class CodexOptionsInput(TypedDict, total=False):
-    """MCP-visible Codex 0.153 invocation controls.
+    """MCP-visible Codex invocation controls.
 
     Fields may be null on an ``agent_run`` override to remove a session
     default. The service normalizes this object before it reaches the adapter.
@@ -122,6 +149,7 @@ class CodexOptionsInput(TypedDict, total=False):
     ask_for_approval: str | None
     search: bool | None
     approve_for_me: bool | None
+    manual_approval: bool | None
     add_dirs: list[str] | None
     dangerously_bypass_approvals_and_sandbox: bool | None
     dangerously_bypass_hook_trust: bool | None
@@ -199,6 +227,13 @@ def _validate_codex_config_key(key: str) -> None:
         raise PermissionError(
             f"Codex config key {key} requires a separate server-side policy"
         )
+    if segments[0] == "features" and (
+        len(segments) == 1 or segments[1] in _CODEX_PROTECTED_FEATURES
+    ):
+        # Whole-table assignments could hide a protected key in an inline table.
+        raise PermissionError(
+            f"Codex config key {key} requires a separate server-side policy"
+        )
     if any(segment in _CODEX_SECRET_CONFIG_SEGMENTS for segment in segments):
         raise PermissionError(
             f"Codex config key {key} may expose credentials or environment data"
@@ -229,6 +264,7 @@ def normalize_codex_options(
         "oss",
         "search",
         "approve_for_me",
+        "manual_approval",
         "dangerously_bypass_approvals_and_sandbox",
         "dangerously_bypass_hook_trust",
         "skip_git_repo_check",
@@ -245,7 +281,12 @@ def normalize_codex_options(
             normalized[key] = None
             continue
         if key in booleans:
-            normalized[key] = _codex_bool(raw, key)
+            enabled = _codex_bool(raw, key)
+            if enabled and key in {"ignore_rules", "ignore_user_config"}:
+                raise PermissionError(
+                    f"Codex option {key} requires a separate server-side policy"
+                )
+            normalized[key] = enabled
         elif key in sequences:
             maximum_items = 64 if key == "config" else 32
             maximum_chars = 8192 if key == "config" else 4096
@@ -267,6 +308,13 @@ def normalize_codex_options(
                 not _CODEX_NAME.fullmatch(item) for item in items
             ):
                 raise ValueError(f"{key} entries contain an invalid feature name")
+            if key in {"enable", "disable"} and any(
+                item.casefold().split(".", 1)[0] in _CODEX_PROTECTED_FEATURES
+                for item in items
+            ):
+                raise PermissionError(
+                    "Codex security feature changes require a separate server-side policy"
+                )
             normalized[key] = items
         elif key == "local_provider":
             provider = _codex_text(raw, key, maximum=32)
@@ -344,6 +392,7 @@ def summarize_codex_options(value: Mapping[str, Any] | None) -> dict[str, Any]:
         "search",
         "approve_for_me",
         "thread_source",
+        "manual_approval",
         "skip_git_repo_check",
         "ephemeral",
         "ignore_user_config",
@@ -378,6 +427,7 @@ class AdapterCapabilities:
     cancel: bool = True
     steer: bool = False
     interaction: bool = False
+    manual_approval: bool = False
     fork: bool = False
     review: bool = False
 
@@ -391,6 +441,7 @@ class AdapterCapabilities:
             "cancel": self.cancel,
             "steer": self.steer,
             "interaction": self.interaction,
+            "manual_approval": self.manual_approval,
             "fork": self.fork,
             "review": self.review,
         }
@@ -419,6 +470,14 @@ class AgentProfile:
     # different per-run value, but the service enforces a server-owned ceiling.
     max_runtime_seconds: int = 3600
     max_output_bytes: int = 512 * 1024
+
+    # Opt-in legacy Windows state screening, not the effective native backend.
+    windows_home_preflight: str = "none"
+
+    def __post_init__(self) -> None:
+        validate_windows_home_preflight(
+            self.windows_home_preflight, provider=self.provider, codex_home=self.codex_home,
+        )
 
     @property
     def codex_config_profile(self) -> str:
@@ -538,6 +597,14 @@ class CodexJsonlParser:
                 self.final_message = message
                 data = {"text": message}
                 summary_value = message
+            elif item_type == "command_execution":
+                normalized_type = "command_completed"
+                code = item.get("exit_code")
+                code = code if type(code) is int else None
+                status = item.get("status")
+                status = status if isinstance(status, str) and status in {"completed", "failed", "in_progress"} else "unknown"
+                data = {"item_type": item_type, "exit_code": code, "status": status}
+                summary_value = f"Command completed: status={status}, exit_code={code}"
             else:
                 data = {"item_type": item_type} if isinstance(item_type, str) else {}
                 summary_value = f"Completed {item_type or 'item'}"
@@ -688,7 +755,6 @@ class CodexAdapter:
     provider = "codex"
     display_name = "Codex"
     command = "codex"
-    tested_cli_version = CODEX_TESTED_CLI_VERSION
     capabilities = AdapterCapabilities(
         attach=True,
         resume=True,
@@ -696,6 +762,7 @@ class CodexAdapter:
         cancel=True,
         fork=True,
         review=True,
+        manual_approval=True,
     )
 
     def profiles(self) -> tuple[AgentProfile, ...]:
@@ -775,6 +842,10 @@ class CodexAdapter:
             )
         if options.get("approve_for_me") and sandbox != "workspace-write":
             raise ValueError("approve_for_me requires the workspace-write sandbox")
+        if options.get("manual_approval"):
+            raise ValueError("manual_approval requires the app-server transport")
+        if options.get("approve_for_me") and options.get("ask_for_approval") == "never":
+            raise ValueError("approve_for_me conflicts with ask_for_approval=never")
         if options.get("color") == "always":
             raise ValueError("color=always is incompatible with the JSONL parser")
         if options.get("ephemeral") and native_session_id and action == "continue":
@@ -789,13 +860,18 @@ class CodexAdapter:
             )
 
         command = [*executable_prefix]
-        # Codex 0.153.0 accepts these two flags only at the root level when
-        # launching the non-interactive exec subcommand.
-        if "ask_for_approval" in options:
-            command.extend(("-a", options["ask_for_approval"]))
+        # Root -a is an interactive option, not inherited by exec. Pass the
+        # typed request through exec's config layer without changing reviewer.
         if options.get("search"):
             command.append("--search")
-        command.extend(("exec", "--json", "-s", sandbox))
+        command.extend(("exec", "--json"))
+        # --approve-for-me selects workspace-write itself and conflicts with -s.
+        if not options.get("approve_for_me"):
+            command.extend(("-s", sandbox))
+        if "ask_for_approval" in options:
+            command.extend(
+                ("-c", "approval_policy=" + json.dumps(options["ask_for_approval"]))
+            )
         if profile.codex_config_profile:
             command.extend(("-p", profile.codex_config_profile))
         command.extend(("-C", cwd))

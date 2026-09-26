@@ -26,6 +26,9 @@ from urllib.parse import urlsplit, urlunsplit
 from . import __version__
 from .proxy import add_agent_proxy
 from .agent_catalog import AgentCatalog
+from .agent_diagnostics import launch_metadata
+from .agent_preflight import inspect_windows_codex_home
+from .agent_approvals import ManualApprovalParser, load_manual_profile
 from .agent_adapters import (
     AgentProfile,
     NormalizedEvent,
@@ -163,6 +166,8 @@ _LIGHTWEIGHT_TOOLS = frozenset(
         "agent_run_events",
         "agent_run_result",
         "agent_run_cancel",
+        "agent_approval_list",
+        "agent_approval_respond",
     }
 )
 
@@ -526,6 +531,14 @@ class _ManagedProcess:
                 result[f"{name}_truncated"] = gap or (start + len(chunk) < total)
                 result[f"{name}_cursor_gap"] = gap
             return result
+
+    def protocol_stdout(self, after_bytes: int, maximum: int) -> tuple[bytes, int, bool]:
+        """Internal raw stream for a strict, incremental JSON-RPC decoder."""
+        with self.lock:
+            base = max(0, self.stdout_total - len(self.stdout))
+            start = max(base, after_bytes)
+            chunk = bytes(self.stdout[start - base:start - base + maximum])
+            return chunk, start + len(chunk), after_bytes < base
 
     def send_input(self, text: str, close_stdin: bool = False) -> int:
         if not isinstance(text, str):
@@ -1523,6 +1536,7 @@ class TianChengService:
             allow_exec=operation == "exec" and decision.allow_exec,
             passthrough_env=self.passthrough_env,
             enable_jobs=False,
+            enable_agent_catalog=False,
             access_policy=AccessPolicy.default(root),
         )
         return scoped, relative
@@ -1564,6 +1578,7 @@ class TianChengService:
             None,
             passthrough_env=self.passthrough_env,
             enable_jobs=False,
+            enable_agent_catalog=False,
             access_policy=AccessPolicy.default(root),
         )
         return scoped, source_relative, destination_relative
@@ -3234,16 +3249,10 @@ class TianChengService:
                     discovered[name] = [*node, str(candidate)]
         # Require the npm-managed launcher.  It supplies
         # CODEX_MANAGED_PACKAGE_ROOT so the native runtime resolves its own
-        # codex-resources (sandbox setup helper and command runner), while the
-        # Codex Desktop app ships a different build of those same helpers.  The
-        # two provision one machine-wide Windows sandbox, so each build rejects
-        # the other's elevated-sandbox marker and every sandboxed command
-        # re-runs the elevated provisioning helper, raising a UAC prompt.  PATH
-        # order alone decides what ``which`` reports, so a Desktop update that
-        # prepends its bin directory would silently swap the build this service
-        # spawns; refuse it by location instead.  Leaving ``codex``
-        # undiscovered surfaces as an unavailable command, which is far easier
-        # to diagnose than a UAC prompt on every call.
+        # codex-resources (sandbox setup helper and command runner). Keep this
+        # service's launcher selection stable when Desktop updates change PATH.
+        # Different build numbers alone do not establish marker incompatibility
+        # or prevent CLI/Desktop coexistence; setup also depends on home state.
         codex_executable = shutil.which("codex") or shutil.which("codex.exe")
         if codex_executable:
             codex_path = Path(codex_executable).resolve()
@@ -3522,6 +3531,8 @@ class TianChengService:
         policy_root: Path | None = None,
         owner: str = "process",
         agent_proxy: bool = False,
+        agent_launch_context: Mapping[str, Any] | None = None,
+        windows_home_preflight_policy: str = "none",
     ) -> dict[str, Any]:
         if not self.allow_exec:
             raise PermissionError("Command execution is disabled; restart with --allow-exec")
@@ -3574,27 +3585,74 @@ class TianChengService:
             active = sum(record.process.poll() is None for record in self._processes.values())
             if active >= MAX_MANAGED_PROCESSES:
                 raise RuntimeError(f"At most {MAX_MANAGED_PROCESSES} managed processes may run")
-        process = subprocess.Popen(
-            prepared,
-            cwd=str(working_directory),
-            env=self._execution_environment(
-                include_passthrough_env=include_passthrough_env,
-                profile_credential_env=profile_credential_env,
-                overrides=environment_overrides,
-                codex_home=codex_home,
-                include_agent_proxy=owner == "agent_run" and agent_proxy,
-            ),
-            # Agent adapters pass the complete prompt as an argument.  Giving
-            # Codex/Claude an open pipe here makes them wait forever for
-            # additional stdin instead of starting the request.  General
-            # command sessions keep the pipe so process_input still works.
-            stdin=subprocess.PIPE if stdin_enabled else subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            shell=False,
-            creationflags=_CREATE_NO_WINDOW,
+        environment = self._execution_environment(
+            include_passthrough_env=include_passthrough_env,
+            profile_credential_env=profile_credential_env,
+            overrides=environment_overrides,
+            codex_home=codex_home,
+            include_agent_proxy=owner == "agent_run" and agent_proxy,
+        )
+        runtime_context = (
+            launch_metadata(
+                registered_prefix, environment, cwd=working_directory,
+                command_key=command_key, profile_home=codex_home,
+            )
+            if owner == "agent_run" else None
         )
         process_id = uuid.uuid4().hex
+        launch_started = time.perf_counter()
+        if runtime_context is not None:
+            runtime_context.update(agent_launch_context or {})
+            runtime_context["launch_id"] = process_id
+
+        def record_launch(state: str, error_type: str | None = None) -> None:
+            if runtime_context is not None:
+                self._record_audit_safely(
+                    tool="agent_launch",
+                    relative_path=self._managed_cwd_label(working_directory),
+                    success=state not in {"spawn_failed", "preflight_blocked"},
+                    duration_ms=(time.perf_counter() - launch_started) * 1000,
+                    state=state,
+                    error_type=error_type,
+                    runtime_context=runtime_context,
+                )
+
+        if runtime_context is not None and command_key == "codex":
+            runtime_context["windows_home_preflight_policy"] = windows_home_preflight_policy
+            if windows_home_preflight_policy == "none":
+                preflight = "not_requested"
+            elif os.name != "nt":
+                preflight = "not_applicable"
+            else:
+                # The policy comes from the registered profile, never run options.
+                assert codex_home is not None
+                preflight = inspect_windows_codex_home(Path(codex_home))
+            runtime_context["windows_home_preflight"] = preflight
+            if preflight not in {"not_requested", "not_applicable", "not_verified"}:
+                record_launch("preflight_blocked", "PermissionError")
+                raise PermissionError(
+                    f"Independent Codex home launch blocked: {preflight}. "
+                    "Host review is required; automatic sandbox setup was not started."
+                )
+        record_launch("prepared")
+        try:
+            process = subprocess.Popen(
+                prepared,
+                cwd=str(working_directory),
+                env=environment,
+                # Agent adapters pass the complete prompt as an argument.  Giving
+                # Codex/Claude an open pipe here makes them wait forever for
+                # additional stdin instead of starting the request.  General
+                # command sessions keep the pipe so process_input still works.
+                stdin=subprocess.PIPE if stdin_enabled else subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                shell=False,
+                creationflags=_CREATE_NO_WINDOW,
+            )
+        except OSError as exc:
+            record_launch("spawn_failed", type(exc).__name__)
+            raise
         record = _ManagedProcess(
             process_id,
             command_key,
@@ -3627,7 +3685,11 @@ class TianChengService:
             args=(record,),
             daemon=True,
         ).start()
-        return self._managed_process_status(record)
+        record_launch("spawned")
+        result = self._managed_process_status(record)
+        if runtime_context is not None:
+            result["runtime_context"] = runtime_context
+        return result
 
     def _get_managed_process(self, process_id: str) -> _ManagedProcess:
         if not isinstance(process_id, str) or not re.fullmatch(r"[0-9a-f]{32}", process_id):
@@ -4172,19 +4234,32 @@ class TianChengService:
         )
         if not prefix:
             raise RuntimeError(f"{adapter.display_name} executable is not available")
-        command = self.agent_profiles.build_command(
-            profile,
-            prefix,
-            prompt=prompt,
-            cwd=str(working_directory),
-            sandbox=session.sandbox,
-            native_session_id=session.native_session_id,
-            invocation_options=prepared_codex_options,
-            action=codex_action,
-        )
+        manual_approval = bool(prepared_codex_options.get("manual_approval"))
+        if manual_approval:
+            if session.provider != "codex" or codex_action != "continue":
+                raise ValueError("Manual approval requires a Codex continue run")
+            env = self._execution_environment(include_passthrough_env=False)
+            native_home = Path(codex_home or env.get("CODEX_HOME") or (Path(env.get("USERPROFILE") or str(Path.home())) / ".codex"))
+            parser = ManualApprovalParser(
+                prompt=prompt, cwd=str(working_directory), sandbox=session.sandbox,
+                config=load_manual_profile(native_home, profile.provider_profile),
+                options=prepared_codex_options, native_id=session.native_session_id,
+            )
+            command = [*prefix, "app-server"]
+        else:
+            parser = adapter.new_parser()
+            command = self.agent_profiles.build_command(
+                profile,
+                prefix,
+                prompt=prompt,
+                cwd=str(working_directory),
+                sandbox=session.sandbox,
+                native_session_id=session.native_session_id,
+                invocation_options=prepared_codex_options,
+                action=codex_action,
+            )
         if command[: len(prefix)] != prefix or len(command) <= len(prefix):
             raise RuntimeError("Agent adapter returned an invalid executable prefix")
-        parser = adapter.new_parser()
         started = self._start_managed_process_prepared(
             profile.command,
             command,
@@ -4199,12 +4274,22 @@ class TianChengService:
                 else None
             ),
             codex_home=str(codex_home) if codex_home is not None else None,
-            stdin_enabled=False,
+            windows_home_preflight_policy=profile.windows_home_preflight,
+            stdin_enabled=manual_approval,
             policy_root=(
                 None if session.policy_root is None else Path(session.policy_root)
             ),
             owner="agent_run",
             agent_proxy=session.proxy_enabled,
+            agent_launch_context={
+                "profile": session.profile,
+                "requested_sandbox": session.sandbox,
+                "requested_approval_policy": prepared_codex_options.get("ask_for_approval"),
+                "requested_auto_review": bool(prepared_codex_options.get("approve_for_me")),
+                "resolved_approval_policy": "not_observed",
+                "requested_additional_write_roots": list(prepared_codex_options.get("add_dirs", ())),
+                "resolved_sandbox_policy": "not_observed",
+            },
         )
         run = AgentRunState(
             new_run_id(),
@@ -4212,10 +4297,17 @@ class TianChengService:
             started["process_id"],
             parser=parser,
             invocation_summary=summarize_codex_options(effective_codex_options),
+            runtime_context=dict(started.get("runtime_context", {})),
             action=codex_action,
         )
         with self._agent_lock:
             session.runs[run.run_id] = run
+        if manual_approval:
+            try:
+                self._flush_manual_protocol(run)
+            except Exception:
+                self._stop_process(run.process_id, force=True)
+                raise
         initial_state = "running" if started["running"] else (
             "succeeded" if started.get("exit_code") == 0 else "failed"
         )
@@ -4232,6 +4324,8 @@ class TianChengService:
             "codex_options": dict(run.invocation_summary),
             "codex_action": run.action,
             "max_runtime_seconds": started["max_runtime_seconds"],
+            "runtime_context": dict(run.runtime_context),
+            "outcomes": self._agent_outcomes(run, started),
         }
 
     def _reauthorize_attached_session(self, session: AgentSessionState) -> None:
@@ -4278,6 +4372,15 @@ class TianChengService:
         if event is None:
             return
         with run.lock:
+            if event.type == "command_completed":
+                run.commands_observed += 1
+                code = event.data.get("exit_code")
+                if event.data.get("status") == "failed" or (type(code) is int and code != 0):
+                    run.command_failures += 1
+                elif type(code) is not int or event.data.get("status") != "completed":
+                    run.commands_unknown += 1
+            elif event.type == "error":
+                run.provider_errors_observed += 1
             run.events.append(event)
             overflow = len(run.events) - MAX_AGENT_EVENTS
             if overflow > 0:
@@ -4318,14 +4421,24 @@ class TianChengService:
             if profile.provider != session.provider or adapter.provider != session.provider:
                 raise RuntimeError("Agent session provider binding does not match its profile")
             display_name = adapter.display_name
-            output = self._process_output(
-                run.process_id,
-                stream="stdout",
-                max_bytes=MAX_COMMAND_OUTPUT_BYTES,
-                after_bytes=run.stdout_offset,
-            )
+            if isinstance(run.parser, ManualApprovalParser):
+                chunk, next_offset, gap = self._get_managed_process(run.process_id).protocol_stdout(
+                    run.stdout_offset, MAX_COMMAND_OUTPUT_BYTES,
+                )
+                output = {"stdout": run.parser.decode_chunk(chunk),
+                          "stdout_next_offset_bytes": next_offset, "stdout_cursor_gap": gap}
+            else:
+                output = self._process_output(
+                    run.process_id,
+                    stream="stdout",
+                    max_bytes=MAX_COMMAND_OUTPUT_BYTES,
+                    after_bytes=run.stdout_offset,
+                )
             run.stdout_offset = output["stdout_next_offset_bytes"]
             if output.get("stdout_cursor_gap"):
+                run.output_gap_observed = True
+                if isinstance(run.parser, ManualApprovalParser):
+                    run.parser.fail("Manual protocol output lost")
                 self._append_agent_event(
                     run,
                     run.parser.synthetic_event(
@@ -4342,6 +4455,22 @@ class TianChengService:
                 run.pending_text = ""
             for line in lines:
                 self._append_agent_event(run, run.parser.feed_line(line))
+            if isinstance(run.parser, ManualApprovalParser):
+                if len(run.pending_text.encode()) > 256 * 1024:
+                    self._append_agent_event(run, run.parser.fail("Manual protocol line too large"))
+                    run.pending_text = ""
+                try:
+                    if self._process_status(run.process_id)["running"]:
+                        self._flush_manual_protocol(run)
+                    else:
+                        run.parser.outgoing.clear()
+                except (RuntimeError, OSError):
+                    if not run.parser.done and self._process_status(run.process_id)["running"]:
+                        self._append_agent_event(run, run.parser.fail("Manual protocol connection closed"))
+                if run.parser.done in {"failed", "cancelled"}:
+                    run.terminal_override = run.parser.done
+                    run.error_summary = run.parser.failure_message
+                    self._stop_process(run.process_id, force=True)
             self._update_agent_native_binding(session, run)
 
             status = self._process_status(run.process_id)
@@ -4359,6 +4488,11 @@ class TianChengService:
                 run.state = "failed"
 
             terminal = run.state not in {"queued", "running"}
+            if terminal and isinstance(run.parser, ManualApprovalParser):
+                run.parser.pending.clear()
+                if run.state == "succeeded" and run.parser.done != "succeeded":
+                    run.state = "failed"
+                    run.error_summary = "App-server exited without a completed turn"
             if terminal and run.pending_text:
                 self._append_agent_event(run, run.parser.feed_line(run.pending_text))
                 run.pending_text = ""
@@ -4395,7 +4529,7 @@ class TianChengService:
                     self._append_agent_event(
                         run,
                         run.parser.synthetic_event(
-                            "completed", f"{display_name} run completed"
+                            "completed", f"{display_name} process exited successfully; task outcome is unverified"
                         ),
                     )
                 else:
@@ -4409,6 +4543,26 @@ class TianChengService:
                     )
                 run.terminal_event_emitted = True
             return status
+
+    @staticmethod
+    def _agent_outcomes(run: AgentRunState, status: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "process": {"state": run.state, "exit_code": status.get("exit_code")},
+            "provider_errors_observed": run.provider_errors_observed,
+            "commands": {
+                "status": (
+                    "failures_observed" if run.command_failures else
+                    "unknown" if not run.commands_observed or run.commands_unknown or run.output_gap_observed else
+                    "no_failures_observed"
+                ),
+                "completed_events": run.commands_observed,
+                "failed_events": run.command_failures,
+                "unknown_events": run.commands_unknown,
+                "output_gap_observed": run.output_gap_observed,
+                "coverage": "observed_codex_command_events_only",
+            },
+            "task": "unverified",
+        }
 
     def _agent_run_payload(
         self,
@@ -4432,12 +4586,66 @@ class TianChengService:
                 "error": run.error_summary,
                 "codex_options": dict(run.invocation_summary),
                 "codex_action": run.action,
+                "runtime_context": dict(run.runtime_context),
+                "outcomes": self._agent_outcomes(run, status),
+                "pending_approval_count": len(run.parser.pending) if isinstance(run.parser, ManualApprovalParser) else 0,
                 "created_at": _iso_timestamp(run.created_epoch),
                 "ended_at": _iso_timestamp(run.ended_epoch) if run.ended_epoch else None,
                 "runtime_seconds": status["runtime_seconds"],
                 "max_runtime_seconds": status["max_runtime_seconds"],
                 "exit_code": status.get("exit_code"),
             }
+
+    def _flush_manual_protocol(self, run: AgentRunState) -> None:
+        parser = run.parser
+        if not isinstance(parser, ManualApprovalParser) or parser.stdin_closed:
+            return
+        process = self._get_managed_process(run.process_id)
+        parser.expire()
+        if parser.done != "failed":
+            while parser.outgoing:
+                message = parser.outgoing.pop(0)
+                process.send_input(json.dumps(message, ensure_ascii=False) + "\n")
+        if parser.done:
+            parser.stdin_closed = True
+            process.send_input("", close_stdin=True)
+
+    def agent_approval_list(self, session_id: str, run_id: str) -> dict[str, Any]:
+        session, run = self._get_agent_run(session_id, run_id)
+        with session.lock, run.lock:
+            self._refresh_agent_run(session, run)
+            requests = run.parser.list_pending() if isinstance(run.parser, ManualApprovalParser) else []
+            if run.state in {"queued", "running"}:
+                self._flush_manual_protocol(run)
+            return {"session_id": session_id, "run_id": run_id, "state": run.state,
+                    "requests": requests, "count": len(requests)}
+
+    def agent_approval_respond(self, session_id: str, run_id: str,
+                               approval_id: str, decision: str) -> dict[str, Any]:
+        session, run = self._get_agent_run(session_id, run_id)
+        with session.lock, run.lock:
+            self._refresh_agent_run(session, run)
+            if session.closed or run.state not in {"queued", "running"}:
+                raise PermissionError("Approval run is no longer active")
+            if not isinstance(run.parser, ManualApprovalParser):
+                raise ValueError("Run is not using manual approval")
+            # A workspace grant revoked while approval was pending must not be
+            # resurrected by responding to the request.
+            self._agent_working_directory(session)
+            if session.conversation_ref is not None:
+                self._reauthorize_attached_session(session)
+            reply = run.parser.respond(approval_id, decision)
+            try:
+                self._flush_manual_protocol(run)
+            except (RuntimeError, OSError):
+                run.parser.fail("Approval response delivery failed")
+                self._stop_process(run.process_id, force=True)
+                raise RuntimeError("Approval response could not be delivered") from None
+            self._append_agent_event(run, run.parser.synthetic_event(
+                "approval_responded", "Approval decision submitted",
+                {"approval_id": approval_id, "decision": decision},
+            ))
+            return {"session_id": session_id, "run_id": run_id, **reply}
 
     def agent_run_inspect(self, session_id: str, run_id: str) -> dict[str, Any]:
         session, run = self._get_agent_run(session_id, run_id)

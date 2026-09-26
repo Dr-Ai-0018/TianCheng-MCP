@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 import subprocess
 import sys
@@ -300,3 +301,51 @@ def test_supervisor_check_reports_safe_effective_config(tmp_path: Path) -> None:
         "supervisor_enabled": True,
         "mcp_connection_max_ttl": "24h",
     }
+
+
+@pytest.mark.parametrize("encoding", ["ascii", "gbk", "utf-8"])
+def test_tee_preserves_failure_detection_with_limited_output_encoding(tmp_path, encoding):
+    supervisor = TunnelSupervisor(
+        config=LauncherConfig(
+            tunnel_client=Path(sys.executable), profile_dir=None,
+            health_base_url="http://127.0.0.1:8080",
+            settings=SupervisorSettings.from_mapping(None),
+        ), profile="tee-test", state_path=tmp_path / "state.json",
+    )
+    supervisor.generation = 1
+    line = 'µ failure_source=client_internal upstream_response_received=false\n'
+    stream = io.StringIO(line + "following line\n")
+    raw_output = io.BytesIO()
+    output = io.TextIOWrapper(raw_output, encoding=encoding, errors="strict")
+    supervisor._tee(stream, output, 1)
+    assert stream.closed
+    assert supervisor.recover_event.is_set()
+    assert supervisor.failure_reason == "client_internal_without_upstream"
+    displayed = raw_output.getvalue().decode(encoding)
+    assert "following line" in displayed
+    assert ("µ" if encoding == "utf-8" else r"\xb5") in displayed
+
+
+@pytest.mark.parametrize("failure", [BrokenPipeError(), ValueError("closed")])
+@pytest.mark.parametrize("phase", ["write", "flush"])
+def test_tee_keeps_draining_after_output_breaks(tmp_path, failure, phase):
+    class BrokenOutput:
+        def write(self, line):
+            if phase == "write":
+                raise failure
+        def flush(self):
+            if phase == "flush":
+                raise failure
+    supervisor = TunnelSupervisor(
+        config=LauncherConfig(
+            tunnel_client=Path(sys.executable), profile_dir=None,
+            health_base_url="http://127.0.0.1:8080",
+            settings=SupervisorSettings.from_mapping(None),
+        ), profile="tee-test", state_path=tmp_path / "state.json",
+    )
+    supervisor.generation = 2
+    stream = io.StringIO("ordinary line\nfailure_source=client_internal upstream_response_received=false\n")
+    supervisor._tee(stream, BrokenOutput(), 2)
+    assert stream.closed
+    assert supervisor.recover_event.is_set()
+    assert supervisor.failure_reason == "client_internal_without_upstream"
