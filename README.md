@@ -4,7 +4,7 @@
 `<WORKSPACE>` 工作区内的文件与本地 Git 能力；服务端代码、依赖和审计日志位于
 仓库目录，不在 ChatGPT 可写工作区内。
 
-当前版本：`0.12.0`。依赖锁定到官方维护的 MCP Python SDK `2.1.0`，使用当前
+当前版本：`0.13.0`。依赖锁定到官方维护的 MCP Python SDK `2.1.0`，使用当前
 `MCPServer`、`MCPServer.tool()`、`ToolAnnotations` 与 stdio transport API。
 
 - MCP Python SDK：<https://github.com/modelcontextprotocol/python-sdk/tree/v2.1.0>
@@ -622,6 +622,15 @@ attach 共用 Codex 已验证的进程、超时、取消、事件分页和 sourc
 业务环境变量只进入 `auth.mode="env"` 的 Codex profile，不会透传给默认走本机登录态的
 `claude-default`。当前只完成
 fake Claude/合成 history 验证；真实模型 smoke 尚未自动执行。
+
+Claude 命令执行可由宿主在 v2 `agent-profiles.json` 中为单独的 Claude profile 设置
+`"claude_command_mode": "trusted-shell"`；缺省 `off`，`claude-default` 保持无 Bash。
+该档位要求服务端开启命令执行、会话使用 `workspace-write`；外部工作目录还要求对应
+access-policy 规则显式 `allow_exec=true`。会话创建及每轮启动都会核验，外部规则热重载撤销
+执行权限时会停止受影响的正在运行的会话。远程 `agent_session`/`agent_run` 无法覆盖该档位。
+`workspace_info`、会话及运行状态显示档位；在 Windows 原生环境中，`trusted-shell` 是
+以宿主用户身份执行命令，**不是**文件系统隔离。工作目录和路径白名单不能阻止 Bash 访问
+其他宿主可访问的路径。需要这个能力时应由宿主创建独立的 `claude-trusted` profile，按需选用。
 
 0.9e 增加 local-only source admin 与 `tc` 菜单入口。CLI/version probe 只执行有界
 `--version`，不发送模型请求；source 增删启停全部复用生产 validator 与原子保存，ACL 收紧

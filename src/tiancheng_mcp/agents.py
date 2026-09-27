@@ -50,6 +50,7 @@ _PROFILE_FIELDS_V2 = {
     "windows_home_preflight",
     "auth",
     "enabled",
+    "claude_command_mode",
 }
 
 
@@ -126,6 +127,11 @@ def load_agent_profile_definitions(path: str | Path) -> AgentProfileConfig:
         windows_home_preflight = validate_windows_home_preflight(
             raw.get("windows_home_preflight", "none"), provider=provider, codex_home=codex_home,
         )
+        claude_command_mode = raw.get("claude_command_mode", "off")
+        if not isinstance(claude_command_mode, str) or claude_command_mode not in {"off", "trusted-shell"}:
+            raise ValueError(f"Invalid claude_command_mode for agent profile {name}")
+        if provider != "claude-code" and claude_command_mode != "off":
+            raise ValueError(f"claude_command_mode requires provider=claude-code for {name}")
         enabled = raw.get("enabled", True)
         if not isinstance(enabled, bool):
             raise ValueError(f"Invalid enabled flag for agent profile {name}")
@@ -166,6 +172,7 @@ def load_agent_profile_definitions(path: str | Path) -> AgentProfileConfig:
                 "credential_env": credential_env,
                 "auth_mode": auth_mode,
                 "enabled": enabled,
+                "claude_command_mode": claude_command_mode,
             }
         )
     return AgentProfileConfig(tuple(definitions), inherit_defaults=inherit_defaults)
@@ -288,6 +295,7 @@ class AgentProfileRegistry:
                     windows_home_preflight=windows_home_preflight,
                     credential_env=credential_env,
                     auth_mode=str(auth_mode),
+                    claude_command_mode=definition.get("claude_command_mode", "off"),
                 )
                 self._profiles[profile.name] = profile
                 self._profile_adapters[profile.name] = adapter
@@ -355,6 +363,10 @@ class AgentProfileRegistry:
                 "auth_mode": profile.auth_mode,
                 "runtime_home_isolated": profile.codex_home is not None,
                 "windows_home_preflight": profile.windows_home_preflight,
+                **(
+                    {"claude_command_mode": profile.claude_command_mode}
+                    if profile.provider == "claude-code" else {}
+                ),
             }
             for profile in sorted(self._profiles.values(), key=lambda item: item.name)
         )
@@ -446,6 +458,7 @@ class AgentSessionState:
     profile: str
     cwd: str
     sandbox: str
+    claude_command_mode: str = "off"
     proxy_enabled: bool = False
     provider: str = "codex"
     runtime_home_isolated: bool = False

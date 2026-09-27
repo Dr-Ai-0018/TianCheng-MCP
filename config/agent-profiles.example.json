@@ -11,6 +11,15 @@
       }
     },
     {
+      "name": "claude-trusted",
+      "provider": "claude-code",
+      "provider_profile": "local-default",
+      "claude_command_mode": "trusted-shell",
+      "auth": {
+        "mode": "existing-login"
+      }
+    },
+    {
       "name": "codex-isolated",
       "provider": "codex",
       "provider_profile": "isolated",

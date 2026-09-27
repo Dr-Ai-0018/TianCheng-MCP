@@ -565,6 +565,130 @@ def test_claude_profile_command_is_server_owned_restricted_and_bounded() -> None
             sandbox="read-only",
         )
 
+    trusted_registry = AgentProfileRegistry(
+        {"claude": ["claude"]},
+        profile_definitions=({
+            "name": "claude-default", "provider": "claude-code",
+            "provider_profile": "local-default", "claude_command_mode": "trusted-shell",
+        },),
+    )
+    trusted = trusted_registry.get("claude-default")
+    trusted_command = trusted_registry.build_command(
+        trusted, ["C:/tools/claude.exe"], prompt="test", cwd="E:/ExampleWorkspace",
+        sandbox="workspace-write",
+    )
+    assert trusted_command[trusted_command.index("--tools") + 1].endswith(",Bash")
+    assert trusted_command[-2:] == ["--allowedTools", "Bash"]
+    with pytest.raises(PermissionError, match="workspace-write"):
+        trusted_registry.build_command(
+            trusted, ["C:/tools/claude.exe"], prompt="test", cwd="E:/ExampleWorkspace",
+            sandbox="read-only",
+        )
+
+
+def test_claude_trusted_shell_requires_host_and_external_exec(workspace, tmp_path) -> None:
+    service = TianChengService(
+        workspace, tmp_path / "audit", allow_exec=True,
+        access_policy=AccessPolicy.default(workspace),
+        agent_source_policy=AgentSourcePolicy.empty(), enable_agent_catalog=False,
+    )
+    service.agent_profiles = AgentProfileRegistry(
+        {"claude": [sys.executable]},
+        profile_definitions=({
+            "name": "claude-trusted", "provider": "claude-code",
+            "provider_profile": "local-default", "claude_command_mode": "trusted-shell",
+        },),
+    )
+    try:
+        with pytest.raises(PermissionError, match="workspace-write"):
+            service.agent_session_create(profile="claude-trusted", sandbox="read-only")
+        created = service.agent_session_create(profile="claude-trusted")
+        assert created["claude_command_mode"] == "trusted-shell"
+        assert created["claude_command_scope"] == "host-user"
+        external = tmp_path / "external"
+        external.mkdir()
+        service.access_policy = AccessPolicy(
+            workspace, [AccessRule(workspace, "full"), AccessRule(external, "full")],
+        )
+        with pytest.raises(PermissionError, match="does not allow"):
+            service.agent_session_create(profile="claude-trusted", cwd=str(external))
+        service.access_policy = AccessPolicy(
+            workspace, [AccessRule(workspace, "full"), AccessRule(external, "full", allow_exec=True)],
+        )
+        external_session = service.agent_session_create(profile="claude-trusted", cwd=str(external))
+        service.access_policy = AccessPolicy(
+            workspace, [AccessRule(workspace, "full"), AccessRule(external, "full")],
+        )
+        with pytest.raises(PermissionError, match="does not allow"):
+            service.agent_run_start(external_session["session_id"], "must not launch")
+        service.agent_profiles._profiles["claude-trusted"] = replace(
+            service.agent_profiles.get("claude-trusted"), claude_command_mode="off"
+        )
+        with pytest.raises(PermissionError, match="profile changed"):
+            service.agent_run_start(created["session_id"], "must not launch")
+    finally:
+        service.shutdown()
+
+
+def test_claude_trusted_shell_stops_on_exec_policy_reload(workspace, tmp_path) -> None:
+    external = tmp_path / "external"
+    external.mkdir()
+    policy_path = tmp_path / "access-policy.json"
+    allowed = AccessPolicy(
+        workspace, [AccessRule(workspace, "full"), AccessRule(external, "full", allow_exec=True)],
+    )
+    policy_path.write_text(json.dumps(allowed.to_payload()), encoding="utf-8")
+    script = tmp_path / "slow_claude.py"
+    script.write_text("import time; time.sleep(30)\n", encoding="utf-8")
+    prefix = [sys.executable, str(script)]
+    service = TianChengService(
+        workspace, tmp_path / "audit", allow_exec=True,
+        access_policy_path=policy_path,
+        agent_source_policy=AgentSourcePolicy.empty(), enable_agent_catalog=False,
+    )
+    service._agent_only_commands["claude"] = prefix
+    service.agent_profiles = AgentProfileRegistry(
+        {"claude": prefix},
+        profile_definitions=({
+            "name": "claude-trusted", "provider": "claude-code",
+            "provider_profile": "local-default", "claude_command_mode": "trusted-shell",
+        },),
+    )
+    try:
+        session = service.agent_session_create(profile="claude-trusted", cwd=str(external))
+        started = service.agent_run_start(session["session_id"], "wait")
+        assert started["state"] == "running"
+        revoked = AccessPolicy(
+            workspace, [AccessRule(workspace, "full"), AccessRule(external, "full")],
+        )
+        policy_path.write_text(json.dumps(revoked.to_payload()), encoding="utf-8")
+        assert service.reload_access_policy()["revoked_claude_runs"] == 1
+        assert service.reload_access_policy()["revoked_claude_runs"] == 0
+        assert service.agent_run_inspect(session["session_id"], started["run_id"])["state"] == "cancelled"
+    finally:
+        service.shutdown()
+
+
+@pytest.mark.parametrize(
+    ("provider", "mode"),
+    (("claude-code", "approved-tools"), ("claude-code", ["trusted-shell"]),
+     ("codex", "trusted-shell")),
+)
+def test_claude_command_profile_config_rejects_invalid_modes(
+    tmp_path, provider, mode
+) -> None:
+    config = tmp_path / "profiles.json"
+    config.write_text(json.dumps({
+        "version": 2, "inherit_defaults": True,
+        "profiles": [{
+            "name": "agent-example", "provider": provider,
+            "provider_profile": "local-default", "auth": {"mode": "existing-login"},
+            "claude_command_mode": mode,
+        }],
+    }), encoding="utf-8")
+    with pytest.raises(ValueError, match="claude_command_mode"):
+        load_agent_profile_definitions(config)
+
 
 def test_claude_stream_json_parser_ignores_tool_payloads_and_redacts() -> None:
     parser = ClaudeJsonlParser()

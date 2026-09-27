@@ -1914,6 +1914,8 @@ function Show-AgentSourceMenu {
     while ($true) {
         if (-not [Console]::IsOutputRedirected) { Clear-Host }
         Write-Host "`n本地 Agent / 会话源管理" -ForegroundColor Cyan
+        Write-Host 'Claude 命令档位由本机 profile 决定；workspace_info 显示当前加载值。' -ForegroundColor DarkGray
+        Write-Host 'trusted-shell 可运行宿主命令；Windows 原生环境不保证项目路径隔离。' -ForegroundColor DarkYellow
         [void](Show-AgentSourceState -Config $Config)
         Write-Host '  1. 添加固定 provider 会话源'
         Write-Host '  2. 启用 / 禁用 source'

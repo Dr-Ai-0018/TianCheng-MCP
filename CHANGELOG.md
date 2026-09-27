@@ -8,6 +8,15 @@
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-09-27
+
+### Added
+
+- Claude Code profile 新增宿主配置的 `claude_command_mode=off|trusted-shell`；默认 `off`。
+  显式可信档位可在 `workspace-write` 会话中运行 Bash，外部工作目录还需 `allow_exec`。
+  权限在创建及每轮启动时检查，热重载撤销外部执行规则会停止正在运行的会话。
+  Windows 原生 Bash 按宿主用户权限执行，不提供项目路径隔离。
+
 ## [0.12.0] - 2026-09-26
 
 ### Added

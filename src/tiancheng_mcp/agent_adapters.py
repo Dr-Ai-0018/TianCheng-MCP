@@ -473,8 +473,15 @@ class AgentProfile:
 
     # Opt-in legacy Windows state screening, not the effective native backend.
     windows_home_preflight: str = "none"
+    # Explicit host-owned Claude capability. It is independent of the file
+    # sandbox and never accepted from an agent_session/agent_run request.
+    claude_command_mode: str = "off"
 
     def __post_init__(self) -> None:
+        if not isinstance(self.claude_command_mode, str) or self.claude_command_mode not in {"off", "trusted-shell"}:
+            raise ValueError("claude_command_mode must be off or trusted-shell")
+        if self.provider != "claude-code" and self.claude_command_mode != "off":
+            raise ValueError("claude_command_mode requires provider=claude-code")
         validate_windows_home_preflight(
             self.windows_home_preflight, provider=self.provider, codex_home=self.codex_home,
         )
@@ -1017,6 +1024,10 @@ class ClaudeCodeAdapter:
                 "Claude Code actions are not part of the Codex-first release"
             )
         permission_mode, tools = self._SANDBOX_POLICY[sandbox]
+        if profile.claude_command_mode == "trusted-shell":
+            if sandbox != "workspace-write":
+                raise PermissionError("Claude trusted-shell requires workspace-write")
+            tools += ",Bash"
         command = [
             *executable_prefix,
             "-p",
@@ -1038,6 +1049,10 @@ class ClaudeCodeAdapter:
             "--tools",
             tools,
         ]
+        if profile.claude_command_mode == "trusted-shell":
+            # --tools only makes Bash available. Without --allowedTools,
+            # headless -p denies commands that require permission.
+            command.extend(("--allowedTools", "Bash"))
         if native_session_id:
             command.extend(("--resume", native_session_id))
         return command

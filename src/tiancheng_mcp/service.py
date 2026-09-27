@@ -1208,7 +1208,39 @@ class TianChengService:
         loaded = self._load_access_policy()
         self.access_policy = loaded
         self.external_grants.access_policy = loaded
-        return {"reloaded": True, **loaded.summary()}
+        revoked_runs = self._stop_revoked_claude_command_runs()
+        return {"reloaded": True, "revoked_claude_runs": revoked_runs, **loaded.summary()}
+
+    def _stop_revoked_claude_command_runs(self) -> int:
+        """Apply a hot policy revocation to already running trusted shells."""
+
+        with self._agent_lock:
+            sessions = list(self._agent_sessions.values())
+        stopped = 0
+        for session in sessions:
+            if session.claude_command_mode != "trusted-shell":
+                continue
+            with session.lock:
+                try:
+                    profile = self.agent_profiles.get(session.profile)
+                    self._agent_working_directory(session)
+                    self._authorize_claude_command_session(session, profile)
+                except (PermissionError, FileNotFoundError, ValueError, WorkspaceSecurityError):
+                    for run in session.runs.values():
+                        with run.lock:
+                            if run.state not in {"queued", "running"}:
+                                continue
+                            run.cancelled = True
+                            run.terminal_override = "cancelled"
+                            run.state = "cancelled"
+                            run.error_summary = "Claude command permission revoked"
+                            run.ended_epoch = time.time()
+                        try:
+                            self._stop_process(run.process_id, force=True)
+                        except (FileNotFoundError, RuntimeError):
+                            pass
+                        stopped += 1
+        return stopped
 
     def _require_policy_hot_reload(self) -> None:
         if not self.allow_policy_hot_reload:
@@ -3897,6 +3929,25 @@ class TianChengService:
         scoped = WorkspaceJail(root, create=False)
         return scoped.resolve(session.cwd, must_exist=True, expect="directory")
 
+    def _authorize_claude_command_session(
+        self, session: AgentSessionState, profile: AgentProfile
+    ) -> None:
+        """Authorize the host-level shell capability at creation and each run."""
+
+        if session.claude_command_mode != profile.claude_command_mode:
+            raise PermissionError("Claude command profile changed; create a new session")
+        if session.claude_command_mode == "off":
+            return
+        if session.provider != "claude-code" or session.sandbox != "workspace-write":
+            raise PermissionError("Claude trusted-shell requires workspace-write")
+        if not self.allow_exec:
+            raise PermissionError("Claude trusted-shell requires host command execution")
+        if session.policy_root is not None:
+            cwd = self._agent_working_directory(session)
+            decision = self.access_policy.authorize(cwd, "exec")
+            if decision.requires_approval or str(decision.rule_path) != session.policy_root:
+                raise PermissionError("Agent working directory no longer allows exec")
+
     def _resolve_codex_option_path(
         self,
         session: AgentSessionState,
@@ -4009,6 +4060,7 @@ class TianChengService:
             profile=selected.name,
             cwd=stored_cwd,
             sandbox=sandbox,
+            claude_command_mode=selected.claude_command_mode,
             proxy_enabled=self._session_proxy_enabled(use_proxy),
             provider=selected.provider,
             runtime_home_isolated=selected.codex_home is not None,
@@ -4016,6 +4068,7 @@ class TianChengService:
             codex_defaults=normalized_defaults,
         )
         self._prepare_codex_options(session, session.codex_defaults)
+        self._authorize_claude_command_session(session, selected)
         with self._agent_lock:
             if len(self._agent_sessions) >= MAX_AGENT_SESSIONS:
                 raise RuntimeError(
@@ -4072,6 +4125,7 @@ class TianChengService:
             cwd=stored_cwd,
             policy_root=policy_root,
             sandbox=sandbox,
+            claude_command_mode=selected.claude_command_mode,
             proxy_enabled=self._session_proxy_enabled(use_proxy),
             provider=selected.provider,
             runtime_home_isolated=selected.codex_home is not None,
@@ -4081,6 +4135,7 @@ class TianChengService:
             codex_defaults=normalized_defaults,
         )
         self._prepare_codex_options(session, session.codex_defaults)
+        self._authorize_claude_command_session(session, selected)
         with self._agent_lock:
             if len(self._agent_sessions) >= MAX_AGENT_SESSIONS:
                 raise RuntimeError(
@@ -4116,6 +4171,10 @@ class TianChengService:
             "cwd_policy_root": session.policy_root,
             "cwd_scope": "workspace" if session.policy_root is None else "access-policy",
             "sandbox": session.sandbox,
+            "claude_command_mode": session.claude_command_mode,
+            "claude_command_scope": (
+                "host-user" if session.claude_command_mode == "trusted-shell" else "none"
+            ),
             "proxy_enabled": session.proxy_enabled,
             "native_session_id": session.native_session_id,
             "origin": "catalog" if session.conversation_ref else "new",
@@ -4220,6 +4279,7 @@ class TianChengService:
         if session.conversation_ref is not None:
             self._reauthorize_attached_session(session)
         working_directory = self._agent_working_directory(session)
+        self._authorize_claude_command_session(session, profile)
         codex_home = self._authorize_agent_codex_home(profile)
         effective_codex_options = merge_codex_options(
             session.codex_defaults,
@@ -4283,6 +4343,7 @@ class TianChengService:
             agent_proxy=session.proxy_enabled,
             agent_launch_context={
                 "profile": session.profile,
+                "claude_command_mode": session.claude_command_mode,
                 "requested_sandbox": session.sandbox,
                 "requested_approval_policy": prepared_codex_options.get("ask_for_approval"),
                 "requested_auto_review": bool(prepared_codex_options.get("approve_for_me")),
@@ -4325,6 +4386,7 @@ class TianChengService:
             "codex_action": run.action,
             "max_runtime_seconds": started["max_runtime_seconds"],
             "runtime_context": dict(run.runtime_context),
+            "claude_command_mode": session.claude_command_mode,
             "outcomes": self._agent_outcomes(run, started),
         }
 
@@ -4587,6 +4649,7 @@ class TianChengService:
                 "codex_options": dict(run.invocation_summary),
                 "codex_action": run.action,
                 "runtime_context": dict(run.runtime_context),
+                "claude_command_mode": session.claude_command_mode,
                 "outcomes": self._agent_outcomes(run, status),
                 "pending_approval_count": len(run.parser.pending) if isinstance(run.parser, ManualApprovalParser) else 0,
                 "created_at": _iso_timestamp(run.created_epoch),
