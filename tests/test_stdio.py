@@ -18,10 +18,13 @@ def _structured(result: object) -> dict:
     return value
 
 
-def _isolated_server_config_args(tmp_path: Path) -> list[str]:
+def _isolated_server_config_args(
+    tmp_path: Path, access_policy: Path | None = None
+) -> list[str]:
     # A stdio server is a separate process, so pytest's in-process fixtures do
     # not protect it from ignored, machine-owned config in the source checkout.
     return [
+        "--access-policy", str(access_policy or tmp_path / "isolated-access-policy.json"),
         "--agent-sources", str(tmp_path / "isolated-agent-sources.json"),
         "--agent-catalog", str(tmp_path / "isolated-catalog.sqlite3"),
         "--agent-profiles", str(tmp_path / "isolated-agent-profiles.json"),
@@ -490,9 +493,7 @@ async def test_static_policy_external_tools_accept_absolute_paths(
             "--audit-dir",
             str(tmp_path / "policy-audit"),
             "--allow-external-grants",
-            "--access-policy",
-            str(policy),
-            *_isolated_server_config_args(tmp_path),
+            *_isolated_server_config_args(tmp_path, policy),
         ],
         cwd=str(Path(__file__).resolve().parents[1]),
         encoding="utf-8",
@@ -567,8 +568,8 @@ async def test_static_policy_read_only_external_stdio_smoke(
         args=[
             "-m", "tiancheng_mcp", "--workspace", str(workspace),
             "--audit-dir", str(tmp_path / "readonly-audit"),
-            "--allow-external-grants", "--access-policy", str(policy),
-            *_isolated_server_config_args(tmp_path),
+            "--allow-external-grants",
+            *_isolated_server_config_args(tmp_path, policy),
         ],
         cwd=str(Path(__file__).resolve().parents[1]),
         encoding="utf-8",

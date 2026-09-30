@@ -115,6 +115,19 @@ def test_catalog_refresh_indexes_only_bounded_metadata(tmp_path: Path) -> None:
     assert inspected == records["codex"]
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX case-sensitive paths")
+def test_posix_catalog_keeps_case_distinct_files(tmp_path: Path) -> None:
+    workspace, policy, codex_root, _ = _catalog_fixture(tmp_path)
+    session_dir = codex_root / "2026" / "08" / "29"
+    for name in ("rollout-Case.jsonl", "rollout-case.jsonl"):
+        _write_codex(session_dir / name, "same-session-id", workspace)
+    catalog = AgentCatalog(tmp_path / "state" / "catalog.sqlite3", workspace)
+    assert catalog.refresh(policy, "src_codex_test")["parsed_files"] == 2
+    records = catalog.list_records(policy, limit=10)["conversations"]
+    assert len(records) == 2
+    assert len({item["conversation_ref"] for item in records}) == 2
+
+
 def test_catalog_incremental_refresh_skips_unchanged_and_removes_deleted(
     tmp_path: Path, monkeypatch
 ) -> None:

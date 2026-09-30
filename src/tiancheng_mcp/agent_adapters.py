@@ -476,12 +476,22 @@ class AgentProfile:
     # Explicit host-owned Claude capability. It is independent of the file
     # sandbox and never accepted from an agent_session/agent_run request.
     claude_command_mode: str = "off"
+    # Pi model routing is fixed by a server-owned profile, never an MCP request.
+    pi_provider: str | None = None
+    pi_model: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.claude_command_mode, str) or self.claude_command_mode not in {"off", "trusted-shell"}:
             raise ValueError("claude_command_mode must be off or trusted-shell")
         if self.provider != "claude-code" and self.claude_command_mode != "off":
             raise ValueError("claude_command_mode requires provider=claude-code")
+        if self.provider == "pi":
+            if not self.pi_provider or not self.pi_model:
+                raise ValueError("Pi profiles require a provider and model")
+            if self.allowed_sandboxes != frozenset({"read-only"}):
+                raise ValueError("Pi profiles currently support read-only only")
+        elif self.pi_provider is not None or self.pi_model is not None:
+            raise ValueError("Pi model routing requires provider=pi")
         validate_windows_home_preflight(
             self.windows_home_preflight, provider=self.provider, codex_home=self.codex_home,
         )

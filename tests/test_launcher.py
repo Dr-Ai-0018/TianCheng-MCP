@@ -13,7 +13,8 @@ from scripts.local_runtime import launcher_config, powershell_path
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-POWERSHELL = Path(powershell_path(PROJECT_ROOT))
+pytestmark = pytest.mark.skipif(os.name != "nt", reason="Windows PowerShell launcher tests")
+POWERSHELL = Path(powershell_path(PROJECT_ROOT)) if os.name == "nt" else None
 _LOCAL_CONFIG = launcher_config(PROJECT_ROOT)
 _CONFIGURED_TUNNEL = _LOCAL_CONFIG.get("tunnelClient")
 REAL_TUNNEL_CLIENT = (

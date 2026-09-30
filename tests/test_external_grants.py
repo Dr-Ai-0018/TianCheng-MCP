@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
+import threading
+import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -36,6 +40,18 @@ def test_chat_approved_external_grant_read_write_and_revoke(tmp_path: Path) -> N
     service.revoke_external_access(grant_id)
     with pytest.raises(PermissionError):
         service.external_stat(grant_id, "new.txt")
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX path syntax and symlinks")
+def test_posix_grant_rejects_foreign_path_and_linked_ancestor(tmp_path: Path) -> None:
+    external = tmp_path / "external"
+    external.mkdir()
+    alias = tmp_path / "alias"
+    alias.symlink_to(external, target_is_directory=True)
+    service = TianChengService(tmp_path / "workspace", tmp_path / "audit", allow_external_grants=True)
+    for path in (r"C:\private", "//server/share", str(alias), str(alias / ".." / "external")):
+        with pytest.raises(WorkspaceSecurityError):
+            service.request_external_access(path, "read")
 
 
 def test_grant_absolute_paths_stay_inside_its_root(tmp_path: Path) -> None:
@@ -351,7 +367,16 @@ def test_revoke_external_grant_hides_completed_job_result(tmp_path: Path) -> Non
         service.shutdown()
 
 
-def test_expired_external_grant_cancels_running_job(tmp_path: Path) -> None:
+def test_expired_external_grant_cancels_running_job(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Expiry must follow the background handoff, rather than race the same
+    # one-second interactive timeout on a busy CI runner. Only the grant
+    # clock is controlled; job waits and the real reaper thread keep running.
+    grant_clock = [time.time()]
+    monkeypatch.setattr(
+        "tiancheng_mcp.grants.time", SimpleNamespace(time=lambda: grant_clock[0])
+    )
     external = tmp_path / "external"
     external.mkdir()
     service = TianChengService(
@@ -359,15 +384,19 @@ def test_expired_external_grant_cancels_running_job(tmp_path: Path) -> None:
         tmp_path / "audit",
         allow_external_grants=True,
         interactive_timeout_seconds=1,
+        access_policy_path=tmp_path / "access-policy.json",
     )
     try:
-        pending = service.request_external_access(str(external), "read", ttl_seconds=1)
+        pending = service.request_external_access(str(external), "read", ttl_seconds=60)
         grant = service.approve_external_access(
             str(pending["request_id"]), str(pending["challenge"]), "批准"
         )
         grant_id = str(grant["grant_id"])
 
+        started = threading.Event()
+
         def slow_operation():
+            started.set()
             while True:
                 event = service._cancel_event()
                 if event is not None and event.wait(0.01):
@@ -380,6 +409,9 @@ def test_expired_external_grant_cancels_running_job(tmp_path: Path) -> None:
         assert response["execution"] == "background"
         job_id = str(response["job_id"])
         assert service.jobs is not None
+        assert started.wait(2)
+        assert service.jobs.get(job_id).state == "running"
+        grant_clock[0] += 61
         assert service.jobs.get(job_id).done.wait(4)
         assert service.job_status(job_id)["state"] == "expired"
         with pytest.raises(PermissionError):

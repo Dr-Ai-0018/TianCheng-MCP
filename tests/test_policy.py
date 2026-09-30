@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
 import shutil
 import tempfile
 from pathlib import Path
@@ -76,6 +77,25 @@ def test_missing_rule_directory_uses_existing_parent(tmp_path: Path) -> None:
     decision = policy.explain(missing / "file.txt", "read")
     assert decision.allowed is True
     assert decision.rule_path == missing
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX path syntax and symlinks")
+def test_posix_policy_rejects_foreign_paths_and_linked_ancestors(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    external = tmp_path / "external"
+    workspace.mkdir()
+    external.mkdir()
+    alias = tmp_path / "alias"
+    alias.symlink_to(external, target_is_directory=True)
+    for path in (
+        r"C:\private",
+        r"\\server\share",
+        "//server/share",
+        str(alias),
+        str(alias / ".." / "external"),
+    ):
+        with pytest.raises(AccessPolicyError):
+            AccessPolicy(workspace, [AccessRule(workspace, "full"), AccessRule(Path(path), "read")])
 
 
 def test_policy_loader_rejects_unknown_fields_and_conflicts(tmp_path: Path) -> None:

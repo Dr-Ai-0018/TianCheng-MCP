@@ -11,10 +11,10 @@ import json
 import os
 import tempfile
 from dataclasses import dataclass
-from pathlib import Path, PureWindowsPath
+from pathlib import Path
 from typing import Any
 
-from .security import FILE_ATTRIBUTE_REPARSE_POINT, WorkspaceSecurityError
+from .security import FILE_ATTRIBUTE_REPARSE_POINT, WorkspaceSecurityError, is_native_absolute_path
 
 
 _MODES = frozenset({"browse", "read", "write", "full", "deny"})
@@ -93,13 +93,10 @@ def _canonical_path(raw: str, *, label: str) -> Path:
         raise AccessPolicyError(f"{label} must be a non-empty absolute path")
     if "\x00" in raw:
         raise AccessPolicyError(f"{label} cannot contain NUL bytes")
-    windows = PureWindowsPath(raw.replace("/", "\\"))
-    if not windows.is_absolute() or not windows.drive:
-        raise AccessPolicyError(f"{label} must be an absolute Windows path")
-    normalized = raw.replace("/", "\\")
-    if normalized.startswith(("\\\\?\\", "\\\\.\\")):
-        raise AccessPolicyError("Windows device paths are not allowed in access policy")
+    if not is_native_absolute_path(raw):
+        raise AccessPolicyError(f"{label} must be a safe absolute path")
     requested = Path(raw)
+    _reject_reparse_ancestors(requested)
     existing = requested
     missing: list[str] = []
     while not os.path.lexists(existing):

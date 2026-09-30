@@ -315,6 +315,18 @@ def _atomic_write_json(path: Path, payload: dict[str, object]) -> None:
 
 
 def _terminate_process_tree(process: subprocess.Popen[str]) -> None:
+    if os.name != "nt":
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        if process.poll() is None:
+            process.kill()
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            pass
+        return
     if process.poll() is not None:
         return
     if os.name == "nt":
@@ -483,6 +495,7 @@ class TunnelSupervisor:
             bufsize=1,
             shell=False,
             creationflags=_CREATE_NEW_PROCESS_GROUP,
+            start_new_session=os.name != "nt",
         )
         self.kill_job = _WindowsKillJob(self.process)  # type: ignore[arg-type]
         if os.name == "nt" and not self.kill_job.active:
@@ -501,6 +514,12 @@ class TunnelSupervisor:
             daemon=True,
             name="tunnel-stdout",
         ).start()
+        threading.Thread(
+            target=self._tee,
+            args=(self.process.stderr, sys.stderr, self.generation),
+            daemon=True,
+            name="tunnel-stderr",
+        ).start()
 
     def _spawn_with_recovery(self) -> bool:
         while not self._stop_requested():
@@ -516,13 +535,6 @@ class TunnelSupervisor:
                 if self._backoff("tunnel_client_spawn_failed"):
                     return False
         return False
-        threading.Thread(
-            target=self._tee,
-            args=(self.process.stderr, sys.stderr, self.generation),
-            daemon=True,
-            name="tunnel-stderr",
-        ).start()
-
     def _ready(self) -> bool:
         try:
             # The admin listener is loopback-only. Never send this probe to a

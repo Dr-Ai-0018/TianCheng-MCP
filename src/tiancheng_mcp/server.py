@@ -1222,7 +1222,7 @@ def create_server(service: TianChengService) -> MCPServer:
             )
 
         @mcp.tool(
-            description="Stop one managed process and its Windows child-process tree.",
+            description="Stop one managed process and its child-process tree.",
             annotations=DESTRUCTIVE,
         )
         def stop_process(process_id: str, force: bool = False) -> dict[str, Any]:

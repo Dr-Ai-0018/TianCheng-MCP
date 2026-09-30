@@ -1,10 +1,11 @@
 # TianCheng Local MCP
 
-面向 Windows 11 / PowerShell 7 的本地 stdio MCP Server。它只向 ChatGPT 暴露
+支持 Windows 11 / PowerShell 7 与原生 Linux 的本地 stdio MCP Server。
+默认 SAFE 模式只向 ChatGPT 暴露
 `<WORKSPACE>` 工作区内的文件与本地 Git 能力；服务端代码、依赖和审计日志位于
 仓库目录，不在 ChatGPT 可写工作区内。
 
-当前版本：`0.13.0`。依赖锁定到官方维护的 MCP Python SDK `2.1.0`，使用当前
+当前版本：`0.14.0`。依赖锁定到官方维护的 MCP Python SDK `2.1.0`，使用当前
 `MCPServer`、`MCPServer.tool()`、`ToolAnnotations` 与 stdio transport API。
 
 - MCP Python SDK：<https://github.com/modelcontextprotocol/python-sdk/tree/v2.1.0>
@@ -33,7 +34,64 @@ TianCheng Local MCP
 ```
 
 服务不需要 OAuth、HTTP Server、LLM API 或模型权限。stdout 只用于 MCP 协议；
-应用日志不写 stdout，审计日志写到项目自己的 `logs` 目录。
+应用日志不写 stdout。Windows 审计日志默认写到项目的 `logs` 目录，Linux 默认写到
+用户服务状态目录。
+
+### Linux 本地 stdio
+
+在 Linux 上使用 Python 3.13 与 `uv`，将工作区放在源码或安装目录之外：
+
+```sh
+uv sync --frozen --extra test
+./run-mcp.sh --workspace /absolute/path/to/workspace
+```
+
+这是前台 stdio 进程，由 MCP 客户端关闭输入流或 Ctrl+C 结束；不启动后台服务。
+也可以安装构建后的 wheel，再运行 `tiancheng-mcp --workspace ...`。默认 SAFE
+模式无需 Tunnel 或模型 API key；`--allow-exec`、外部授权和 Agent 能力需要单独启用。
+Linux 默认从 `~/.config/tiancheng-mcp` 读取服务配置，
+在 `~/.local/state/tiancheng-mcp` 保存审计与 Catalog 状态；设置
+`XDG_CONFIG_HOME` 或 `XDG_STATE_HOME` 后，分别改用该目录下的 `tiancheng-mcp` 子目录。
+服务自有目录必须由当前用户持有且权限为 `0700`。可以通过命令行参数逐项指定
+独立配置路径。Linux 上的工作区文件仍服从运行用户的系统权限，服务不会改写整棵
+工作区的权限。Agent 验收需要宿主事先配置可用的原生 CLI 和模型凭据。
+
+已在原生 Debian stdio 上验证 Codex Agent 的写入、续跑、取消、手动审批和关闭，
+以及 app-server 只读会话的实际拒写。可用以下入口重新核对只读拒写与可写对照；
+它会消耗真实模型额度，并在指定的测试目录保留合成 Git 工作区：
+
+```sh
+uv run python scripts/accept_linux_agent_readonly.py --test-root /absolute/test-dir
+```
+
+测试目录必须在源码树之外。脚本要求实际命令事件、独立随机标记和文件结果一致，
+缺少执行证据时返回非零；所有意外审批申请都取消，不接受提权。
+此入口使用独立 stdio，不更改在线 Tunnel 的 SAFE 配置。
+
+### Linux Tunnel 运行
+
+已在原生 Debian 13 上使用 OpenAI `tunnel-client v0.0.15` 的受管 runtime，
+通过 ChatGPT 开发者插件验证默认 SAFE 的工作区查询、合成文件写读、回收和恢复。
+客户端自身负责进程启动、状态和停止；没有设置开机自启。此处不启用 `--allow-exec`。
+
+先把 [示例配置](config/tunnel.linux.example.json) 复制到**工作区外**的私有目录，
+填写绝对路径、现有 Tunnel ID 和别名。`runtime_root`、审计及配置路径都应在
+MCP 工作区外；`client` 指向已核验的 Linux `tunnel-client` 可执行文件，
+`python` 指向安装了本项目的 Python。`key_file` 是仅由运行用户持有且不允许组/其他用户
+访问的普通文件，内容为单行 `CONTROL_PLANE_API_KEY=...`；不要把 key 写进 JSON、
+命令参数、仓库或工作区。运维脚本只输出选定的运行状态字段，不输出客户端原始日志。
+
+```sh
+python3 scripts/linux_tunnel_runtime.py connect --config /absolute/private/tunnel.json
+python3 scripts/linux_tunnel_runtime.py status  --config /absolute/private/tunnel.json
+python3 scripts/linux_tunnel_runtime.py stop    --config /absolute/private/tunnel.json
+```
+
+`connect` 创建或复用该别名，`status` 应显示 `runtime_state=ready` 且
+`process_running=true`、`ready=true`；`stop` 应显示 `runtime_state=stopped`。
+需恢复时再次运行 `connect`。脚本将 Tunnel 的 XDG 配置、状态和数据隔离在
+`runtime_root` 下。当前实现只提供可脚本化的 Linux 运维入口，尚未移植 Windows
+`tc.ps1` 的交互式菜单。Tunnel 连接成功不代表真实 Agent 或 DEV 能力已验收。
 
 ## 工具
 
@@ -54,7 +112,7 @@ TianCheng Local MCP
 `--allow-exec` 时，才额外注册 `git_remote_list/add/set_url/remove`、
 `git_clone/fetch/pull/push`、`run_command`，以及
 `start_process/process_status/process_output/process_input/list_processes/stop_process`、
-`agent_session/agent_run`，共 48 个工具。
+`agent_session/agent_run/agent_approval`，额外 18 个，总计 49 个工具。
 Dev Profile 会复用当前
 Windows 用户的 Git 配置、Git Credential Manager 和 GitHub CLI 登录；remote URL 不得
 内嵌密码或 token，`git credential*` 与 `gh auth token` 这类直接输出凭据的入口会被拒绝。
@@ -437,18 +495,18 @@ Claude runtime、steer/interaction 等能力仍会稳定拒绝。
 Agent Profile 名称与 Codex CLI 自己的 config profile 是两层不同概念。服务器内置
 `codex-default` 与 `claude-default`，两者复用各自 CLI 已有登录态，不绑定私人 provider 或
 凭据变量。可选的本机 `config/agent-profiles.json` 严格加载额外 profile；该文件不由 Git
-跟踪，结构参考 `config/agent-profiles.example.json`。v2 默认用 `inherit_defaults=true` 保留可用
+跟踪，结构参考 `config/agent-profiles.example.json`。v2/v3 默认用 `inherit_defaults=true` 保留可用
 provider 的内置 profile，再按同名覆盖、新名追加、`enabled=false` 禁用；因此只配置 Codex
 不会再误删内置 `claude-default`。配置文件缺失时安全回退到内置 profile，文件存在但字段、
 provider 或认证声明无效时则拒绝启动，不会静默降级。配置只允许声明 provider、真正传给
-Codex `-p` 的 `provider_profile`、专用 `codex_home`、`windows_home_preflight` 检查策略和受控 `auth`，不能声明 executable、
+Codex `-p` 的 `provider_profile`、Pi 的 `pi.provider`/`pi.model`、专用 `codex_home`、`windows_home_preflight` 检查策略和受控 `auth`，不能声明 executable、
 argv 或任意环境变量表。示例中的隔离 profile 展示了如何绑定独立 `CODEX_HOME`；调用方只能
 选择已经由服务端注册的名称，不能在 `agent_session` 或 `agent_run` 中提交、覆盖或读取这些绑定。
 该目录必须已经存在，且每次创建 session 和启动 run 时都要重新通过无审批的可写
 access-policy、系统/敏感/服务目录和 reparse 检查。`workspace_info.agent_profile_metadata`
 只返回 `runtime_home_isolated`、`auth_mode` 与 `windows_home_preflight` 策略，session inspect 只返回前者；两者都不暴露
 runtime home 路径、环境变量名或凭据。
-v1/v2 profile 配置均支持 `windows_home_preflight`，仅接受 `none`（省略时的默认值）和
+v1/v2/v3 profile 配置均支持 `windows_home_preflight`，仅接受 `none`（省略时的默认值）和
 `require-existing`。后者要求 `provider=codex` 且显式绑定 `codex_home`，由宿主在采用既有
 Windows elevated 状态布局时选择；它不推断或修改原生实际 backend，远程 session/run 不能覆盖。
 无效类型/值会拒绝加载，包括已禁用或 Provider 不可用的配置。
@@ -611,6 +669,18 @@ provider endpoint、hook/plugin/MCP、sandbox/approval 等敏感 `-c` 根也不�
 `codex exec ... resume <native_session_id> <prompt>`，继续沿用服务器 profile、sandbox、cwd、
 最小环境和 managed-process 限制。同一原生 JSONL 正常追加后可继续下一轮；source 被禁用、
 根或文件被替换、会话 id/cwd 绑定变化时立即 fail-closed。当前仍未配置或扫描真实 source。
+
+Pi Coding Agent 可通过服务端 v3 `agent-profiles.json` 显式注册。profile 的 `pi.provider`、
+`pi.model` 和 `auth.credential_env` 由宿主固定；本机 launcher 可用 `piCliEntry` 指定
+工作区外的绝对 `cli.js` 路径，服务用受信 Node 启动它。MCP 调用方只能选择 profile，
+不能指定入口、模型或密钥。当前 Pi 仅支持 `read-only` 会话中的**无工具单次推理**：
+固定关闭文件/命令工具、extensions、context files、skills 和 session 保存；不支持续接、
+历史 attach、Catalog discover，也不能读写项目文件。`read-only` 在这里是现有会话档位名称，
+并不表示 Pi 已拥有受隔离的只读文件工具。Windows 文件工具需要额外的进程级隔离与越界验收，
+尚未开放。长生成过程会发出稀疏状态事件，不转发中途正文或思考内容。
+public 示例使用占位 provider/model/key，不包含本机入口或凭据值。
+离线 WSL/bubblewrap 文件隔离探针位于 `scripts/probe_pi_wsl_isolation.sh`，仅用于合成工作区
+边界验证；它不启动模型推理，也不改变当前 Pi profile 的文件权限。
 
 0.9d 增加服务器自有 `claude-default` adapter/profile。Claude Code 只在 agent runtime 的
 独立 executable registry 中注册，不会因此成为任意 `run_command`。固定命令使用

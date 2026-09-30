@@ -44,3 +44,22 @@ jobs:
           name: pytest-results-${{ matrix.python-version }}
           path: pytest-results.xml
       - run: uv build
+
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          python-version: "3.13"
+      - run: uv lock --check
+      - run: uv sync --frozen --extra test
+      - run: uv run python -m pytest --junitxml=pytest-results-linux.xml
+      - name: Upload pytest report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytest-results-linux-3.13
+          path: pytest-results-linux.xml
+      - run: uv build

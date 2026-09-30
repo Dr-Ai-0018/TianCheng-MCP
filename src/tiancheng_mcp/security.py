@@ -28,6 +28,28 @@ class WorkspaceSecurityError(ValueError):
     """Raised when an input path cannot safely be accessed in the workspace."""
 
 
+def is_native_absolute_path(raw: str, *, allow_unc: bool = True) -> bool:
+    """Accept only an unambiguous absolute path for the current platform."""
+
+    if os.name == "nt":
+        normalized = raw.replace("/", "\\")
+        if normalized.startswith(("\\\\?\\", "\\\\.\\")):
+            return False
+        windows = PureWindowsPath(normalized)
+        return bool(windows.drive) and windows.is_absolute() and ".." not in windows.parts and (
+            allow_unc or not normalized.startswith("\\\\")
+        )
+    # Backslashes name ordinary POSIX files, but could conceal a Windows path
+    # supplied to a cross-platform policy. Double slash has implementation-
+    # defined meaning on POSIX, so exclude it from capability roots as well.
+    return (
+        raw.startswith("/")
+        and not raw.startswith("//")
+        and "\\" not in raw
+        and ".." not in raw.split("/")
+    )
+
+
 def _is_reparse_point(path: Path) -> bool:
     try:
         stat_result = path.lstat()

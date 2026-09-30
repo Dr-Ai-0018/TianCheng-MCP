@@ -186,7 +186,8 @@ def test_exec_codex_is_discoverable_when_installed(
     if "codex" not in enabled._exec_commands:
         pytest.skip("Codex CLI is unavailable")
     prepared = enabled._prepare_exec_command("codex", ["--version"])
-    assert prepared[0].casefold().endswith("codex.exe") or prepared[0].casefold().endswith("node.exe")
+    assert Path(prepared[0]).is_absolute()
+    assert Path(prepared[0]).is_file()
 
 
 def test_exec_output_is_bounded(workspace: Path, tmp_path: Path) -> None:
@@ -203,7 +204,6 @@ def test_exec_output_is_bounded(workspace: Path, tmp_path: Path) -> None:
     assert result["stdout_bytes_total"] > 1024
 
 
-@pytest.mark.skipif(os.name != "nt", reason="Windows Job Object test")
 def test_exec_timeout_kills_child_process_tree(workspace: Path, tmp_path: Path) -> None:
     enabled = TianChengService(workspace, tmp_path / "exec-audit", allow_exec=True)
     child_code = (

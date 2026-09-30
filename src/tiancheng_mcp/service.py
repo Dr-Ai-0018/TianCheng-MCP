@@ -10,6 +10,7 @@ import json
 import os
 import re
 import secrets
+import signal
 import shutil
 import subprocess
 import sys
@@ -28,6 +29,7 @@ from .proxy import add_agent_proxy
 from .agent_catalog import AgentCatalog
 from .agent_diagnostics import launch_metadata
 from .agent_preflight import inspect_windows_codex_home
+from .pi_adapter import PiJsonlParser
 from .agent_approvals import ManualApprovalParser, load_manual_profile
 from .agent_adapters import (
     AgentProfile,
@@ -282,6 +284,16 @@ class _WindowsKillJob:
 def _terminate_process_tree(process: subprocess.Popen[bytes]) -> None:
     """Terminate a process tree without invoking a command shell."""
 
+    if os.name != "nt":
+        # Every process started by this service has its own session. Kill the
+        # group even if its leader exited while a child kept running.
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        if process.poll() is None:
+            process.kill()
+        return
     if os.name == "nt":
         taskkill = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32/taskkill.exe"
         if taskkill.is_file():
@@ -379,6 +391,7 @@ def _run_process_bounded(
         stderr=subprocess.PIPE,
         shell=False,
         creationflags=_CREATE_NO_WINDOW,
+        start_new_session=os.name != "nt",
     )
     kill_job = _WindowsKillJob(process)
     assert process.stdout is not None
@@ -439,6 +452,8 @@ def _run_process_bounded(
     finally:
         # KILL_ON_JOB_CLOSE also refuses detached background children after the
         # main process exits normally. Exec commands may not leave daemons behind.
+        if os.name != "nt":
+            _terminate_process_tree(process)
         kill_job.close()
     stdout_thread.join(timeout=5)
     stderr_thread.join(timeout=5)
@@ -598,6 +613,7 @@ class TianChengService:
         allow_policy_hot_reload: bool = False,
         agent_profile_config_path: str | Path | None = None,
         agent_env_file: str | Path | None = None,
+        pi_cli_entry: str | Path | None = None,
         agent_proxy_environment: Mapping[str, str] | None = None,
         agent_proxy_mode: str | None = None,
     ) -> None:
@@ -656,9 +672,15 @@ class TianChengService:
                 self.rg_executable = str(resolved_rg)
             else:
                 raise WorkspaceSecurityError("Refusing ripgrep executable from inside workspace")
+        self._pi_cli_entry = pi_cli_entry
         self._exec_commands = self._discover_exec_commands() if allow_exec else {}
         self._agent_only_commands = (
             self._discover_agent_only_commands() if allow_exec else {}
+        )
+        pi_command = self._agent_only_commands.get("pi")
+        self._pi_cli_digest = (
+            hashlib.sha256(Path(pi_command[-1]).read_bytes()).digest()
+            if pi_command else None
         )
         project_root = Path(__file__).resolve().parents[2]
         profile_definitions = None
@@ -3316,6 +3338,24 @@ class TianChengService:
             claude_path = Path(claude_executable).resolve()
             if claude_path.suffix.casefold() not in {".cmd", ".ps1"}:
                 discovered["claude"] = [str(claude_path)]
+        if self._pi_cli_entry is not None:
+            entry = Path(self._pi_cli_entry)
+            if not entry.is_absolute() or entry.suffix.casefold() != ".js":
+                raise ValueError("Pi CLI entry must be an absolute JavaScript file")
+            if not entry.is_file():
+                raise ValueError("Pi CLI entry must be an existing regular file")
+            for component in (entry, *entry.parents):
+                if component.is_symlink() or (
+                    hasattr(component, "is_junction") and component.is_junction()
+                ):
+                    raise ValueError("Pi CLI entry cannot traverse a link or junction")
+            resolved = entry.resolve(strict=True)
+            if entry.is_relative_to(self.jail.root) or resolved.is_relative_to(self.jail.root):
+                raise PermissionError("Pi CLI entry cannot be inside the workspace")
+            node = self._exec_commands.get("node")
+            if not node:
+                raise RuntimeError("Pi CLI entry requires a trusted Node executable")
+            discovered["pi"] = [*node, str(resolved)]
         for command in discovered.values():
             executable = Path(command[0]).resolve()
             try:
@@ -3327,11 +3367,28 @@ class TianChengService:
             )
         return discovered
 
+    @staticmethod
+    def _windows_user_profile_credential(name: str) -> str | None:
+        """Resolve only a profile-declared user variable, without logging it."""
+        if os.name != "nt":
+            return None
+        try:
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment") as key:
+                value, kind = winreg.QueryValueEx(key, name)
+        except (OSError, ImportError):
+            return None
+        if (kind not in {winreg.REG_SZ, winreg.REG_EXPAND_SZ}
+            or not isinstance(value, str) or not value or "\x00" in value):
+            return None
+        return value
+
     def _execution_environment(
         self,
         *,
         include_passthrough_env: bool = True,
         profile_credential_env: str | None = None,
+        allow_user_credential_fallback: bool = False,
         overrides: Mapping[str, str] | None = None,
         codex_home: str | None = None,
         include_agent_proxy: bool = False,
@@ -3377,6 +3434,8 @@ class TianChengService:
             value = os.environ.get(profile_credential_env)
             if value is None:
                 value = self._agent_credentials.get(profile_credential_env)
+            if value is None and allow_user_credential_fallback:
+                value = self._windows_user_profile_credential(profile_credential_env)
             if value is not None:
                 environment[profile_credential_env] = value
         for name, value in (overrides or {}).items():
@@ -3514,6 +3573,8 @@ class TianChengService:
                 record.process.kill()
                 exit_code = record.process.wait(timeout=5)
         finally:
+            if os.name != "nt":
+                _terminate_process_tree(record.process)
             with record.stdin_lock:
                 if record.process.stdin is not None and not record.stdin_closed:
                     try:
@@ -3557,6 +3618,7 @@ class TianChengService:
         output_limit_bytes: int,
         include_passthrough_env: bool = True,
         profile_credential_env: str | None = None,
+        allow_user_credential_fallback: bool = False,
         environment_overrides: Mapping[str, str] | None = None,
         codex_home: str | None = None,
         stdin_enabled: bool = True,
@@ -3620,6 +3682,7 @@ class TianChengService:
         environment = self._execution_environment(
             include_passthrough_env=include_passthrough_env,
             profile_credential_env=profile_credential_env,
+            allow_user_credential_fallback=allow_user_credential_fallback,
             overrides=environment_overrides,
             codex_home=codex_home,
             include_agent_proxy=owner == "agent_run" and agent_proxy,
@@ -3681,6 +3744,7 @@ class TianChengService:
                 stderr=subprocess.PIPE,
                 shell=False,
                 creationflags=_CREATE_NO_WINDOW,
+                start_new_session=os.name != "nt",
             )
         except OSError as exc:
             record_launch("spawn_failed", type(exc).__name__)
@@ -4255,6 +4319,8 @@ class TianChengService:
             raise ValueError("codex_action must be continue, fork, or review")
         if session.provider != "codex" and codex_action != "continue":
             raise NotImplementedError("Codex actions require a Codex profile")
+        if session.provider == "pi" and session.runs:
+            raise NotImplementedError("Pi session continuation is not available yet")
         effective_max_runtime_seconds = _bounded_int(
             profile.max_runtime_seconds
             if max_runtime_seconds is None
@@ -4294,6 +4360,12 @@ class TianChengService:
         )
         if not prefix:
             raise RuntimeError(f"{adapter.display_name} executable is not available")
+        if session.provider == "pi":
+            # Recheck both path and contents before every run.
+            current = self._discover_agent_only_commands().get("pi")
+            if (current != prefix or self._pi_cli_digest is None or
+                hashlib.sha256(Path(prefix[-1]).read_bytes()).digest() != self._pi_cli_digest):
+                raise RuntimeError("Pi CLI entry changed since service startup")
         manual_approval = bool(prepared_codex_options.get("manual_approval"))
         if manual_approval:
             if session.provider != "codex" or codex_action != "continue":
@@ -4328,6 +4400,7 @@ class TianChengService:
             output_limit_bytes=profile.max_output_bytes,
             include_passthrough_env=False,
             profile_credential_env=profile.credential_env,
+            allow_user_credential_fallback=session.provider == "pi",
             environment_overrides=(
                 {"AWZ_ROUTE": str(prepared_codex_options["route"])}
                 if "route" in prepared_codex_options
@@ -4499,6 +4572,10 @@ class TianChengService:
             run.stdout_offset = output["stdout_next_offset_bytes"]
             if output.get("stdout_cursor_gap"):
                 run.output_gap_observed = True
+                if isinstance(run.parser, PiJsonlParser):
+                    run.terminal_override = "failed"
+                    run.error_summary = "Pi protocol output was lost"
+                    self._stop_process(run.process_id, force=True)
                 if isinstance(run.parser, ManualApprovalParser):
                     run.parser.fail("Manual protocol output lost")
                 self._append_agent_event(
@@ -4517,6 +4594,13 @@ class TianChengService:
                 run.pending_text = ""
             for line in lines:
                 self._append_agent_event(run, run.parser.feed_line(line))
+            if isinstance(run.parser, PiJsonlParser) and len(run.pending_text) > 256 * 1024:
+                run.parser.policy_violation = True
+                run.pending_text = ""
+            if isinstance(run.parser, PiJsonlParser) and run.parser.policy_violation:
+                run.terminal_override = "failed"
+                run.error_summary = "Pi emitted a forbidden tool or oversized protocol line"
+                self._stop_process(run.process_id, force=True)
             if isinstance(run.parser, ManualApprovalParser):
                 if len(run.pending_text.encode()) > 256 * 1024:
                     self._append_agent_event(run, run.parser.fail("Manual protocol line too large"))
@@ -4559,6 +4643,13 @@ class TianChengService:
                 self._append_agent_event(run, run.parser.feed_line(run.pending_text))
                 run.pending_text = ""
                 self._update_agent_native_binding(session, run)
+            if (terminal and isinstance(run.parser, PiJsonlParser)
+                and run.state == "succeeded"
+                and (not run.parser.done or run.parser.final_message is None
+                     or run.parser.reported_error or run.parser.policy_violation
+                     or run.output_gap_observed)):
+                run.state = "failed"
+                run.error_summary = "Pi did not produce a valid completed assistant response"
             if terminal and run.ended_epoch is None:
                 run.ended_epoch = time.time()
             if terminal and not run.terminal_event_emitted:

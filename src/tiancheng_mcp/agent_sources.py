@@ -11,12 +11,12 @@ from dataclasses import dataclass
 import hashlib
 import json
 import os
-from pathlib import Path, PureWindowsPath
+from pathlib import Path
 import re
 import tempfile
 from typing import Any, Callable
 
-from .security import FILE_ATTRIBUTE_REPARSE_POINT, WorkspaceJail
+from .security import FILE_ATTRIBUTE_REPARSE_POINT, WorkspaceJail, is_native_absolute_path
 
 
 AGENT_SOURCE_SCHEMA_VERSION = 1
@@ -104,12 +104,8 @@ def _canonical_source_root(raw: object, provider: str) -> Path:
         raise AgentSourcePolicyError("source root must be a non-empty absolute path")
     if "\x00" in raw:
         raise AgentSourcePolicyError("source root cannot contain NUL bytes")
-    normalized = raw.replace("/", "\\")
-    if normalized.startswith(("\\\\", "\\\\?\\", "\\\\.\\")):
-        raise AgentSourcePolicyError("UNC and Windows device paths are not allowed")
-    windows = PureWindowsPath(normalized)
-    if not windows.is_absolute() or not windows.drive:
-        raise AgentSourcePolicyError("source root must be an absolute Windows path")
+    if not is_native_absolute_path(raw, allow_unc=False):
+        raise AgentSourcePolicyError("source root must be a safe absolute path")
     requested = Path(raw)
     if not requested.exists() or not requested.is_dir():
         raise AgentSourcePolicyError("source root must be an existing directory")
@@ -176,7 +172,7 @@ class AgentSource:
         payload = "\x00".join(
             (
                 self.provider,
-                str(self.root).casefold(),
+                str(self.root).casefold() if os.name == "nt" else str(self.root),
                 str(self.root_device),
                 str(self.root_inode),
             )

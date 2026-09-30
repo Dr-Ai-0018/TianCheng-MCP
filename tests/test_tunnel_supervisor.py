@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -217,6 +219,39 @@ def test_supervisor_command_applies_ttl_and_profile_directory(tmp_path: Path) ->
         "--profile-dir",
         str(tmp_path / "profiles"),
     ]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX tunnel process group cleanup")
+def test_posix_supervisor_stop_kills_tunnel_child(monkeypatch, tmp_path: Path) -> None:
+    config = LauncherConfig(
+        tunnel_client=Path(sys.executable),
+        profile_dir=None,
+        health_base_url="http://127.0.0.1:8080",
+        settings=SupervisorSettings.from_mapping(None),
+    )
+    supervisor = TunnelSupervisor(config=config, profile="test", state_path=tmp_path / "state.json")
+    marker = tmp_path / "started"
+    survived = tmp_path / "survived"
+    child_code = (
+        "import pathlib,time; time.sleep(2); "
+        f"pathlib.Path({str(survived)!r}).write_text('bad')"
+    )
+    parent_code = (
+        "import pathlib,subprocess,sys,time; "
+        f"subprocess.Popen([sys.executable, '-c', {child_code!r}]); "
+        f"pathlib.Path({str(marker)!r}).write_text('ready'); time.sleep(30)"
+    )
+    monkeypatch.setattr(supervisor, "_command", lambda: [sys.executable, "-c", parent_code])
+    try:
+        supervisor._spawn()
+        deadline = time.monotonic() + 5
+        while not marker.exists():
+            assert time.monotonic() < deadline
+            time.sleep(0.05)
+    finally:
+        supervisor._stop_child()
+    time.sleep(3)
+    assert not survived.exists()
 
 
 def test_recovery_writes_diagnostic_log_and_state_fields(tmp_path: Path) -> None:

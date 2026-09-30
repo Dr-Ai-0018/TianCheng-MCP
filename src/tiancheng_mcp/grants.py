@@ -16,7 +16,7 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
 
-from .security import FILE_ATTRIBUTE_REPARSE_POINT, WorkspaceSecurityError
+from .security import FILE_ATTRIBUTE_REPARSE_POINT, WorkspaceSecurityError, is_native_absolute_path
 from .policy import AccessPolicy, AccessPolicyError
 
 
@@ -57,20 +57,26 @@ def _reject_reparse_components(root: Path, candidate: Path) -> None:
             raise WorkspaceSecurityError(f"Symlink, junction, or reparse point is not allowed: {part!r}")
 
 
+def _reject_reparse_ancestors(path: Path) -> None:
+    current = path
+    while True:
+        if os.path.lexists(current) and _is_reparse(current):
+            raise WorkspaceSecurityError("External grant path cannot contain a symlink or reparse point")
+        parent = current.parent
+        if parent == current:
+            return
+        current = parent
+
+
 def _canonical_directory(raw: str, workspace_root: Path) -> Path:
     if not isinstance(raw, str) or not raw.strip():
         raise ValueError("path must be a non-empty absolute directory path")
     if "\x00" in raw:
         raise WorkspaceSecurityError("NUL bytes are not allowed in paths")
-    windows = PureWindowsPath(raw.replace("/", "\\"))
-    if not windows.is_absolute() or not windows.drive:
+    if not is_native_absolute_path(raw):
         raise WorkspaceSecurityError("External grant path must be absolute")
-    # Device namespaces are deliberately excluded. UNC paths can be granted
-    # explicitly, but device paths cannot be safely canonicalized here.
-    normalized = raw.replace("/", "\\")
-    if normalized.startswith("\\\\?\\") or normalized.startswith("\\\\.\\"):
-        raise WorkspaceSecurityError("Windows device paths are not allowed")
     requested = Path(raw)
+    _reject_reparse_ancestors(requested)
     if not requested.exists() or not requested.is_dir():
         raise FileNotFoundError(f"External grant directory does not exist: {raw}")
     if _is_reparse(requested):

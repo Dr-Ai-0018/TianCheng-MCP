@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -73,6 +74,16 @@ def test_agent_source_policy_absent_file_is_empty(tmp_path: Path) -> None:
     policy = AgentSourcePolicy.load(tmp_path / "missing-agent-sources.json")
     assert policy.sources == ()
     assert policy.summary()["source_count"] == 0
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX path syntax")
+def test_posix_agent_source_rejects_foreign_absolute_path(tmp_path: Path) -> None:
+    codex, _ = _roots(tmp_path)
+    for path in (r"C:\sessions", r"\\server\sessions", "//server/sessions"):
+        payload = _payload(codex)
+        payload["sources"][0]["root"] = path
+        with pytest.raises(AgentSourcePolicyError, match="absolute path"):
+            AgentSourcePolicy.from_payload(payload)
 
 
 @pytest.mark.parametrize(

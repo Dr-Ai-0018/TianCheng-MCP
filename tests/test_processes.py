@@ -47,6 +47,32 @@ def test_managed_process_can_be_stopped(workspace: Path, tmp_path: Path) -> None
     assert stopped["state"] == "stopped"
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX process group cleanup")
+def test_posix_managed_stop_kills_child_process(workspace: Path, tmp_path: Path) -> None:
+    service = TianChengService(workspace, tmp_path / "audit", allow_exec=True)
+    child_code = (
+        "import pathlib,time; time.sleep(2); "
+        "pathlib.Path('child-survived.txt').write_text('bad', encoding='utf-8')"
+    )
+    parent_code = (
+        "import subprocess,sys,time; "
+        f"subprocess.Popen([sys.executable, '-c', {child_code!r}]); "
+        "print('child started', flush=True); time.sleep(30)"
+    )
+    try:
+        started = service.start_process("python", ["-c", parent_code], max_runtime_seconds=40)
+        process_id = started["process_id"]
+        deadline = time.monotonic() + 5
+        while "child started" not in service.process_output(process_id)["stdout"]:
+            assert time.monotonic() < deadline
+            time.sleep(0.05)
+        service.stop_process(process_id, force=True)
+        time.sleep(3)
+        assert not (workspace / "child-survived.txt").exists()
+    finally:
+        service.shutdown()
+
+
 def test_managed_process_hard_runtime_limit(workspace: Path, tmp_path: Path) -> None:
     service = TianChengService(workspace, tmp_path / "audit", allow_exec=True)
     started = service.start_process(
@@ -72,7 +98,7 @@ def test_managed_process_accepts_stdin_and_reports_session_id(
     status = _wait_for_exit(service, started["process_id"])
     assert status["state"] == "exited"
     assert status["stdin_closed"] is True
-    assert service.process_output(started["process_id"])["stdout"] == "中文输入\r\n"
+    assert service.process_output(started["process_id"])["stdout"] == "中文输入" + os.linesep
 
 
 def test_managed_process_output_cursor_is_incremental(
@@ -86,15 +112,17 @@ def test_managed_process_output_cursor_is_incremental(
     )
     status = _wait_for_exit(service, started["process_id"])
     assert status["state"] == "exited"
-    first = service.process_output(started["process_id"], stream="stdout", max_bytes=5)
-    assert first["stdout"] == "one\r\n"
-    assert first["stdout_next_offset_bytes"] == 5
+    first_line = "one" + os.linesep
+    first_bytes = len(first_line.encode("utf-8"))
+    first = service.process_output(started["process_id"], stream="stdout", max_bytes=first_bytes)
+    assert first["stdout"] == first_line
+    assert first["stdout_next_offset_bytes"] == first_bytes
     second = service.process_output(
-        started["process_id"], stream="stdout", max_bytes=16, after_bytes=5
+        started["process_id"], stream="stdout", max_bytes=16, after_bytes=first_bytes
     )
-    assert second["stdout"] == "two\r\n"
+    assert second["stdout"] == "two" + os.linesep
     assert second["stdout_cursor_gap"] is False
-    assert second["stdout_next_offset_bytes"] == 10
+    assert second["stdout_next_offset_bytes"] == first_bytes + len(second["stdout"].encode("utf-8"))
 
 
 def test_managed_output_is_readable_before_the_process_exits(
@@ -149,6 +177,7 @@ def _touch(path: Path) -> Path:
     return path
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows npm launcher discovery")
 def test_codex_discovery_uses_the_npm_managed_launcher(
     monkeypatch: pytest.MonkeyPatch, workspace: Path, tmp_path: Path
 ) -> None:
@@ -167,6 +196,7 @@ def test_codex_discovery_uses_the_npm_managed_launcher(
     assert codex[1].endswith("codex.js")
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows desktop launcher discovery")
 def test_codex_discovery_refuses_the_desktop_build(
     monkeypatch: pytest.MonkeyPatch, workspace: Path, tmp_path: Path
 ) -> None:
@@ -183,6 +213,7 @@ def test_codex_discovery_refuses_the_desktop_build(
     assert "codex" not in service._exec_commands
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows executable discovery")
 def test_codex_discovery_refuses_a_bare_windows_executable(
     monkeypatch: pytest.MonkeyPatch, workspace: Path, tmp_path: Path
 ) -> None:

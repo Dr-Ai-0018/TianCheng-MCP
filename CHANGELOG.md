@@ -8,6 +8,36 @@
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-09-29
+
+### Added
+
+- 原生 Linux stdio 启动器 `run-mcp.sh`，以及基于官方受管 runtime 的 Linux Tunnel
+  connect/status/stop 脚本与占位示例配置；默认 SAFE，不自动启用执行能力或开机自启。
+- GitHub CI 新增 Ubuntu / Python 3.13 测试与 wheel 构建；保留 Windows 3.12/3.13 回归。
+- Pi Coding Agent 可通过服务端 v3 profile 显式注册。当前仅支持 read-only 会话中的
+  无工具单次推理与流式进度；不提供文件或命令工具，不代表 Pi 文件沙箱已验收。
+- Linux 真实 Codex Agent 只读验收入口：在独立合成 Git 工作区经 MCP/app-server
+  串行验证实际拒写与可写对照，要求命令退出码、随机标记和文件字节一致；
+  意外审批申请一律取消，缺少事件或仅有模型文字报告时不会标为通过。
+
+### Fixed
+
+- 授权过期取消测试先确认任务进入后台运行，再推进独立授权时钟，消除授权 TTL
+  与交互等待同为一秒时的 CI 竞态；仍验证真实回收线程取消任务并拒绝过期访问。
+- 工作区外路径策略、临时授权和 Agent 来源校验按宿主平台处理绝对路径；Linux
+  拒绝外来 Windows 路径、父目录跳转和链接越界，保留 Windows 的原有检查。
+- POSIX managed process 与 job 取消回收整个受管进程组；已用真实 Linux stdio
+  验证子进程树收尾和 job 取消，Windows 保留现有进程管理路径。
+- Linux 默认使用 XDG 配置与状态目录，并检查服务私有目录的所有者与 0700 权限；
+  显式配置路径仍可使用，工作区自身权限由宿主系统管理。
+
+### Notes
+
+- Linux 提供命令行与脚本化运维入口；Windows PowerShell 交互式 TUI 尚未移植。
+- Codex app-server 的真实只读拒写、写入/续跑/取消、人工审批与关闭已在 Linux 验证；
+  执行工具按宿主账户运行，文件工作区策略不等同于操作系统隔离。
+
 ## [0.13.0] - 2026-09-27
 
 ### Added

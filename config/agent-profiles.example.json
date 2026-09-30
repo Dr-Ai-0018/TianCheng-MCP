@@ -1,7 +1,13 @@
 {
-  "version": 2,
+  "version": 3,
   "inherit_defaults": true,
   "profiles": [
+    {
+      "name": "pi-local-example",
+      "provider": "pi",
+      "pi": { "provider": "example-provider", "model": "example-model" },
+      "auth": { "mode": "env", "credential_env": "EXAMPLE_PI_KEY" }
+    },
     {
       "name": "codex-custom",
       "provider": "codex",

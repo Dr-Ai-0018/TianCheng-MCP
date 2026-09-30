@@ -1,0 +1,17 @@
+{
+  "client": "/opt/tunnel-client/tunnel-client",
+  "python": "/opt/tiancheng-mcp/.venv/bin/python",
+  "runtime_root": "/home/example/.local/state/tiancheng-tunnel",
+  "key_file": "/home/example/.config/tiancheng-mcp/tunnel.env",
+  "tunnel_id": "tunnel_REPLACE_ME",
+  "alias": "tiancheng-linux",
+  "profile": "tiancheng-linux",
+  "workspace": "/home/example/tiancheng-workspace",
+  "audit_dir": "/home/example/.local/state/tiancheng-mcp/audit",
+  "access_policy": "/home/example/.config/tiancheng-mcp/access-policy.json",
+  "agent_sources": "/home/example/.config/tiancheng-mcp/agent-sources.json",
+  "agent_catalog": "/home/example/.local/state/tiancheng-mcp/agent-catalog.sqlite3",
+  "agent_profiles": "/home/example/.config/tiancheng-mcp/agent-profiles.json",
+  "agent_env_file": "/home/example/.config/tiancheng-mcp/agent.env",
+  "launcher_local_config": "/home/example/.config/tiancheng-mcp/launcher.local.json"
+}

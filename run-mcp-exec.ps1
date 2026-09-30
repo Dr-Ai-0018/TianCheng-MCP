@@ -16,6 +16,7 @@ if (-not (Test-Path -LiteralPath $python -PathType Leaf)) {
 
 $interactiveTimeout = 75
 $workspace = ''
+$piCliEntry = ''
 foreach ($configPath in @(
     (Join-Path $PSScriptRoot 'config\launcher.defaults.json'),
     (Join-Path $PSScriptRoot 'config\launcher.local.json')
@@ -28,6 +29,7 @@ foreach ($configPath in @(
                 if ($candidate -ge 1 -and $candidate -le 90) { $interactiveTimeout = $candidate }
             }
             if ($config.workspace) { $workspace = [string]$config.workspace }
+            if ($config.piCliEntry) { $piCliEntry = [string]$config.piCliEntry }
         } catch { }
     }
 }
@@ -74,6 +76,7 @@ $arguments = @(
     '--interactive-timeout-seconds', [string]$interactiveTimeout
 )
 if ($AllowPolicyHotReload) { $arguments += '--allow-policy-hot-reload' }
+if ($piCliEntry) { $arguments += @('--pi-cli-entry', $piCliEntry) }
 foreach ($name in $PassEnv) {
     $arguments += @('--pass-env', $name)
 }

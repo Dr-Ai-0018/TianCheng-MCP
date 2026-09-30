@@ -27,6 +27,7 @@ from .agent_adapters import (
     CodexJsonlParser,
     NormalizedEvent,
 )
+from .pi_adapter import PiAdapter
 
 MAX_AGENT_EVENTS = 2_000
 MAX_AGENT_SESSIONS = 128
@@ -52,6 +53,7 @@ _PROFILE_FIELDS_V2 = {
     "enabled",
     "claude_command_mode",
 }
+_PROFILE_FIELDS_V3 = _PROFILE_FIELDS_V2 | {"pi"}
 
 
 @dataclass(frozen=True)
@@ -78,9 +80,9 @@ def load_agent_profile_definitions(path: str | Path) -> AgentProfileConfig:
             raise ValueError("Agent profile config v1 must contain only version and profiles")
         inherit_defaults = True
         profile_fields = _PROFILE_FIELDS_V1
-    elif version == 2:
+    elif version in {2, 3}:
         if not set(payload).issubset({"version", "inherit_defaults", "profiles"}):
-            raise ValueError("Invalid fields in agent profile config v2")
+            raise ValueError(f"Invalid fields in agent profile config v{version}")
         if set(payload) != {"version", "inherit_defaults", "profiles"}:
             raise ValueError(
                 "Agent profile config v2 requires version, inherit_defaults, and profiles"
@@ -88,9 +90,9 @@ def load_agent_profile_definitions(path: str | Path) -> AgentProfileConfig:
         inherit_defaults = payload["inherit_defaults"]
         if not isinstance(inherit_defaults, bool):
             raise ValueError("inherit_defaults must be a boolean")
-        profile_fields = _PROFILE_FIELDS_V2
+        profile_fields = _PROFILE_FIELDS_V3 if version == 3 else _PROFILE_FIELDS_V2
     else:
-        raise ValueError("Agent profile config version must be 1 or 2")
+        raise ValueError("Agent profile config version must be 1, 2 or 3")
     if not isinstance(payload["profiles"], list):
         raise ValueError("Agent profile config profiles must be a list")
     definitions: list[dict[str, Any]] = []
@@ -98,11 +100,14 @@ def load_agent_profile_definitions(path: str | Path) -> AgentProfileConfig:
     for index, raw in enumerate(payload["profiles"]):
         if not isinstance(raw, dict) or not set(raw).issubset(profile_fields):
             raise ValueError(f"Invalid fields in agent profile at index {index}")
-        if not {"name", "provider", "provider_profile"}.issubset(raw):
+        required = {"name", "provider"}
+        if raw.get("provider") != "pi" or version != 3:
+            required.add("provider_profile")
+        if not required.issubset(raw):
             raise ValueError(f"Missing required fields in agent profile at index {index}")
         name = raw["name"]
         provider = raw["provider"]
-        provider_profile = raw["provider_profile"]
+        provider_profile = raw.get("provider_profile", "")
         if not isinstance(name, str) or _PROFILE_NAME.fullmatch(name) is None:
             raise ValueError(f"Invalid agent profile name at index {index}")
         if name in seen:
@@ -110,9 +115,25 @@ def load_agent_profile_definitions(path: str | Path) -> AgentProfileConfig:
         seen.add(name)
         if not isinstance(provider, str) or _PROFILE_NAME.fullmatch(provider) is None:
             raise ValueError(f"Invalid provider for agent profile {name}")
+        if provider == "pi" and version == 3:
+            if "provider_profile" in raw:
+                raise ValueError(f"Pi profile {name} cannot declare provider_profile")
+            pi = raw.get("pi")
+            if not isinstance(pi, dict) or set(pi) != {"provider", "model"}:
+                raise ValueError(f"Pi profile {name} requires provider and model")
+            pi_provider, pi_model = pi["provider"], pi["model"]
+            if (not isinstance(pi_provider, str) or
+                re.fullmatch(r"[a-z][a-z0-9-]{0,63}", pi_provider) is None or
+                not isinstance(pi_model, str) or
+                re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}", pi_model) is None):
+                raise ValueError(f"Invalid Pi provider or model for {name}")
+        else:
+            if "pi" in raw:
+                raise ValueError(f"Only Pi profiles may declare pi settings: {name}")
+            pi_provider = pi_model = None
         if (
             not isinstance(provider_profile, str)
-            or not provider_profile
+            or (provider != "pi" and not provider_profile)
             or len(provider_profile) > 256
             or any(character in provider_profile for character in "\r\n\0")
         ):
@@ -162,6 +183,8 @@ def load_agent_profile_definitions(path: str | Path) -> AgentProfileConfig:
             or _ENVIRONMENT_NAME.fullmatch(credential_env) is None
         ):
             raise ValueError(f"Invalid credential_env for agent profile {name}")
+        if provider == "pi" and auth_mode != "env":
+            raise ValueError(f"Pi profile {name} requires env authentication")
         definitions.append(
             {
                 "name": name,
@@ -171,6 +194,8 @@ def load_agent_profile_definitions(path: str | Path) -> AgentProfileConfig:
                 "windows_home_preflight": windows_home_preflight,
                 "credential_env": credential_env,
                 "auth_mode": auth_mode,
+                "pi_provider": pi_provider,
+                "pi_model": pi_model,
                 "enabled": enabled,
                 "claude_command_mode": claude_command_mode,
             }
@@ -204,8 +229,9 @@ class AgentProfileRegistry:
         self._adapters: dict[str, AgentAdapter] = {}
         self._known_adapters: dict[str, AgentAdapter] = {}
         self._profile_adapters: dict[str, AgentAdapter] = {}
+        definitions = tuple(profile_definitions or ())
         registered_adapters = (
-            (CodexAdapter(), ClaudeCodeAdapter())
+            (CodexAdapter(), ClaudeCodeAdapter(), PiAdapter())
             if adapters is None
             else adapters
         )
@@ -217,10 +243,10 @@ class AgentProfileRegistry:
             if not adapter.probe(prefix):
                 continue
             profiles = adapter.profiles()
-            if not profiles:
-                raise ValueError(
-                    f"Agent adapter {adapter.provider} did not register any profiles"
-                )
+            if not profiles and not any(
+                item.get("provider") == adapter.provider for item in definitions
+            ):
+                continue
             self._adapters[adapter.provider] = adapter
             for profile in profiles:
                 if profile.provider != adapter.provider:
@@ -244,7 +270,7 @@ class AgentProfileRegistry:
             if not inherit_default_profiles:
                 self._profiles.clear()
                 self._profile_adapters.clear()
-            for definition in profile_definitions:
+            for definition in definitions:
                 provider = definition["provider"]
                 if not isinstance(provider, str):
                     raise ValueError(f"Invalid agent profile provider: {provider!r}")
@@ -290,12 +316,18 @@ class AgentProfileRegistry:
                     name=name,
                     provider=provider,
                     command=adapter.command,
-                    provider_profile=str(definition["provider_profile"]),
+                    provider_profile=str(definition.get("provider_profile", "")),
                     codex_home=definition.get("codex_home"),
                     windows_home_preflight=windows_home_preflight,
                     credential_env=credential_env,
                     auth_mode=str(auth_mode),
                     claude_command_mode=definition.get("claude_command_mode", "off"),
+                    pi_provider=definition.get("pi_provider"),
+                    pi_model=definition.get("pi_model"),
+                    allowed_sandboxes=(
+                        frozenset({"read-only"}) if provider == "pi"
+                        else frozenset({"read-only", "workspace-write"})
+                    ),
                 )
                 self._profiles[profile.name] = profile
                 self._profile_adapters[profile.name] = adapter

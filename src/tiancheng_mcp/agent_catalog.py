@@ -140,7 +140,12 @@ def _conversation_ref(
     source_id: str, provider: str, native_session_id: str, relative_path: str
 ) -> str:
     payload = "\x00".join(
-        (source_id, provider, native_session_id, relative_path.casefold())
+        (
+            source_id,
+            provider,
+            native_session_id,
+            relative_path.casefold() if os.name == "nt" else relative_path,
+        )
     ).encode("utf-8")
     return "convref_" + hashlib.sha256(payload).hexdigest()[:32]
 
