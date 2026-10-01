@@ -134,8 +134,9 @@ class JobManager:
             metadata=dict(metadata or {}),
         )
         with self._lock:
+            if self._stopping.is_set():
+                raise RuntimeError("Job manager is shutting down")
             self._purge_locked(time.time())
-            self._reclaim_capacity_locked()
             if idempotency_key is not None:
                 existing = self._idempotency.get(idempotency_key)
                 if existing is not None:
@@ -146,6 +147,7 @@ class JobManager:
                     ):
                         raise ValueError("idempotency_key was already used for a different operation")
                     return existing_record
+            self._reclaim_capacity_locked()
             if len(self._records) >= self._max_records:
                 raise RuntimeError("Too many retained jobs; wait for old jobs to expire")
             self._records[record.job_id] = record
@@ -155,14 +157,13 @@ class JobManager:
                     idempotency_fingerprint or operation,
                     record,
                 )
-        try:
-            self._queue.put_nowait(record)
-        except queue.Full as exc:
-            with self._lock:
+            try:
+                self._queue.put_nowait(record)
+            except queue.Full as exc:
                 self._records.pop(record.job_id, None)
                 if idempotency_key is not None:
                     self._idempotency.pop(idempotency_key, None)
-            raise RuntimeError("Job queue is full; retry after current jobs finish") from exc
+                raise RuntimeError("Job queue is full; retry after current jobs finish") from exc
         return record
 
     def submit_and_wait(

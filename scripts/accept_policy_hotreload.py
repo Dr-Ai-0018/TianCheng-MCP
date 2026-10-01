@@ -18,6 +18,8 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
+from dataclasses import dataclass
 from pathlib import Path
 
 from mcp import Client, StdioServerParameters
@@ -25,8 +27,43 @@ from mcp import Client, StdioServerParameters
 from local_runtime import workspace_path
 
 REPO = Path(__file__).resolve().parents[1]
-WORKSPACE = workspace_path(REPO)
 RUN_POLL_TIMEOUT = 300.0
+
+
+@dataclass(frozen=True)
+class AcceptanceFixture:
+    sandbox: Path
+    project: Path
+    policy_file: Path
+
+
+def prepare_fixture(workspace: Path, parent: Path | None = None) -> AcceptanceFixture:
+    """Create an isolated Git project and policy with inherited permissions.
+
+    mkdir creates the unique directory once.  No ACL on an existing directory
+    is changed; callers can choose a disposable parent on the test machine.
+    """
+    parent = Path(tempfile.gettempdir()) if parent is None else parent
+    parent.mkdir(parents=True, exist_ok=True)
+    sandbox = parent / f"tc-accept-hot-{uuid.uuid4().hex}"
+    sandbox.mkdir()
+    try:
+        project = sandbox / "work" / "external-project"
+        (project / "src").mkdir(parents=True)
+        (project / "notes.md").write_text("existing content", encoding="utf-8")
+        subprocess.run(
+            ["git", "init", "--quiet"], cwd=project, check=True, capture_output=True,
+        )
+        policy_file = sandbox / "policy" / "access-policy.json"
+        policy_file.parent.mkdir()
+        policy_file.write_text(
+            json.dumps({"rules": [{"path": str(workspace), "mode": "full"}]}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        return AcceptanceFixture(sandbox, project, policy_file)
+    except BaseException:
+        shutil.rmtree(sandbox, ignore_errors=True)
+        raise
 
 
 def _allowlisted_env_names() -> list[str]:
@@ -111,36 +148,24 @@ async def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--providers", default="claude-default,codex-default")
     parser.add_argument("--keep", action="store_true")
+    parser.add_argument("--codex-model", help="Optional model for this Codex acceptance run only")
+    parser.add_argument("--workspace", type=Path, help="Override the configured MCP workspace")
+    parser.add_argument("--test-root", type=Path, help="Disposable staging parent; existing ACLs are unchanged")
+    parser.add_argument("--prepare-only", action="store_true", help="Prepare and validate fixtures without starting MCP or Agents")
     args = parser.parse_args()
-
-    # A plain directory on a normal drive, deliberately not tempfile.mkdtemp:
-    # on Windows mkdtemp applies a restrictive owner-only DACL, and files the
-    # agent then writes inherit it and become unreadable even to the same
-    # user. That is an artifact of the test staging, not of the server or the
-    # agent, and it would otherwise look like a lost write.
-    import uuid as _uuid
-    sandbox = Path(tempfile.mkdtemp(prefix=f"tc-accept-hot-{_uuid.uuid4().hex[:8]}-"))
-    sandbox.mkdir()
-    # Keep the throwaway policy file in its own directory: the server refuses
-    # to whitelist anything under the directory holding its policy, so a
-    # project nested beside the policy file would be rejected by that guard
-    # rather than exercising the flow.
-    project = sandbox / "work" / "external-project"
-    (project / "src").mkdir(parents=True)
-    (project / "notes.md").write_text("existing content", encoding="utf-8")
-    # Codex refuses to run outside a trusted directory unless
-    # --skip-git-repo-check is passed, and the server deliberately does not
-    # pass it. Real target directories are repositories, so make this one a
-    # repository too rather than weakening the provider's own safety net.
-    subprocess.run(
-        ["git", "init", "--quiet"], cwd=str(project), check=True, capture_output=True
-    )
-    (sandbox / "policy").mkdir()
-    policy_file = sandbox / "policy" / "access-policy.json"
-    policy_file.write_text(
-        json.dumps({"rules": [{"path": str(WORKSPACE), "mode": "full"}]}, ensure_ascii=False),
-        encoding="utf-8",
-    )
+    workspace = args.workspace.resolve() if args.workspace is not None else workspace_path(REPO)
+    fixture = prepare_fixture(workspace, args.test_root)
+    sandbox, project, policy_file = fixture.sandbox, fixture.project, fixture.policy_file
+    if args.prepare_only:
+        try:
+            print(json.dumps({"prepared": True, "project": str(project),
+                              "policy_file": str(policy_file)}, ensure_ascii=False), flush=True)
+        finally:
+            if args.keep:
+                print(f"kept sandbox: {sandbox}", flush=True)
+            else:
+                shutil.rmtree(sandbox)
+        return
 
     parameters = StdioServerParameters(
         command=sys.executable,
@@ -148,9 +173,9 @@ async def main() -> None:
             "-m",
             "tiancheng_mcp",
             "--workspace",
-            str(WORKSPACE),
+            str(workspace),
             "--audit-dir",
-            str(REPO / "logs"),
+            str(sandbox / "audit"),
             "--allow-exec",
             # The external_* file tools only register under this flag, so a
             # hot-reload profile needs it to actually use a newly whitelisted
@@ -331,6 +356,8 @@ async def main() -> None:
                             f"directory whose entire content is exactly this one line: {token}\n"
                             "Reply DONE when the file exists."
                         ),
+                        **({"codex_options": {"model": args.codex_model}}
+                           if tag == "codex" and args.codex_model else {}),
                     },
                 )
                 final = await c.wait_terminal(session["session_id"], run["run_id"])
@@ -359,6 +386,13 @@ async def main() -> None:
                         },
                     )
                     print(f"    agent said: {said.get('result')!r}", flush=True)
+                    events = await c.must(
+                        "agent_run",
+                        {"action": "events", "session_id": session["session_id"],
+                         "run_id": run["run_id"], "after_seq": 0, "limit": 100,
+                         "max_bytes": 16384},
+                    )
+                    print(f"    run events: {json.dumps(events, ensure_ascii=False)}", flush=True)
                     listing, listing_error = await c.call(
                         "external_list_dir", {"path": str(project), "depth": 1}
                     )

@@ -5,7 +5,7 @@
 `<WORKSPACE>` 工作区内的文件与本地 Git 能力；服务端代码、依赖和审计日志位于
 仓库目录，不在 ChatGPT 可写工作区内。
 
-当前版本：`0.14.0`。依赖锁定到官方维护的 MCP Python SDK `2.1.0`，使用当前
+当前版本：`0.15.0`。依赖锁定到官方维护的 MCP Python SDK `2.1.0`，使用当前
 `MCPServer`、`MCPServer.tool()`、`ToolAnnotations` 与 stdio transport API。
 
 - MCP Python SDK：<https://github.com/modelcontextprotocol/python-sdk/tree/v2.1.0>
@@ -101,7 +101,7 @@ python3 scripts/linux_tunnel_runtime.py stop    --config /absolute/private/tunne
 | --- | --- | --- |
 | 信息 | `workspace_info` | 工作区、版本、能力、exec/Git 状态；不返回用户、环境变量或主机信息 |
 | 文件读取 | `list_dir`, `stat`, `hash_file`, `read_text`, `read_text_chunk` | 有递归深度、读取量和二进制拒绝限制；大文件可用稳定字节游标续读；哈希有大小上限 |
-| 文件写入 | `write_text`, `edit_text`, `append_text`, `mkdir`, `move`, `copy` | UTF-8；覆盖/精确替换采用同目录临时文件 + `os.replace`；写入和追加支持 SHA-256 乐观锁 |
+| 文件写入 | `write_text`, `edit_text`, `append_text`, `mkdir`, `move`, `copy` | UTF-8；覆盖/精确替换/追加采用同目录临时文件 + `os.replace`；修改支持 SHA-256 乐观锁 |
 | 回收 | `delete`, `trash_list`, `trash_restore`, `trash_purge` | 默认可恢复；只有显式 purge 永久销毁并标成 destructive |
 | 查找 | `glob`, `search_text` | `search_text` 优先使用 ripgrep，先枚举受 ignore 规则约束的候选文件并按 glob 过滤，再按总扫描字节、结果、输出和超时限制 |
 | 本地 Git | `git_status`, `git_diff`, `git_log`, `git_init`, `git_add`, `git_commit` | 默认安全 Profile 只提供工作区内的本地仓库操作 |
@@ -130,6 +130,11 @@ destructive，`run_command` 同时标为 destructive/open-world。
 授权只存在当前 MCP 进程内存，最多 10 分钟；`external_grant_status` 可查看状态，
 `revoke_external_access` 可由 ChatGPT 主动立即撤销，`external_access_cancel`
 可取消尚未批准的请求。MCP/Tunnel 重启后全部失效。
+
+活动 grant 最多3项，待批准请求最多16项；批准时重新检查当前策略、目录和容量。
+grant 不能覆盖静态 `deny`；授权根后来被禁止时，grant 失效并取消关联后台任务。
+父目录的授权也不会放宽子目录规则：搜索、列目录和 glob 省略不可访问节点，
+copy/move/delete 在修改前检查整个源树，copy/move 同时检查派生的目标路径。
 
 若未来引入第二因子，审批必须走模型与 MCP 均无法读取的独立通道；当前聊天 challenge
 只用于把用户的明确确认绑定到一次待审批请求，不构成独立的身份验证因子。
@@ -224,6 +229,18 @@ Git 只跟踪可移植默认值和示例：`launcher.defaults.json`、
 - `.env`、`exec-env.allowlist`：本机变量值和显式透传名单；
 - `config/access-policy.json`、`config/agent-sources.json`：本机授权策略；
 - `state/`、`logs/`：运行状态、Catalog 与审计日志。
+
+Windows TUI 和 SAFE/DEV/GRANTS 启动器共用 Python 配置模型。`tc.ps1 -ConfigPath <文件>`
+生成的 MCP 命令会把同一个配置文件传给启动器；三个 `run-mcp*.ps1` 也都接受 `-ConfigPath`。
+workspace、Python、policy、sources、Catalog、Agent profiles、env 文件、audit 目录及超时设置
+均使用该配置。相对路径以项目根目录为基准；`TIANCHENG_WORKSPACE` 覆盖配置中的 workspace。
+Python CLI 可显式传 `--runtime-config <文件>`；明确 CLI 参数优先于环境 workspace、local 配置和 defaults。
+执行、外部 grant 和策略热更新只由显式开关启用，不从 JSON 推断授权。
+
+旧默认 profile 仍可使用默认配置。已有 profile 若没有记录所选自定义配置，或记录的是另一份配置，
+TUI 会在 doctor/start 前阻止启动；使用同一 `-ConfigPath` 执行 `set-mode` 或 `edit-profile`
+更新原有 profile，无需另建 Tunnel。`info -Json` 可查看所选路径与 SAFE MCP 命令；
+新窗口启动也会保留这份配置。配置值无效时明确失败，不静默回退。
 
 需要自定义 Agent 时复制示例后再修改；不要直接修改随仓库提交的示例：
 
@@ -410,7 +427,9 @@ uv run python .\scripts\smoke_exec_stdio.py
 5. move/copy 不覆盖现有目标；目录不能被复制或移动到自身内部。
 6. Git 只支持拥有真实 `.git` 目录的独立仓库。拒绝 worktree `.git` 文件、object
    alternates、reparse point、include/filter/credential/alias 等危险仓库本地配置；专用
-   commit 禁用 hooks 与签名。安全 Profile 不注册任何联网 Git 工具；Dev Profile 则显式
+   配置由 Git 自身按真实语法解析，不跟随仓库 include。所有专用 Git 工具禁用 fsmonitor、
+   hooks、自动签名、自动维护和 ext 协议；SAFE 还禁用全局外部过滤器，并保留用户 Git 身份。
+   需要服务端受信任过滤器的流程使用明确启用的 DEV。安全 Profile 不注册任何联网 Git 工具；Dev Profile 则显式
    继承用户/系统 Git config 与 GCM，以便访问 GitHub 等远程仓库。
 
 上述边界的目标是保证 MCP 文件和 Git 工具不会把用户提供的路径解析到
@@ -474,6 +493,18 @@ Python 扩展若完全不检查取消信号，线程无法被 CPython 安全地�
 Agent run 由 `agent_run` 的 `inspect`、`events`、`result` 和 `cancel` 管理；通用
 `process_*` 工具与 `list_processes` 不访问 Agent 进程，Agent 返回值也不暴露内部
 `process_id`。`job_*` 只管理超过交互预算的后台工具调用，与上述两种生命周期分开。
+
+受管进程和 Agent 共享最多 32 个正在准备、启动或运行的进程槽位，Agent 自身的并发限制仍生效。
+退出时关闭管道和系统句柄，输出和状态保留在有界历史中。普通进程历史最多保留 1 小时、128 条、
+64 MiB 总输出，触及任一限制会先淘汰最早结束的记录；调用方需要长期结果时应及时回读并保存。
+`list_processes` 返回共享槽位占用与历史上限；状态提供 `resources_released`、
+`resource_cleanup_error`、`output_drain_incomplete` 和 `history_expires_at`。近期被淘汰的 ID
+返回明确的 `history expired`，该标记本身也有界；超出标记保留范围后返回普通未找到错误。
+Agent 的事件、错误摘要及最终结果仍按原有 session/run 上限保留，不保留终态的原始进程输出。
+
+所有 Agent 协议按原始字节增量解码 UTF-8，再按 JSONL 分帧；支持中文、emoji 跨块与退出时无换行的
+最后一行。单行上限为 256 KiB，无效编码或超长帧使 run 明确失败。输出缺口和未完成排空会记入结果；
+Pi 与人工审批模式遇到这类不完整协议会失败。普通 provider 的进程成功仍不代表任务已经完成。
 
 0.7.1 增加服务器自有的 `codex-default` profile registry 和有界 Codex JSONL 事件解析器，
 作为后续 `agent_session`/`agent_run` 的安全基础；本版本尚未暴露任意 Agent 命令工具。
@@ -662,6 +693,13 @@ provider endpoint、hook/plugin/MCP、sandbox/approval 等敏感 `-c` 根也不�
 真实 source；TUI 只探测固定 `.codex/sessions` / `.claude/projects` 候选，用户输入 `ADD`
 确认后才写入 local-only policy，MCP 端仍不能新增或扩大 source。
 
+刷新按确定顺序保存检查点，文件数量、字节或时间预算耗尽时，下次调用继续推进；重启服务也保留进度。
+`scan_complete` 表示完成一次观察周期，`retryable_files` 表示仍待重试的记录；`state=complete` 同时要求
+扫描完整、没有可重试文件或未解决的遍历错误。已删除记录在完整且无遍历错误的周期结束后清理。
+来源绑定、解析器版本或预算配置变化会重置扫描检查点；文件身份与会话绑定仍在查询/attach 时复核。
+单文件超过 `max_file_bytes` 或 `max_scan_bytes` 会明确记录为 `oversized` 或 `scan-oversized`，提高相应预算
+后重新尝试。Catalog 只读取既有受限 metadata，不读取完整 transcript 来弥补预算。
+
 0.9c 在 DEV Profile 的 `agent_session` 增加 `attach`：调用方只能提交 Catalog 生成的
 `conversation_ref`，不能直接提交 native session id、thread id、`--last` 或历史文件路径。
 服务端重新验证 source/root/file identity、provider、session id 与历史 cwd；cwd 不在
@@ -704,8 +742,13 @@ access-policy 规则显式 `allow_exec=true`。会话创建及每轮启动都会
 
 0.9e 增加 local-only source admin 与 `tc` 菜单入口。CLI/version probe 只执行有界
 `--version`，不发送模型请求；source 增删启停全部复用生产 validator 与原子保存，ACL 收紧
-失败会恢复上一版。用户可显式刷新单个 source 的 metadata，或在停止 Tunnel/MCP 后把旧
-SQLite/WAL/SHM 移为时间戳备份再重建。Catalog 连接均显式关闭，避免 Windows 文件锁与长期
+失败会恢复上一版。用户可显式刷新单个 source 的 metadata，或在停止 Tunnel/MCP 后重建。
+重建先准备独立新库，再预检全部备份目标，将旧 SQLite/WAL/SHM 保存为带时间戳和随机标识的备份，
+最后切换新库；准备失败保留旧库，搬移或切换失败会回退。回退本身失败时保留备份并明确报错，
+不要删除恢复文件。临时文件清理失败时，成功结果的 `cleanup_pending` 给出待清理路径。
+Catalog 查询/刷新/重建共用跨线程与跨进程维护锁；它只协调本项目的访问。外部 SQLite 客户端需关闭，
+checkpoint 忙时重建会拒绝切换。Schema 3 自动迁移 schema 1/2；回退旧版需恢复升级前备份或重建索引。
+Catalog 连接均显式关闭，避免 Windows 文件锁与长期
 连接泄漏。菜单和 JSON 状态不读取或输出 transcript 正文、key/token；真实模型 smoke 仍需
 进入菜单第 7 项并准确输入 `RUN CODEX` 或 `RUN CLAUDE` 二次确认。它使用固定 read-only
 prompt、180 秒超时且只返回 marker 是否通过，不输出模型正文。Agent 子进程会立即收到 stdin
@@ -746,6 +789,14 @@ Windows 实机验证 `codex-default` 与 `claude-default` marker 均成功。Cla
 
 `edit_text` 必须给出精确旧文本和预期命中次数；不唯一、已变化或 SHA-256 前置条件不匹配
 都会拒绝写入。`write_text` 和 `append_text` 也可携带上次返回的 `sha256`，防止静默覆盖或追加到并发修改后的文件。
+
+同一服务进程中的文件修改共享路径协调器，包括外部授权的临时 service 和重叠 workspace。
+锁覆盖读取、条件检查及提交；父目录/子树冲突也会串行，等待期间可取消。独立目录可并行。
+该协调器不控制其他进程、编辑器或开放执行命令的直接文件修改。
+
+回收站删除先原子写入原路径恢复记录，再移动数据；记录失败时保留原文件。
+恢复不覆盖已有目标。若数据已恢复但元数据清理失败，仍返回 `restored=true`，并用
+`metadata_cleanup_pending=true` 明确提示残留记录；不会把已成功恢复的数据误报为未恢复。
 
 `hash_file` 只读取 workspace 内文件并返回 SHA-256；默认最多处理 256 MiB，避免对异常大文件
 进行无界扫描。
@@ -835,6 +886,28 @@ Set-Location -LiteralPath '<TUNNEL_CLIENT_DIR>'
 保持 `run` 进程运行。然后在 ChatGPT 中点击 **Local MCP → 刷新**，重新发现 TianCheng
 工具；原先 embedded stub 的 `echo`、`server_info`、`uppercase` 应被这里的 24 个工具
 取代。
+
+## 开发回归与隔离验收
+
+常规回归使用合成配置与工作区，不读取开发机器的真实 Agent 环境文件：
+
+```sh
+uv run pytest
+uv run python scripts/accept_policy_hotreload.py --workspace "<TEST_WORKSPACE>" --test-root "<OUTSIDE_SOURCE>" --prepare-only
+```
+
+`--prepare-only` 只验证独立 Git 工作区和临时策略的准备阶段，不启动 MCP 或模型。
+真实热更新验收可去掉该参数，用 `--providers "<CODEX_PROFILE>"` 选择已配置的 profile；
+可选 `--codex-model` 仅覆盖这轮验收的模型，不改变全局 Codex 配置。
+`--keep` 保留产物；策略、审计和失败诊断均位于独立测试目录，正式白名单不被修改。
+真实验收会消耗模型额度，测试目录须与开发源码及正式工作区分开。
+
+Linux 只读拒写及写入对照使用 `scripts/accept_linux_agent_readonly.py`，要求真实命令结果、
+随机诊断 token、文件状态及 session 关闭证据，文件没有出现或模型文字不能单独通过。
+人工审批使用 `scripts/accept_agent_manual.py --root "<OUTSIDE_SOURCE>" --decision cancel`；
+接受测试只有在人工明确批准脚本内的固定命令和指定目录后才可使用
+`--decision accept --authorized`。脚本检查命令、cwd 和审批 ID，接受后通过 MCP 独立回读 marker；
+取消的原生终态条目可能没有退出码，不将其误判为实际命令执行。
 
 ## 项目文件
 

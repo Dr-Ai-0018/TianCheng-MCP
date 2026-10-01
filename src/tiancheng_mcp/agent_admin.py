@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-from datetime import UTC, datetime
 import json
 import os
 from pathlib import Path
@@ -17,11 +16,13 @@ import shutil
 import subprocess
 import sys
 import time
+import uuid
 from typing import Any, Callable
 
 from .agent_adapters import redact_text
 from .agent_catalog import AgentCatalog
 from .agent_sources import AgentSourcePolicy
+from .catalog_storage import catalog_lock, database_group, ensure_quiescent, move_database_group, restore_group
 from .policy import AccessPolicy
 from .service import TianChengService
 
@@ -218,34 +219,46 @@ def rebuild_catalog(
 ) -> dict[str, Any]:
     policy = AgentSourcePolicy.load(config_path)
     database = Path(catalog_path)
-    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-    moved: list[tuple[Path, Path]] = []
-    try:
-        for suffix in ("", "-wal", "-shm"):
-            current = Path(str(database) + suffix)
-            if not current.exists():
-                continue
-            backup = current.with_name(f"{current.name}.backup-{stamp}")
-            if backup.exists():
-                raise AgentSourceAdminError("Catalog backup name already exists")
-            current.replace(backup)
-            moved.append((current, backup))
-    except OSError:
-        for current, backup in reversed(moved):
-            if backup.exists() and not current.exists():
-                backup.replace(current)
-        raise
-    catalog = AgentCatalog(database, workspace_root)
-    refreshes = [
-        catalog.refresh(policy, source.source_id)
-        for source in policy.sources
-        if source.enabled
-    ]
-    return {
-        "rebuilt": True,
-        "backup_files": [str(backup) for _, backup in moved],
-        "refreshes": refreshes,
-    }
+    # Validate the final path before preparing anything outside the workspace.
+    AgentCatalog(database, workspace_root)
+    staged = database.with_name(f"{database.name}.rebuild-{uuid.uuid4().hex}")
+    with catalog_lock(database):
+        result = None
+        try:
+            catalog = AgentCatalog(staged, workspace_root)
+            refreshes = [catalog.refresh(policy, source.source_id)
+                for source in policy.sources if source.enabled]
+            # Even a source-free catalog must contain the current schema.
+            with catalog._lock:
+                connection = catalog._connect()
+                try:
+                    checkpoint = connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+                    if checkpoint[0]:
+                        raise AgentSourceAdminError("Prepared Catalog has an active SQLite reader")
+                finally:
+                    connection.close()
+            ensure_quiescent(database)
+            moved = move_database_group(database, "backup")
+            try:
+                staged.replace(database)
+            except BaseException:
+                restore_group(moved)
+                raise
+            result = {"rebuilt": True, "backup_files": [str(backup) for _, backup in moved],
+                "refreshes": refreshes}
+            return result
+        finally:
+            pending = []
+            for path in [*database_group(staged), Path(str(staged) + '.lock')]:
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    pending.append(str(path))
+            if pending:
+                if result is not None:
+                    result["cleanup_pending"] = pending
+                elif sys.exception() is not None:
+                    sys.exception().add_note("Prepared Catalog cleanup pending: " + ", ".join(pending))
 
 
 def run_agent_smoke(

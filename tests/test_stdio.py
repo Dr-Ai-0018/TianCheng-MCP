@@ -4,6 +4,7 @@ import asyncio
 import sys
 import json
 from pathlib import Path
+import shutil
 
 import pytest
 from mcp import Client, StdioServerParameters
@@ -31,6 +32,66 @@ def _isolated_server_config_args(
         "--agent-env-file", str(tmp_path / "isolated-agent.env"),
         "--launcher-local-config", str(tmp_path / "isolated-launcher.json"),
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(shutil.which("git") is None, reason="Git is unavailable")
+async def test_safe_stdio_rejects_inline_fsmonitor_before_execution(workspace: Path, tmp_path: Path) -> None:
+    parameters = StdioServerParameters(
+        command=sys.executable,
+        args=["-m", "tiancheng_mcp", "--workspace", str(workspace),
+              "--audit-dir", str(tmp_path / "audit"), *_isolated_server_config_args(tmp_path)],
+        cwd=str(Path(__file__).resolve().parents[1]), encoding="utf-8",
+    )
+    marker = workspace / "executed.txt"
+    script = workspace / "monitor.sh"
+    script.write_text(f'#!/bin/sh\nprintf EXECUTED > "{marker.as_posix()}"\n', encoding="utf-8")
+    script.chmod(0o755)
+    async with Client(parameters, mode="legacy", raise_exceptions=False) as client:
+        info = _structured(await client.call_tool("workspace_info", {}))
+        assert info["command_execution_enabled"] is False
+        initialized = await client.call_tool("git_init", {"path": "repo"})
+        assert not initialized.is_error
+        config = workspace / "repo/.git/config"
+        modified = await client.call_tool("write_text", {
+            "path": "repo/.git/config",
+            "content": config.read_text(encoding="utf-8") + f'\n[core] fsmonitor = "{script.as_posix()}"\n',
+        })
+        assert not modified.is_error
+        result = await client.call_tool("git_status", {"repo": "repo"})
+        assert result.is_error
+        assert "unsafe Git setting" in " ".join(getattr(item, "text", "") for item in result.content)
+        assert not marker.exists()
+
+
+@pytest.mark.asyncio
+async def test_external_stdio_keeps_descendant_deny_for_search_and_copy(workspace: Path, tmp_path: Path) -> None:
+    external = tmp_path / "external"
+    (external / "tree/blocked").mkdir(parents=True)
+    (external / "tree/public.txt").write_text("PUBLIC_MARKER", encoding="utf-8")
+    (external / "tree/blocked/private.txt").write_text("DENIED_MARKER", encoding="utf-8")
+    policy = tmp_path / "policy.json"
+    policy.write_text(json.dumps({"rules": [
+        {"path": str(workspace), "mode": "full"},
+        {"path": str(external), "mode": "full"},
+        {"path": str(external / "tree/blocked"), "mode": "deny"},
+    ]}), encoding="utf-8")
+    parameters = StdioServerParameters(
+        command=sys.executable,
+        args=["-m", "tiancheng_mcp", "--workspace", str(workspace), "--allow-external-grants",
+              "--audit-dir", str(tmp_path / "audit"), *_isolated_server_config_args(tmp_path, policy)],
+        cwd=str(Path(__file__).resolve().parents[1]), encoding="utf-8",
+    )
+    async with Client(parameters, mode="legacy", raise_exceptions=False) as client:
+        denied = await client.call_tool("external_search_text", {"query": "DENIED_MARKER", "base_path": str(external)})
+        assert not denied.is_error
+        assert _structured(denied)["results"] == []
+        public = await client.call_tool("external_search_text", {"query": "PUBLIC_MARKER", "base_path": str(external)})
+        assert [item["path"] for item in _structured(public)["results"]] == ["tree/public.txt"]
+        copy = await client.call_tool("external_copy", {"source": str(external / "tree"), "destination": str(external / "copy")})
+        assert copy.is_error
+        assert not (external / "copy").exists()
+        assert (external / "tree/public.txt").read_text() == "PUBLIC_MARKER"
 
 
 def test_exception_group_is_flattened_to_bounded_message() -> None:

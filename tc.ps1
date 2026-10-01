@@ -46,22 +46,9 @@ function Read-JsonHashtable {
     return $raw | ConvertFrom-Json -AsHashtable
 }
 
-$script:ProjectRelativeKeys = @(
-    'python', 'mcpScript', 'mcpExecScript', 'mcpGrantsScript',
-    'accessPolicyPath', 'agentSourcesPath', 'agentCatalogPath', 'envFile'
-)
-
 function Resolve-LauncherConfig {
     param([Parameter(Mandatory)][hashtable]$Config)
 
-    foreach ($key in $script:ProjectRelativeKeys) {
-        if (-not $Config.ContainsKey($key)) { continue }
-        $value = [string]$Config[$key]
-        if ([string]::IsNullOrWhiteSpace($value)) { continue }
-        if (-not [System.IO.Path]::IsPathRooted($value)) {
-            $Config[$key] = [System.IO.Path]::GetFullPath((Join-Path $script:ProjectRoot $value))
-        }
-    }
     foreach ($pair in @(
         @{ Key = 'tunnelClient'; Command = 'tunnel-client' },
         @{ Key = 'powerShell'; Command = 'pwsh' }
@@ -93,15 +80,13 @@ function Get-Workspace {
 }
 
 function Get-LauncherConfig {
-    $defaults = Read-JsonHashtable -Path $script:DefaultsPath
-    if ($defaults.Count -eq 0) {
-        throw "Launcher defaults are missing: $script:DefaultsPath"
-    }
-    $overrides = Read-JsonHashtable -Path $script:LocalConfigPath
-    foreach ($key in $overrides.Keys) {
-        $defaults[$key] = $overrides[$key]
-    }
-    return (Resolve-LauncherConfig -Config $defaults)
+    $bootstrap = if ($env:TIANCHENG_PYTHON) { $env:TIANCHENG_PYTHON }
+    else { Join-Path $script:ProjectRoot '.venv\Scripts\python.exe' }
+    $resolved = & $bootstrap (Join-Path $script:ProjectRoot 'scripts\resolve_launcher.py') `
+        --local $script:LocalConfigPath
+    if ($LASTEXITCODE -ne 0) { throw 'Launcher configuration could not be resolved' }
+    $config = ($resolved -join "`n") | ConvertFrom-Json -AsHashtable
+    return (Resolve-LauncherConfig -Config $config)
 }
 
 function Save-LauncherOverrides {
@@ -256,6 +241,25 @@ function Test-ProfileHotReload {
     param([hashtable]$Config, [string]$Name)
 
     return (Get-ProfileMode -Config $Config -Name $Name).EndsWith('+HOT')
+}
+
+function Assert-ProfileConfiguration {
+    param([hashtable]$Config, [string]$Name)
+
+    $record = Get-ProfileRecord -Config $Config -Name $Name
+    if ($null -eq $record -or -not (Test-Path -LiteralPath ([string]$record.Path) -PathType Leaf)) {
+        throw 'Profile configuration cannot be inspected before launch.'
+    }
+    $text = [System.IO.File]::ReadAllText([string]$record.Path, [System.Text.Encoding]::UTF8).Replace('\"', '"')
+    $match = [regex]::Match($text, '(?i)(?:^|\s)-ConfigPath\s+(?:"([^"]+)"|([^\s"'']+))')
+    $selected = [System.IO.Path]::GetFullPath($script:LocalConfigPath)
+    if ($match.Success) {
+        $stored = if ($match.Groups[1].Success) { $match.Groups[1].Value } else { $match.Groups[2].Value }
+        if ([System.IO.Path]::GetFullPath($stored) -eq $selected) { return }
+    } elseif ($selected -eq [System.IO.Path]::GetFullPath((Join-Path $script:ProjectRoot 'config\launcher.local.json'))) {
+        return  # Older default profiles still select the same default file.
+    }
+    throw 'Profile uses a different launcher configuration. Run set-mode or edit-profile with this -ConfigPath to update the existing profile before starting.'
 }
 
 function Get-ProfileDirectoryArguments {
@@ -465,7 +469,9 @@ function Get-McpCommand {
         '-ExecutionPolicy',
         'Bypass',
         '-File',
-        (Quote-CommandPart -Value $mcpCommandPath)
+        (Quote-CommandPart -Value $mcpCommandPath),
+        '-ConfigPath',
+        (Quote-CommandPart -Value $script:LocalConfigPath.Replace('\', '/'))
     )
     if ($ExternalGrants -and $ExecMode) { $parts += '-AllowExec' }
     # Hot reload is a separate high-risk switch: it lets an approved chat
@@ -635,6 +641,7 @@ function Invoke-Doctor {
     if (-not (Test-ProfileExists -Config $Config -Name $Name)) {
         throw "Profile '$Name' does not exist."
     }
+    Assert-ProfileConfiguration -Config $Config -Name $Name
     $key = Import-ControlPlaneKey -Config $Config
     if (-not $key.Configured) {
         throw 'CONTROL_PLANE_API_KEY is not configured. Use the key menu first.'
@@ -684,6 +691,7 @@ function Start-TunnelForeground {
         throw "Profile '$Name' does not exist. Create it from the profile menu first."
     }
     Assert-TunnelCanStart -Config $Config -Name $Name
+    Assert-ProfileConfiguration -Config $Config -Name $Name
     Confirm-ExecProfile -Config $Config -Name $Name -AlreadyAllowed $ExecAlreadyAllowed
     $key = Import-ControlPlaneKey -Config $Config
     if (-not $key.Configured) {
@@ -728,6 +736,7 @@ function Start-TunnelWindow {
         throw "Profile '$Name' does not exist. Create it from the profile menu first."
     }
     Assert-TunnelCanStart -Config $Config -Name $Name
+    Assert-ProfileConfiguration -Config $Config -Name $Name
     Confirm-ExecProfile -Config $Config -Name $Name -AlreadyAllowed $ExecAlreadyAllowed
     $key = Import-ControlPlaneKey -Config $Config
     if (-not $key.Configured) {
@@ -736,7 +745,8 @@ function Start-TunnelWindow {
     Assert-FileExists -Path ([string]$Config.powerShell) -Label 'PowerShell 7'
     $arguments = @(
         '-NoLogo', '-NoProfile', '-NoExit', '-File', $PSCommandPath,
-        '-Action', 'start', '-Profile', $Name
+        '-Action', 'start', '-Profile', $Name,
+        '-ConfigPath', (Quote-CommandPart -Value $script:LocalConfigPath.Replace('\', '/'))
     )
     if ($SkipDoctor) { $arguments += '-SkipDoctor' }
     if ((Get-ProfileMode -Config $Config -Name $Name) -eq 'DEV' -or $ExecAlreadyAllowed) {
@@ -1099,6 +1109,15 @@ function Show-Info {
         projectRoot = $script:ProjectRoot
         defaultsPath = $script:DefaultsPath
         localConfigPath = $script:LocalConfigPath
+        workspace = [string]$Config.workspace
+        python = [string]$Config.python
+        accessPolicyPath = [string]$Config.accessPolicyPath
+        agentSourcesPath = [string]$Config.agentSourcesPath
+        agentCatalogPath = [string]$Config.agentCatalogPath
+        mcpCommand = if ((Test-Path -LiteralPath ([string]$Config.powerShell) -PathType Leaf) -and
+            (Test-Path -LiteralPath ([string]$Config.mcpScript) -PathType Leaf)) {
+            Get-McpCommand -Config $Config -ExecMode $false
+        } else { $null }
         defaultProfile = [string]$Config.defaultProfile
         tunnelClientExists = Test-Path -LiteralPath ([string]$Config.tunnelClient) -PathType Leaf
         supervisorPythonExists = Test-Path -LiteralPath ([string]$Config.python) -PathType Leaf

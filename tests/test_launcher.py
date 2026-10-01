@@ -85,6 +85,23 @@ def test_removed_totp_setup_is_not_a_launcher_action() -> None:
     assert "ValidateSet" in result.stderr
 
 
+def test_custom_configuration_rejects_unmigrated_profile_before_doctor(tmp_path: Path) -> None:
+    config = tmp_path / "launcher.json"
+    write_test_config(config, env_file=tmp_path / ".env", profile_dir=tmp_path / "profiles")
+    profile = tmp_path / "legacy.yaml"
+    profile.write_text("run-mcp.ps1\n", encoding="utf-8")
+    (tmp_path / "profiles.json").write_text(json.dumps([{"name": "legacy", "path": str(profile)}]), encoding="utf-8")
+    stub = tmp_path / "tunnel-stub.ps1"
+    stub.write_text("if ($args[0] -eq 'profiles') { Get-Content (Join-Path $PSScriptRoot 'profiles.json') -Raw; exit 0 }\nWrite-Output 'UNEXPECTED_DOCTOR_CALL'; exit 2\n", encoding="utf-8")
+    payload = json.loads(config.read_text(encoding="utf-8"))
+    payload.update(tunnelClient=str(stub), defaultProfile="legacy")
+    config.write_text(json.dumps(payload), encoding="utf-8")
+    result = run_powershell(PROJECT_ROOT / "tc.ps1", "-Action", "doctor", "-ConfigPath", str(config))
+    assert result.returncode != 0
+    assert "different launcher configuration" in result.stdout + result.stderr
+    assert "UNEXPECTED_DOCTOR_CALL" not in result.stdout + result.stderr
+
+
 def write_test_config(path: Path, *, env_file: Path, profile_dir: Path) -> None:
     workspace = path.parent / "workspace"
     workspace.mkdir(exist_ok=True)
@@ -236,6 +253,8 @@ def test_launcher_creates_safe_stdio_profile_in_isolated_directory(tmp_path: Pat
         path.read_text(encoding="utf-8") for path in profile_dir.rglob("*.yaml")
     )
     assert "run-mcp.ps1" in profile_text
+    assert "-ConfigPath" in profile_text
+    assert config.as_posix() in profile_text
     assert "run-mcp-exec.ps1" not in profile_text
     assert "env:CONTROL_PLANE_API_KEY" in profile_text
 

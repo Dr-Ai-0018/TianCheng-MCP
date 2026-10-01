@@ -247,7 +247,8 @@ def test_catalog_migrates_pre_identity_schema_before_query(tmp_path: Path) -> No
             for row in connection.execute("PRAGMA table_info(catalog_files)")
         }
         assert {"file_device", "file_inode"} <= columns
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert "scan_generation" in columns
 
 
 def test_catalog_file_identity_encodes_unsigned_windows_values_losslessly() -> None:

@@ -14,6 +14,8 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
+from contextlib import contextmanager
+from collections.abc import Iterator
 from pathlib import Path, PureWindowsPath
 
 from .security import FILE_ATTRIBUTE_REPARSE_POINT, WorkspaceSecurityError, is_native_absolute_path
@@ -23,6 +25,7 @@ from .policy import AccessPolicy, AccessPolicyError
 MAX_GRANT_TTL = 600
 MAX_PENDING_TTL = 120
 MAX_ACTIVE_GRANTS = 3
+MAX_PENDING_GRANTS = 16
 _ALLOWED_MODES = frozenset({"read", "write", "delete", "exec"})
 
 
@@ -125,18 +128,50 @@ class ExternalGrantManager:
     ) -> None:
         self.workspace_root = workspace_root.resolve(strict=True)
         self.enabled = enabled
+        self._lock = threading.RLock()
         self.access_policy = access_policy
         self._pending: dict[str, PendingGrant] = {}
         self._active: dict[str, ExternalGrant] = {}
         self._attempts: dict[str, int] = {}
         self._expired_ids: set[str] = set()
-        self._lock = threading.RLock()
+
+    @property
+    def access_policy(self) -> AccessPolicy | None:
+        with self._lock:
+            return self._access_policy
+
+    @access_policy.setter
+    def access_policy(self, value: AccessPolicy | None) -> None:
+        with self._lock:
+            self._access_policy = value
+
+    @contextmanager
+    def policy_update(self) -> Iterator[None]:
+        """Commit owner/manager policy snapshots between grant operations."""
+        with self._lock:
+            yield
 
     def _require_enabled(self) -> None:
         if not self.enabled:
             raise PermissionError("External grants are disabled; restart with --allow-external-grants")
 
+    def _check_static_deny(self, path: Path, operation: str) -> None:
+        if self.access_policy is None:
+            return
+        try:
+            decision = self.access_policy.explain(path, operation)
+        except (AccessPolicyError, WorkspaceSecurityError) as exc:
+            raise PermissionError("Static access policy could not safely evaluate this path") from exc
+        # No matching static rule is precisely what an explicit grant is for.
+        # An explicit deny, however, cannot be superseded by that capability.
+        if decision.rule_path is not None and decision.mode == "deny":
+            raise PermissionError("Static access policy denies this path")
+
     def request(self, path: str, mode: str = "read", ttl_seconds: int = 600, reason: str = "") -> dict[str, object]:
+        with self._lock:
+            return self._request_locked(path, mode, ttl_seconds, reason)
+
+    def _request_locked(self, path: str, mode: str, ttl_seconds: int, reason: str) -> dict[str, object]:
         self._require_enabled()
         if mode not in _ALLOWED_MODES:
             raise ValueError(f"mode must be one of: {', '.join(sorted(_ALLOWED_MODES))}")
@@ -177,6 +212,9 @@ class ExternalGrantManager:
             self._purge_expired_locked(now)
             if len(self._active) >= MAX_ACTIVE_GRANTS:
                 raise RuntimeError(f"At most {MAX_ACTIVE_GRANTS} active external grants are allowed")
+            self._check_static_deny(root, mode)
+            if len(self._pending) >= MAX_PENDING_GRANTS:
+                raise RuntimeError(f"At most {MAX_PENDING_GRANTS} pending external requests are allowed")
             request_id = uuid.uuid4().hex
             alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
             challenge = "".join(secrets.choice(alphabet) for _ in range(4)) + "-" + "".join(secrets.choice(alphabet) for _ in range(4))
@@ -217,6 +255,10 @@ class ExternalGrantManager:
                 raise PermissionError("Too many approval attempts; request cancelled")
             if not hmac.compare_digest(challenge, pending.challenge):
                 raise PermissionError("Invalid or mismatched approval challenge")
+            _canonical_directory(str(pending.root), self.workspace_root)
+            self._check_static_deny(pending.root, pending.mode)
+            if len(self._active) >= MAX_ACTIVE_GRANTS:
+                raise RuntimeError(f"At most {MAX_ACTIVE_GRANTS} active external grants are allowed")
             grant_id = secrets.token_urlsafe(18)
             grant = ExternalGrant(grant_id, request_id, pending.root, pending.mode, now + pending.ttl_seconds, now)
             self._active[grant_id] = grant
@@ -259,6 +301,9 @@ class ExternalGrantManager:
             return expired
 
     def resolve(self, grant_id: str, relative_path: str = ".", *, required_mode: str = "read", must_exist: bool = True, expect: str | None = None, allow_root: bool = True) -> tuple[Path, ExternalGrant]:
+        self._require_enabled()
+        if required_mode not in _ALLOWED_MODES:
+            raise ValueError("Unknown external grant operation")
         with self._lock:
             self._purge_expired_locked(time.time())
             grant = self._active.get(grant_id)
@@ -310,15 +355,30 @@ class ExternalGrantManager:
             raise IsADirectoryError(f"Expected a file: {raw}")
         if expect == "directory" and os.path.lexists(candidate) and not resolved.is_dir():
             raise NotADirectoryError(f"Expected a directory: {raw}")
+        with self._lock:
+            self._purge_expired_locked(time.time())
+            if self._active.get(grant_id) != grant:
+                raise PermissionError("Unknown or expired external grant")
+            self._check_static_deny(grant.root, required_mode)
+            self._check_static_deny(resolved, required_mode)
         return resolved, grant
 
     def _purge_expired_locked(self, now: float) -> None:
         self._pending = {key: value for key, value in self._pending.items() if value.expires_at > now}
         self._attempts = {key: value for key, value in self._attempts.items() if key in self._pending}
-        self._expired_ids.update(
-            key for key, value in self._active.items() if value.expires_at <= now
-        )
-        self._active = {key: value for key, value in self._active.items() if value.expires_at > now}
+        invalid: set[str] = set()
+        for key, value in self._active.items():
+            if value.expires_at <= now:
+                invalid.add(key)
+                continue
+            try:
+                self._check_static_deny(value.root, value.mode)
+            except PermissionError:
+                invalid.add(key)
+        # The service reaper consumes these ids and cancels/hides associated
+        # jobs. A newly denied root must not leave background work authorized.
+        self._expired_ids.update(invalid)
+        self._active = {key: value for key, value in self._active.items() if key not in invalid}
 
     @staticmethod
     def _pending_payload(item: PendingGrant) -> dict[str, object]:

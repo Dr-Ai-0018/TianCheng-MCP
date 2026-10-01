@@ -403,6 +403,7 @@ class TunnelSupervisor:
             window_seconds=config.settings.restart_budget_window_seconds,
         )
         self.last_healthy_at: str | None = None
+        self.ready_since: float | None = None
         self.last_recovery_reason: str | None = None
         self.backoff_until: str | None = None
 
@@ -627,9 +628,15 @@ class TunnelSupervisor:
             while not self._stop_requested():
                 assert self.process is not None
                 exit_code = self.process.poll()
-                elapsed = self.monotonic() - (self.started_at or self.monotonic())
+                now = self.monotonic()
+                elapsed = now - (self.started_at if self.started_at is not None else now)
                 if exit_code is None and elapsed >= self.config.settings.startup_grace_seconds:
                     ready = self._ready()
+                    if ready:
+                        if self.ready_since is None:
+                            self.ready_since = now
+                    else:
+                        self.ready_since = None
                     if ready and not healthy_written:
                         self.last_healthy_at = _utc_now()
                         self._write_state("healthy", tunnel_ready=True)
@@ -637,13 +644,17 @@ class TunnelSupervisor:
                     elif not ready:
                         self._write_state("degraded", tunnel_ready=False)
                         healthy_written = False
+                else:
+                    self.ready_since = None
                 if (
                     exit_code is None
-                    and elapsed >= self.config.settings.stable_reset_seconds
+                    and self.ready_since is not None
+                    and now - self.ready_since >= self.config.settings.stable_reset_seconds
                     and self.restart_budget.count
+                    and not self.recover_event.is_set()
                 ):
                     self.restart_budget.clear()
-                    self._write_state("healthy", tunnel_ready=self._ready())
+                    self._write_state("healthy", tunnel_ready=True)
                 reason: str | None = None
                 if exit_code is not None:
                     reason = f"tunnel_client_exit_{exit_code}"
@@ -666,6 +677,7 @@ class TunnelSupervisor:
                 if self._backoff(reason):
                     break
                 healthy_written = False
+                self.ready_since = None
                 if not self._spawn_with_recovery():
                     if not self._stop_requested():
                         terminal_state = "failed"

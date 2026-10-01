@@ -47,8 +47,10 @@ def isolate_service_local_agent_state(
     original_init = TianChengService.__init__
 
     def init_with_test_state(self: TianChengService, *args, **kwargs) -> None:
+        kwargs.setdefault("access_policy_path", tmp_path / "access-policy.json")
         kwargs.setdefault("agent_source_policy_path", tmp_path / "agent-sources.json")
         kwargs.setdefault("agent_catalog_path", tmp_path / "agent-catalog.sqlite3")
+        kwargs.setdefault("agent_env_file", tmp_path / "agent.env")
         original_init(self, *args, **kwargs)
 
     monkeypatch.setattr(TianChengService, "__init__", init_with_test_state)

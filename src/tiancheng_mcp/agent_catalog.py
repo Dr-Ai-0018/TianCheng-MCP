@@ -14,13 +14,15 @@ import sqlite3
 import threading
 import time
 from typing import Any
+import uuid
 
 from .agent_sources import AgentSource, AgentSourcePolicy
+from .catalog_storage import catalog_lock, move_database_group
 from .jobs import JobCancelled
 from .security import FILE_ATTRIBUTE_REPARSE_POINT, WorkspaceSecurityError
 
 
-AGENT_CATALOG_SCHEMA_VERSION = 2
+AGENT_CATALOG_SCHEMA_VERSION = 3
 AGENT_CATALOG_PARSER_VERSION = 1
 MAX_METADATA_READ_BYTES = 256 * 1024
 MAX_METADATA_LINES = 1_000
@@ -280,7 +282,7 @@ class AgentCatalog:
         database_resolved = self.database_path.resolve(strict=False)
         if database_resolved == self.workspace_root or self.workspace_root in database_resolved.parents:
             raise ValueError("Agent catalog database must be outside the workspace")
-        self._lock = threading.RLock()
+        self._lock = catalog_lock(self.database_path)
 
     def _connect(self) -> sqlite3.Connection:
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
@@ -300,7 +302,7 @@ class AgentCatalog:
             connection.execute("PRAGMA busy_timeout=5000")
             connection.execute("PRAGMA journal_mode=WAL")
             version = connection.execute("PRAGMA user_version").fetchone()[0]
-            if version not in {0, 1, AGENT_CATALOG_SCHEMA_VERSION}:
+            if version not in {0, 1, 2, AGENT_CATALOG_SCHEMA_VERSION}:
                 raise AgentCatalogError("Unsupported agent catalog schema version")
             self._ensure_schema(connection)
             return connection
@@ -330,11 +332,7 @@ class AgentCatalog:
     def _recover_corrupt_database(self) -> None:
         if not self.database_path.exists():
             return
-        suffix = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-        recovery = self.database_path.with_name(
-            f"{self.database_path.name}.corrupt-{suffix}"
-        )
-        self.database_path.replace(recovery)
+        move_database_group(self.database_path, "corrupt")
 
     @staticmethod
     def _ensure_schema(connection: sqlite3.Connection) -> None:
@@ -392,6 +390,16 @@ class AgentCatalog:
             connection.execute(
                 "ALTER TABLE catalog_files ADD COLUMN file_inode INTEGER NOT NULL DEFAULT 0"
             )
+        if "scan_generation" not in columns:
+            connection.execute("ALTER TABLE catalog_files ADD COLUMN scan_generation TEXT")
+        refresh_columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(catalog_refreshes)")}
+        for name, declaration in (
+            ("scan_generation", "TEXT"), ("scan_cursor", "TEXT"),
+            ("scan_fingerprint", "TEXT"), ("cycle_incomplete", "INTEGER NOT NULL DEFAULT 0"),
+            ("scan_complete", "INTEGER NOT NULL DEFAULT 0"), ("retryable_files", "INTEGER NOT NULL DEFAULT 0"),
+        ):
+            if name not in refresh_columns:
+                connection.execute(f"ALTER TABLE catalog_refreshes ADD COLUMN {name} {declaration}")
         connection.execute(
             f"PRAGMA user_version = {AGENT_CATALOG_SCHEMA_VERSION}"
         )
@@ -433,6 +441,22 @@ class AgentCatalog:
         started = time.monotonic()
         deadline = started + source.max_refresh_seconds
         existing = self._existing(source.source_id)
+        scan_fingerprint = hashlib.sha256(json.dumps(
+            [source.binding_fingerprint, AGENT_CATALOG_PARSER_VERSION, source.as_dict()["limits"]],
+            sort_keys=True).encode("utf-8")).hexdigest()
+        with self._lock, closing(self._connect()) as connection:
+            previous_scan = connection.execute("SELECT * FROM catalog_refreshes WHERE source_id = ?",
+                (source.source_id,)).fetchone()
+        resume = (previous_scan is not None and previous_scan["scan_cursor"] is not None
+            and previous_scan["scan_fingerprint"] == scan_fingerprint)
+        cursor = previous_scan["scan_cursor"] if resume else None
+        generation = previous_scan["scan_generation"] if resume else uuid.uuid4().hex
+        cycle_incomplete = bool(previous_scan["cycle_incomplete"]) if resume else False
+        def scan_key(relative: str) -> tuple[tuple[str, ...], str]:
+            parts = Path(relative).parts
+            return parts[:-1], parts[-1]
+        cursor_key = scan_key(cursor) if cursor else None
+        next_cursor = cursor
         seen: set[str] = set()
         updates: list[_IndexedFile] = []
         scanned_files = 0
@@ -458,7 +482,12 @@ class AgentCatalog:
                 break
             current_path = Path(current)
             safe_directories: list[str] = []
-            for directory in directories:
+            for directory in sorted(directories):
+                if cursor_key is not None:
+                    child_parts = (current_path / directory).relative_to(source.root).parts
+                    cursor_parent = cursor_key[0]
+                    if child_parts < cursor_parent and cursor_parent[:len(child_parts)] != child_parts:
+                        continue
                 inspected_entries += 1
                 if inspected_entries > max_entries:
                     partial = True
@@ -468,24 +497,29 @@ class AgentCatalog:
                     jail.resolve(jail.relative(child), must_exist=True, expect="directory")
                 except (OSError, ValueError, WorkspaceSecurityError):
                     error_files += 1
+                    cycle_incomplete = True
                     continue
                 safe_directories.append(directory)
             directories[:] = safe_directories
             if partial:
                 break
-            for filename in files:
+            for filename in sorted(files):
                 self._cancel_if_requested(cancel_event)
-                inspected_entries += 1
-                if inspected_entries > max_entries or time.monotonic() >= deadline:
-                    partial = True
-                    break
                 candidate = current_path / filename
                 try:
                     relative_path = jail.relative(candidate)
                 except WorkspaceSecurityError:
                     error_files += 1
+                    cycle_incomplete = True
                     continue
+                if cursor_key is not None and scan_key(relative_path) <= cursor_key:
+                    continue
+                inspected_entries += 1
+                if inspected_entries > max_entries or time.monotonic() >= deadline:
+                    partial = True
+                    break
                 if not _is_candidate(source, relative_path):
+                    next_cursor = relative_path
                     continue
                 if scanned_files >= source.max_files:
                     partial = True
@@ -497,19 +531,28 @@ class AgentCatalog:
                     status = checked.stat()
                 except (OSError, ValueError, WorkspaceSecurityError):
                     error_files += 1
+                    cycle_incomplete = True
+                    next_cursor = relative_path
                     continue
                 scanned_files += 1
                 seen.add(relative_path)
+                preceding_cursor = next_cursor
+                next_cursor = relative_path
                 size = status.st_size
                 mtime_ns = status.st_mtime_ns
                 try:
                     file_device, file_inode = _file_identity(status)
                 except AgentCatalogError:
                     error_files += 1
+                    cycle_incomplete = True
                     continue
                 previous = existing.get(relative_path)
                 if (
                     previous is not None
+                    and previous["status"] in {"ready", "oversized", "scan-oversized", "unsupported", "corrupt"}
+                    and previous["error_code"] != "metadata_read_failed"
+                    and (previous["status"] != "oversized" or size > source.max_file_bytes)
+                    and (previous["status"] != "scan-oversized" or size > source.max_scan_bytes)
                     and previous["size"] == size
                     and previous["mtime_ns"] == mtime_ns
                     and previous["file_device"] == file_device
@@ -518,7 +561,12 @@ class AgentCatalog:
                     and previous["source_fingerprint"]
                     == source.binding_fingerprint
                 ):
-                    unchanged_files += 1
+                    if previous["status"] == "ready":
+                        unchanged_files += 1
+                    elif previous["status"] in {"oversized", "scan-oversized"}:
+                        skipped_files += 1
+                    else:
+                        error_files += 1
                     continue
                 if size > source.max_file_bytes:
                     skipped_files += 1
@@ -551,12 +599,17 @@ class AgentCatalog:
                             file_device,
                             file_inode,
                             None,
-                            "deferred",
-                            "scan_budget_exceeded",
+                            "scan-oversized" if size > source.max_scan_bytes else "deferred",
+                            "file_exceeds_scan_budget" if size > source.max_scan_bytes else "scan_budget_exceeded",
                         )
                     )
-                    partial = True
-                    break
+                    if size <= source.max_scan_bytes:
+                        # Retry from this file next time, rather than charging
+                        # an earlier transient failure the whole budget again.
+                        next_cursor = preceding_cursor
+                        partial = True
+                        break
+                    continue
                 scanned_bytes += size
                 updated_at = _iso_from_epoch(status.st_mtime)
                 try:
@@ -663,12 +716,16 @@ class AgentCatalog:
         if walk_errors:
             error_files += len(walk_errors)
             partial = True
+            cycle_incomplete = True
 
+        scan_complete = not partial
         removed_files = 0
         refreshed_at = _iso_from_epoch(time.time())
+        self._cancel_if_requested(cancel_event)
         with self._lock, closing(self._connect()) as connection:
             connection.execute("BEGIN IMMEDIATE")
             for item in updates:
+                self._cancel_if_requested(cancel_event)
                 connection.execute(
                     """
                     INSERT INTO catalog_files (
@@ -718,14 +775,25 @@ class AgentCatalog:
                         int(item.metadata_truncated),
                     ),
                 )
-            if not partial:
-                stale = set(existing) - seen
+            for relative_path in seen:
+                self._cancel_if_requested(cancel_event)
+                connection.execute("UPDATE catalog_files SET scan_generation = ? WHERE source_id = ? AND relative_path = ?",
+                    (generation, source.source_id, relative_path))
+            if scan_complete and not cycle_incomplete:
+                stale = [str(row[0]) for row in connection.execute(
+                    "SELECT relative_path FROM catalog_files WHERE source_id = ? AND (scan_generation IS NULL OR scan_generation != ?)",
+                    (source.source_id, generation))]
                 for relative_path in stale:
+                    self._cancel_if_requested(cancel_event)
                     connection.execute(
                         "DELETE FROM catalog_files WHERE source_id = ? AND relative_path = ?",
                         (source.source_id, relative_path),
                     )
                 removed_files = len(stale)
+            retryable_files = connection.execute("SELECT COUNT(*) FROM catalog_files WHERE source_id = ? AND "
+                "(status IN ('deferred', 'active-writing') OR error_code = 'metadata_read_failed')",
+                (source.source_id,)).fetchone()[0]
+            partial = not scan_complete or cycle_incomplete or retryable_files > 0
             connection.execute(
                 """
                 INSERT INTO catalog_refreshes (
@@ -755,12 +823,19 @@ class AgentCatalog:
                     removed_files,
                 ),
             )
+            connection.execute("UPDATE catalog_refreshes SET scan_generation = ?, scan_cursor = ?, "
+                "scan_fingerprint = ?, cycle_incomplete = ?, scan_complete = ?, retryable_files = ? WHERE source_id = ?",
+                (generation, None if scan_complete else next_cursor, scan_fingerprint,
+                 int(cycle_incomplete), int(scan_complete), retryable_files, source.source_id))
+            self._cancel_if_requested(cancel_event)
             connection.commit()
         return {
             "source_id": source.source_id,
             "provider": source.provider,
             "state": "partial" if partial else "complete",
             "partial": partial,
+            "scan_complete": scan_complete,
+            "retryable_files": retryable_files,
             "scanned_files": scanned_files,
             "parsed_files": parsed_files,
             "unchanged_files": unchanged_files,
@@ -804,6 +879,8 @@ class AgentCatalog:
                         else {
                             "refreshed_at": refresh["refreshed_at"],
                             "partial": bool(refresh["partial"]),
+                            "scan_complete": bool(refresh["scan_complete"]),
+                            "retryable_files": refresh["retryable_files"],
                             "scanned_files": refresh["scanned_files"],
                             "parsed_files": refresh["parsed_files"],
                             "unchanged_files": refresh["unchanged_files"],

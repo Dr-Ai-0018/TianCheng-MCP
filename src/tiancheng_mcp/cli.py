@@ -12,6 +12,7 @@ from pathlib import Path
 from .proxy import ProxySettings
 from .server import create_server
 from .service import TianChengService
+from .runtime_config import launcher_config, runtime_arguments
 
 
 WORKSPACE_ENV = "TIANCHENG_WORKSPACE"
@@ -42,6 +43,8 @@ def _ensure_private_directory(path: Path) -> None:
 def build_parser() -> argparse.ArgumentParser:
     config_dir, state_dir = _runtime_directories()
     parser = argparse.ArgumentParser(description="TianCheng workspace-jailed MCP server")
+    parser.add_argument("--runtime-config", default=None, help="Resolve launcher settings before explicit CLI options")
+    parser.add_argument("--runtime-project-root", default=str(PROJECT_ROOT), help="Checkout containing launcher defaults")
     parser.add_argument(
         "--workspace",
         default=os.environ.get(WORKSPACE_ENV) or None,
@@ -131,6 +134,14 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.runtime_config:
+        local_path = Path(args.runtime_config).resolve()
+        config = launcher_config(Path(args.runtime_project_root), local_path)
+        # Explicit command-line options follow configuration and win. Enabling
+        # execution or approvals is never inferred from configuration fields.
+        args = parser.parse_args(runtime_arguments(config, local_path) + (
+            list(sys.argv[1:]) if argv is None else argv
+        ))
     if not args.workspace:
         parser.error(
             "--workspace is required (or set the "

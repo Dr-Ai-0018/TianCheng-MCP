@@ -152,11 +152,14 @@ def test_search_scan_budget_is_aggregate(service: TianChengService) -> None:
     assert result["truncated"] is True
 
 
+@pytest.mark.parametrize("engine", ["python", "ripgrep"])
 def test_search_respects_gitignore_and_internal_excludes(
-    service: TianChengService,
+    service: TianChengService, engine: str,
 ) -> None:
-    if not service.rg_executable:
+    if engine == "ripgrep" and not service.rg_executable:
         pytest.skip("ripgrep is unavailable")
+    if engine == "python":
+        service.rg_executable = None
     service.write_text(".gitignore", "ignored/\n")
     service.write_text("visible.txt", "special needle\n")
     service.write_text("ignored/hidden.txt", "special needle\n")

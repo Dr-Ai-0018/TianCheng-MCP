@@ -116,6 +116,7 @@ class WorkspaceJail:
         must_exist: bool,
         expect: str | None = None,
         allow_root: bool = True,
+        operation: str | None = None,
     ) -> Path:
         """Return a checked path.
 
@@ -193,7 +194,8 @@ class WorkspaceJail:
                     f"Symlink, junction, or reparse point is not allowed: {part!r}"
                 )
 
-    def reject_reparse_tree(self, root: Path, *, max_entries: int = 200_000) -> None:
+    def reject_reparse_tree(self, root: Path, *, max_entries: int = 200_000,
+                            operation: str | None = None, destination: Path | None = None) -> None:
         """Reject reparse points anywhere below an existing directory."""
 
         checked = self.resolve(self.relative(root), must_exist=True)

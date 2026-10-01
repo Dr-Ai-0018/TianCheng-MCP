@@ -1136,10 +1136,11 @@ def test_agent_run_receives_immediate_stdin_eof(workspace, tmp_path) -> None:
         "result"
     ] == "eof"
     assert "process_id" not in started
-    process = service._get_managed_process(
+    process = service._process_status(
         service._get_agent_run(session["session_id"], started["run_id"])[1].process_id
     )
-    assert process.stdin_closed is True
+    assert process["stdin_closed"] is True
+    assert process["resources_released"] is True
 
 
 def test_isolated_agent_profile_freezes_and_injects_isolated_codex_home(monkeypatch) -> None:

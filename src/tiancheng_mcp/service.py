@@ -52,6 +52,12 @@ from .agents import (
     new_session_id,
 )
 from .audit import AuditLogger
+from .access_context import AccessContext, ContextJail
+from .git_runtime import GitRuntime
+from .file_operations import coordinate_mutation
+from .process_runtime import ProcessSlots, _ManagedProcess, _drain_managed_stream
+from .protocol_stream import ProtocolStreamError
+from .search_runtime import SearchCandidates
 from .grants import ExternalGrantManager
 from .jobs import JobCancelled, JobManager, current_cancel_event, current_job_id
 from .policy import AccessPolicy, AccessPolicyError, AccessRule, _canonical_target
@@ -67,6 +73,9 @@ MAX_COMMAND_OUTPUT_BYTES = 1024 * 1024
 DEFAULT_MANAGED_OUTPUT_BYTES = 512 * 1024
 MAX_MANAGED_OUTPUT_BYTES = 2 * 1024 * 1024
 MAX_MANAGED_PROCESSES = 32
+MAX_PROCESS_HISTORY = 128
+MAX_PROCESS_HISTORY_BYTES = 64 * 1024 * 1024
+PROCESS_HISTORY_SECONDS = 3600
 MAX_AGENT_RUNTIME_SECONDS = 3 * 60 * 60
 DEFAULT_GIT_OUTPUT_BYTES = 512 * 1024
 MAX_LIST_DEPTH = 5
@@ -126,13 +135,6 @@ def _desktop_codex_roots() -> tuple[Path, ...]:
 
 _EXEC_ENVIRONMENT_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _AGENT_ENVIRONMENT_OVERRIDE_NAMES = frozenset({"AWZ_ROUTE"})
-_DEFAULT_SEARCH_EXCLUDES = (
-    "!**/.git/**",
-    "!**/.tiancheng-trash/**",
-    "!**/.tiancheng-tmp/**",
-    "!**/node_modules/**",
-    "!**/.venv/**",
-)
 _T = TypeVar("_T")
 
 # These operations are strictly bounded and are needed to inspect/stop a busy
@@ -472,127 +474,6 @@ def _run_process_bounded(
     }
 
 
-class _ManagedProcess:
-    """One long-running allowlisted process with bounded in-memory output."""
-
-    def __init__(
-        self,
-        process_id: str,
-        command: str,
-        cwd: str,
-        process: subprocess.Popen[bytes],
-        kill_job: _WindowsKillJob,
-        output_limit: int,
-        max_runtime_seconds: int,
-        owner: str = "process",
-    ) -> None:
-        self.process_id = process_id
-        self.owner = owner
-        self.session_id = f"sess_{uuid.uuid4().hex}"
-        self.command = command
-        self.cwd = cwd
-        self.process = process
-        self.kill_job = kill_job
-        self.output_limit = output_limit
-        self.max_runtime_seconds = max_runtime_seconds
-        self.started_epoch = time.time()
-        self.ended_epoch: float | None = None
-        self.exit_code: int | None = None
-        self.timed_out = False
-        self.stop_requested = False
-        self.stdout = bytearray()
-        self.stderr = bytearray()
-        self.stdout_total = 0
-        self.stderr_total = 0
-        self.lock = threading.Lock()
-        self.reader_threads: list[threading.Thread] = []
-        self.stdin_lock = threading.Lock()
-        self.stdin_closed = process.stdin is None
-
-    def append_output(self, stream: str, chunk: bytes) -> None:
-        with self.lock:
-            buffer = self.stdout if stream == "stdout" else self.stderr
-            if stream == "stdout":
-                self.stdout_total += len(chunk)
-            else:
-                self.stderr_total += len(chunk)
-            buffer.extend(chunk)
-            if len(buffer) > self.output_limit:
-                del buffer[: len(buffer) - self.output_limit]
-
-    def snapshot_output(
-        self, stream: str, maximum: int, after_bytes: int = 0
-    ) -> dict[str, Any]:
-        if after_bytes < 0:
-            raise ValueError("after_bytes must be non-negative")
-        with self.lock:
-            result: dict[str, Any] = {}
-            for name, buffer, total in (
-                ("stdout", self.stdout, self.stdout_total),
-                ("stderr", self.stderr, self.stderr_total),
-            ):
-                if stream not in {name, "both"}:
-                    continue
-                base = max(0, total - len(buffer))
-                requested = after_bytes
-                gap = requested < base
-                start = max(requested, base)
-                relative = start - base
-                chunk = bytes(buffer[relative : relative + maximum])
-                result[name] = chunk.decode("utf-8", errors="replace")
-                result[f"{name}_bytes_total"] = total
-                result[f"{name}_offset_bytes"] = start
-                result[f"{name}_next_offset_bytes"] = start + len(chunk)
-                result[f"{name}_truncated"] = gap or (start + len(chunk) < total)
-                result[f"{name}_cursor_gap"] = gap
-            return result
-
-    def protocol_stdout(self, after_bytes: int, maximum: int) -> tuple[bytes, int, bool]:
-        """Internal raw stream for a strict, incremental JSON-RPC decoder."""
-        with self.lock:
-            base = max(0, self.stdout_total - len(self.stdout))
-            start = max(base, after_bytes)
-            chunk = bytes(self.stdout[start - base:start - base + maximum])
-            return chunk, start + len(chunk), after_bytes < base
-
-    def send_input(self, text: str, close_stdin: bool = False) -> int:
-        if not isinstance(text, str):
-            raise ValueError("input must be text")
-        data = text.encode("utf-8")
-        if len(data) > 256 * 1024:
-            raise ValueError("input is limited to 256 KiB per call")
-        with self.stdin_lock:
-            if self.stdin_closed or self.process.stdin is None:
-                raise RuntimeError("process stdin is closed")
-            if self.process.poll() is not None:
-                raise RuntimeError("process has already exited")
-            try:
-                self.process.stdin.write(data)
-                self.process.stdin.flush()
-                if close_stdin:
-                    self.process.stdin.close()
-                    self.stdin_closed = True
-            except (BrokenPipeError, OSError) as exc:
-                self.stdin_closed = True
-                raise RuntimeError("process stdin is unavailable") from exc
-        return len(data)
-
-
-def _drain_managed_stream(
-    stream: Any, record: _ManagedProcess, stream_name: str
-) -> None:
-    # read() blocks until it has the full request or the pipe closes, so a
-    # long-running process that emits a few hundred bytes at a time would
-    # deliver nothing until it exited. read1() returns whatever one underlying
-    # read yields, which is what makes incremental output actually incremental.
-    read_available = getattr(stream, "read1", None) or stream.read
-    while True:
-        chunk = read_available(65536)
-        if not chunk:
-            break
-        record.append_output(stream_name, chunk)
-
-
 class TianChengService:
     def __init__(
         self,
@@ -734,10 +615,17 @@ class TianChengService:
             self.agent_catalog = AgentCatalog(catalog_location, self.jail.root)
         else:
             self.agent_source_policy = AgentSourcePolicy.empty()
+        self._audit_health_lock = threading.Lock()
+        self._audit_failure_count = 0
+        self._audit_last_error_type: str | None = None
         self._agent_sessions: dict[str, AgentSessionState] = {}
         self._agent_lock = threading.RLock()
         self._processes: dict[str, _ManagedProcess] = {}
         self._process_lock = threading.Lock()
+        self._process_slots = ProcessSlots()
+        self._process_closing = False
+        self._expired_processes: dict[str, float] = {}
+        self._agent_process_history: dict[str, dict[str, Any]] = {}
         self.jobs: JobManager | None = JobManager() if enable_jobs else None
         self._grant_reaper_stop = threading.Event()
         self._grant_reaper: threading.Thread | None = None
@@ -819,7 +707,7 @@ class TianChengService:
         while not self._grant_reaper_stop.wait(0.25):
             for grant_id in self.external_grants.expire():
                 if self.jobs is not None:
-                    self.jobs.cancel_for_grant(grant_id, "grant expired")
+                    self.jobs.cancel_for_grant(grant_id, "grant expired or static policy denied")
 
     @staticmethod
     def _check_cancelled() -> None:
@@ -897,11 +785,17 @@ class TianChengService:
         try:
             self.audit.record(**event)
         except Exception as exc:  # noqa: BLE001 - audit failures are deliberately isolated
-            print(
-                f"WARNING: audit record failed ({type(exc).__name__})",
-                file=sys.stderr,
-                flush=True,
-            )
+            with self._audit_health_lock:
+                self._audit_failure_count = min(self._audit_failure_count + 1, 2**63 - 1)
+                self._audit_last_error_type = type(exc).__name__[:100]
+            try:
+                print(f"WARNING: audit record failed ({type(exc).__name__})", file=sys.stderr, flush=True)
+            except (OSError, ValueError):
+                pass
+
+    def _audit_health(self) -> dict[str, Any]:
+        with self._audit_health_lock:
+            return {"failure_count": self._audit_failure_count, "last_error_type": self._audit_last_error_type}
 
     def run_with_fallback(
         self,
@@ -939,7 +833,7 @@ class TianChengService:
             idempotency_fingerprint=idempotency_fingerprint,
         )
         if not completed:
-            self.audit.record(
+            self._record_audit_safely(
                 tool=tool,
                 relative_path=relative_path,
                 success=True,
@@ -1017,7 +911,7 @@ class TianChengService:
         if self.jobs is None:
             raise RuntimeError("Job manager is disabled for this service instance")
         result = self.jobs.cancel(job_id, reason)
-        self.audit.record(
+        self._record_audit_safely(
             tool="job_cancel",
             relative_path="<job>",
             success=True,
@@ -1035,6 +929,7 @@ class TianChengService:
 
     def workspace_info(self) -> dict[str, Any]:
         return {
+            "audit_health": self._audit_health(),
             "workspace_root": str(self.jail.root),
             "server_version": __version__,
             "capabilities": {
@@ -1228,8 +1123,12 @@ class TianChengService:
         if self.access_policy_path.resolve(strict=False) == self.jail.root or self.jail.root in self.access_policy_path.resolve(strict=False).parents:
             raise ValueError("Access policy must be stored outside the workspace")
         loaded = self._load_access_policy()
-        self.access_policy = loaded
-        self.external_grants.access_policy = loaded
+        with self.external_grants.policy_update():
+            self.access_policy = loaded
+            self.external_grants.access_policy = loaded
+        if self.jobs is not None:
+            for grant_id in self.external_grants.expire():
+                self.jobs.cancel_for_grant(grant_id, "grant expired or static policy denied")
         revoked_runs = self._stop_revoked_claude_command_runs()
         return {"reloaded": True, "revoked_claude_runs": revoked_runs, **loaded.summary()}
 
@@ -1475,14 +1374,25 @@ class TianChengService:
         _, grant = self.external_grants.resolve(
             grant_id, ".", required_mode=required_mode, must_exist=True, expect="directory"
         )
-        return TianChengService(
-            grant.root,
-            None,
+        def authorize(path: Path, operation: str) -> None:
+            mode = "read" if operation == "list" else operation
+            self.external_grants.resolve(
+                grant_id, str(path), required_mode=mode, must_exist=False,
+            )
+
+        return self._scoped_service(
+            AccessContext(grant.root, required_mode, lambda: self.access_policy, authorize),
             allow_exec=grant.mode == "exec",
-            passthrough_env=self.passthrough_env,
-            enable_jobs=False,
-            enable_agent_catalog=False,
         )
+
+    def _scoped_service(self, context: AccessContext, *, allow_exec: bool = False) -> TianChengService:
+        scoped = TianChengService(
+            context.root, None, allow_exec=allow_exec,
+            passthrough_env=self.passthrough_env, enable_jobs=False,
+            enable_agent_catalog=False, access_policy=AccessPolicy.default(context.root),
+        )
+        scoped.jail = ContextJail(context)
+        return scoped
 
     def _grant_relative_path(
         self, grant_id: str, path: str, required_mode: str, *,
@@ -1529,7 +1439,7 @@ class TianChengService:
         return self._external_service(grant_id, "write").move(source_relative, destination_relative)
 
     def external_copy(self, grant_id: str, source: str, destination: str) -> dict[str, Any]:
-        source_relative = self._grant_relative_path(grant_id, source, "write", allow_root=False)
+        source_relative = self._grant_relative_path(grant_id, source, "read", allow_root=False)
         destination_relative = self._grant_relative_path(grant_id, destination, "write", must_exist=False, allow_root=False)
         return self._external_service(grant_id, "write").copy(source_relative, destination_relative)
 
@@ -1584,21 +1494,16 @@ class TianChengService:
             relative = target.relative_to(root).as_posix() or "."
         except ValueError as exc:
             raise WorkspaceSecurityError("Static policy path escaped its rule root") from exc
-        scoped = TianChengService(
-            root,
-            None,
+        scoped = self._scoped_service(
+            AccessContext(root, operation, lambda: self.access_policy),
             allow_exec=operation == "exec" and decision.allow_exec,
-            passthrough_env=self.passthrough_env,
-            enable_jobs=False,
-            enable_agent_catalog=False,
-            access_policy=AccessPolicy.default(root),
         )
         return scoped, relative
 
     def _policy_scoped_pair(
-        self, source: str, destination: str, operation: str
+        self, source: str, destination: str, operation: str, *, source_operation: str | None = None
     ) -> tuple["TianChengService", str, str]:
-        source_decision = self.access_policy.authorize(source, operation)
+        source_decision = self.access_policy.authorize(source, source_operation or operation)
         destination_decision = self.access_policy.authorize(destination, operation)
         if source_decision.requires_approval or destination_decision.requires_approval:
             raise PermissionError(
@@ -1627,13 +1532,8 @@ class TianChengService:
             destination_relative = destination_decision.path.relative_to(root).as_posix() or "."
         except ValueError as exc:
             raise WorkspaceSecurityError("Static policy path escaped its rule root") from exc
-        scoped = TianChengService(
-            root,
-            None,
-            passthrough_env=self.passthrough_env,
-            enable_jobs=False,
-            enable_agent_catalog=False,
-            access_policy=AccessPolicy.default(root),
+        scoped = self._scoped_service(
+            AccessContext(root, operation, lambda: self.access_policy),
         )
         return scoped, source_relative, destination_relative
 
@@ -1701,7 +1601,7 @@ class TianChengService:
             scoped.shutdown()
 
     def policy_external_copy(self, source: str, destination: str) -> dict[str, Any]:
-        scoped, source_relative, destination_relative = self._policy_scoped_pair(source, destination, "write")
+        scoped, source_relative, destination_relative = self._policy_scoped_pair(source, destination, "write", source_operation="read")
         try:
             return scoped.copy(source_relative, destination_relative)
         finally:
@@ -1793,6 +1693,8 @@ class TianChengService:
                     entries.append(metadata)
                     if checked.is_dir() and current_depth < depth:
                         queue.append((checked, current_depth + 1))
+                except PermissionError:
+                    continue
                 except WorkspaceSecurityError:
                     stat_result = child.lstat()
                     entries.append(
@@ -2001,11 +1903,13 @@ class TianChengService:
                 stream.flush()
                 os.fsync(stream.fileno())
             self.jail.resolve(self.jail.relative(target), must_exist=False, allow_root=False)
+            self._check_cancelled()
             os.replace(temporary, target)
         except Exception:
             temporary.unlink(missing_ok=True)
             raise
 
+    @coordinate_mutation("path")
     def write_text(
         self,
         path: str,
@@ -2043,6 +1947,7 @@ class TianChengService:
             "sha256": self._sha256_bytes(encoded),
         }
 
+    @coordinate_mutation("path")
     def edit_text(
         self,
         path: str,
@@ -2100,6 +2005,7 @@ class TianChengService:
             "atomic_replace": True,
         }
 
+    @coordinate_mutation("path")
     def append_text(
         self,
         path: str,
@@ -2114,8 +2020,10 @@ class TianChengService:
             raise IsADirectoryError(f"Cannot append to a directory: {path}")
         expected_hash = self._validate_expected_sha256(expected_sha256)
         previous_hash: str | None = None
+        previous_data = b""
         if target.exists():
-            previous_hash = self._sha256_bytes(target.read_bytes())
+            previous_data = target.read_bytes()
+            previous_hash = self._sha256_bytes(previous_data)
         if expected_hash is not None and previous_hash != expected_hash:
             raise RuntimeError("File changed since it was read; expected_sha256 does not match")
         if not target.parent.exists():
@@ -2124,19 +2032,19 @@ class TianChengService:
             target.parent.mkdir(parents=True, exist_ok=False)
         self.jail.resolve(self.jail.relative(target.parent), must_exist=True, expect="directory")
         encoded = content.encode("utf-8")
-        with target.open("ab") as stream:
-            stream.write(encoded)
-            stream.flush()
-            os.fsync(stream.fileno())
-        current_hash = self._sha256_bytes(target.read_bytes())
+        updated = previous_data + encoded
+        self._atomic_replace_bytes(target, updated)
+        current_hash = self._sha256_bytes(updated)
         return {
             "path": self.jail.relative(target),
             "bytes_appended": len(encoded),
             "size": target.stat().st_size,
             "previous_sha256": previous_hash,
             "sha256": current_hash,
+            "atomic_replace": True,
         }
 
+    @coordinate_mutation("path")
     def mkdir(self, path: str, parents: bool = True, exist_ok: bool = True) -> dict[str, Any]:
         target = self.jail.resolve(path, must_exist=False, allow_root=False)
         existed = target.exists()
@@ -2146,6 +2054,7 @@ class TianChengService:
         checked = self.jail.resolve(path, must_exist=True, expect="directory", allow_root=False)
         return {"path": self.jail.relative(checked), "created": not existed}
 
+    @coordinate_mutation("source", "destination")
     def move(self, source: str, destination: str) -> dict[str, Any]:
         source_path = self.jail.resolve(source, must_exist=True, allow_root=False)
         destination_path = self.jail.resolve(destination, must_exist=False, allow_root=False)
@@ -2153,7 +2062,8 @@ class TianChengService:
             raise FileExistsError("Destination already exists; move never overwrites")
         if source_path.is_dir() and source_path in destination_path.parents:
             raise ValueError("A directory cannot be moved inside itself")
-        self.jail.reject_reparse_tree(source_path)
+        self.jail.reject_reparse_tree(source_path, operation="write", destination=destination_path)
+        self._check_cancelled()
         destination_path.parent.mkdir(parents=True, exist_ok=True)
         self.jail.resolve(
             self.jail.relative(destination_path.parent), must_exist=True, expect="directory"
@@ -2164,14 +2074,16 @@ class TianChengService:
             "destination": self.jail.relative(moved.resolve(strict=True)),
         }
 
+    @coordinate_mutation("source", "destination")
     def copy(self, source: str, destination: str) -> dict[str, Any]:
-        source_path = self.jail.resolve(source, must_exist=True, allow_root=False)
+        source_path = self.jail.resolve(source, must_exist=True, allow_root=False, operation="read")
         destination_path = self.jail.resolve(destination, must_exist=False, allow_root=False)
         if destination_path.exists():
             raise FileExistsError("Destination already exists; copy never overwrites")
         if source_path.is_dir() and source_path in destination_path.parents:
             raise ValueError("A directory cannot be copied inside itself")
-        self.jail.reject_reparse_tree(source_path)
+        self.jail.reject_reparse_tree(source_path, operation="read", destination=destination_path)
+        self._check_cancelled()
         destination_path.parent.mkdir(parents=True, exist_ok=True)
         self.jail.resolve(
             self.jail.relative(destination_path.parent), must_exist=True, expect="directory"
@@ -2186,18 +2098,19 @@ class TianChengService:
             "type": "directory" if destination_path.is_dir() else "file",
         }
 
+    @coordinate_mutation(whole_workspace=True)
     def delete(self, path: str) -> dict[str, Any]:
         target = self.jail.resolve(path, must_exist=True, allow_root=False)
+        self.jail.reject_reparse_tree(target, operation="delete")
         trash = self.jail.resolve(".tiancheng-trash", must_exist=False, allow_root=False)
         trash.mkdir(parents=True, exist_ok=True)
-        if target == trash:
-            raise WorkspaceSecurityError("The trash root cannot be deleted through this tool")
+        if target == trash or trash in target.parents:
+            raise WorkspaceSecurityError("Trash items must be restored or purged through the trash tools")
         timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S.%fZ")
         destination = trash / f"{timestamp}-{uuid.uuid4().hex[:8]}-{target.name}"
         destination = self.jail.resolve(
             self.jail.relative(destination), must_exist=False, allow_root=False
         )
-        os.replace(target, destination)
         metadata_directory = self._trash_metadata_directory(trash, create=True)
         metadata_path = metadata_directory / f"{destination.name}.json"
         metadata = {
@@ -2205,10 +2118,20 @@ class TianChengService:
             "trash_path": self.jail.relative(destination),
             "deleted_at": datetime.now(UTC).isoformat(),
         }
-        metadata_path.write_text(
-            json.dumps(metadata, ensure_ascii=False, separators=(",", ":")),
-            encoding="utf-8",
-        )
+        # This durable intent is sufficient to restore even if the server stops
+        # immediately after the payload move. Metadata failure leaves the source.
+        self._atomic_replace_bytes(metadata_path, json.dumps(
+            metadata, ensure_ascii=False, separators=(",", ":")
+        ).encode("utf-8"))
+        try:
+            self._check_cancelled()
+            os.replace(target, destination)
+        except BaseException:
+            try:
+                metadata_path.unlink(missing_ok=True)
+            except OSError:
+                pass  # Orphan intent has no payload and is not a trash item.
+            raise
         return {
             "original_path": metadata["original_path"],
             "trash_path": self.jail.relative(destination),
@@ -2254,6 +2177,7 @@ class TianChengService:
             return None
         return value if isinstance(value, dict) else None
 
+    @coordinate_mutation(whole_workspace=True)
     def trash_list(self, max_results: int = 200) -> dict[str, Any]:
         maximum = _bounded_int(
             max_results, minimum=1, maximum=MAX_GLOB_RESULTS, label="max_results"
@@ -2296,6 +2220,7 @@ class TianChengService:
             "max_results": maximum,
         }
 
+    @coordinate_mutation(whole_workspace=True)
     def trash_restore(
         self, trash_path: str, destination: str | None = None
     ) -> dict[str, Any]:
@@ -2312,15 +2237,22 @@ class TianChengService:
             self.jail.relative(target.parent), must_exist=True, expect="directory"
         )
         self.jail.reject_reparse_tree(item)
+        self._check_cancelled()
         os.replace(item, target)
         metadata_path = trash / ".metadata" / f"{item.name}.json"
-        metadata_path.unlink(missing_ok=True)
+        cleanup_pending = False
+        try:
+            metadata_path.unlink(missing_ok=True)
+        except OSError:
+            cleanup_pending = True
         return {
             "trash_path": trash_path,
             "restored_path": self.jail.relative(target),
             "restored": True,
+            "metadata_cleanup_pending": cleanup_pending,
         }
 
+    @coordinate_mutation(whole_workspace=True)
     def trash_purge(self, trash_path: str | None = None) -> dict[str, Any]:
         trash = self._trash_root()
         if trash_path is None:
@@ -2365,7 +2297,7 @@ class TianChengService:
                 try:
                     self.jail.resolve(self.jail.relative(child), must_exist=True)
                     safe_directories.append(name)
-                except WorkspaceSecurityError:
+                except (WorkspaceSecurityError, PermissionError):
                     continue
             directories[:] = safe_directories
             for name in [*safe_directories, *files]:
@@ -2377,7 +2309,7 @@ class TianChengService:
                 child = current_path / name
                 try:
                     checked = self.jail.resolve(self.jail.relative(child), must_exist=True)
-                except WorkspaceSecurityError:
+                except (WorkspaceSecurityError, PermissionError):
                     continue
                 relative = self.jail.relative(checked)
                 match_relative = checked.relative_to(base).as_posix()
@@ -2451,13 +2383,14 @@ class TianChengService:
             )
         result = self._search_text_python(
             query, glob_pattern, case_sensitive, maximum, scan_limit, base,
-            self._cancel_event(),
+            self._cancel_event(), include_hidden=include_hidden, respect_gitignore=respect_gitignore,
+            include_internal=include_internal, timeout_seconds=timeout,
         )
         result.update(
             {
                 "engine": "python-fallback",
                 "include_hidden": include_hidden,
-                "respect_gitignore": False,
+                "respect_gitignore": respect_gitignore,
                 "include_internal": include_internal,
                 "base_path": self.jail.relative(base),
             }
@@ -2492,86 +2425,17 @@ class TianChengService:
             "NO_COLOR": "1",
         }
 
-        # Enumerate only requested files first. This makes max_scan_bytes an
-        # aggregate budget and prevents unrelated files from consuming rg's
-        # bounded output before the requested glob is reached.
-        file_arguments = [
-            self.rg_executable,
-            "--files",
-            "--color",
-            "never",
-            "--sort",
-            "path",
-        ]
-        normalized_glob = glob_pattern.replace("\\", "/")
-        # ripgrep's --glob intentionally overrides ignore rules. Preserve
-        # .gitignore semantics by applying the user glob in Python whenever
-        # ignore handling is enabled; with respect_gitignore=false it is safe
-        # and faster to let ripgrep prune the candidate list directly.
-        if not respect_gitignore:
-            file_arguments.extend(("--glob", normalized_glob))
-        if include_hidden:
-            file_arguments.append("--hidden")
-        file_arguments.append("--no-require-git" if respect_gitignore else "--no-ignore")
-        if not include_internal:
-            for exclusion in _DEFAULT_SEARCH_EXCLUDES:
-                file_arguments.extend(("--glob", exclusion))
-        file_arguments.append(self.jail.relative(base))
-        started = time.monotonic()
-        if cancel_event is not None and cancel_event.is_set():
-            raise JobCancelled("Job cancelled")
-        file_list = _run_process_bounded(
-            file_arguments,
-            cwd=self.jail.root,
-            env=environment,
-            timeout_seconds=timeout_seconds,
-            maximum_output=max(MAX_COMMAND_OUTPUT_BYTES, min(scan_limit, 8 * 1024 * 1024)),
-            cancel_event=cancel_event,
-        )
-        if file_list["cancelled"]:
-            raise JobCancelled("Job cancelled during ripgrep file enumeration")
-        if file_list["timeout"]:
-            raise TimeoutError("ripgrep file enumeration timed out")
-        if file_list["exit_code"] not in {0, 1}:
-            raise RuntimeError(f"ripgrep file enumeration failed: {file_list['stderr'].strip()}")
-
-        candidates: list[str] = []
-        scanned_bytes = 0
-        scanned_files = 0
-        scan_truncated = file_list["stdout_truncated"]
-        for raw_path in file_list["stdout"].splitlines():
-            if cancel_event is not None and cancel_event.is_set():
-                raise JobCancelled("Job cancelled during ripgrep candidate enumeration")
-            raw_path = raw_path.strip()
-            if not raw_path:
-                continue
-            relative_label = raw_path.replace("\\", "/")
-            if relative_label.startswith("./"):
-                relative_label = relative_label[2:]
-            try:
-                checked = self.jail.resolve(relative_label, must_exist=True, expect="file")
-            except (OSError, WorkspaceSecurityError):
-                continue
-            checked_label = self.jail.relative(checked)
-            match_relative = checked.relative_to(base).as_posix()
-            if not matcher.fullmatch(match_relative):
-                continue
-            if scanned_files >= MAX_SEARCH_SCANNED_FILES:
-                scan_truncated = True
-                break
-            size = checked.stat().st_size
-            if size > per_file_limit:
-                continue
-            if scanned_bytes + size > scan_limit:
-                scan_truncated = True
-                break
-            candidates.append(checked_label)
-            scanned_files += 1
-            scanned_bytes += size
-
+        selection = SearchCandidates(self.jail, base, glob_pattern, include_hidden,
+            respect_gitignore, include_internal, scan_limit, per_file_limit,
+            MAX_SEARCH_SCANNED_FILES, timeout_seconds, cancel_event).collect()
+        started = selection.started
+        candidates = [self.jail.relative(path) for path in selection.paths]
+        scanned_files = len(candidates)
+        scanned_bytes = selection.scanned_bytes
+        scan_truncated = selection.truncated
         matches: list[dict[str, Any]] = []
         invalid_records = 0
-        output_truncated = file_list["stdout_truncated"] or file_list["stderr_truncated"]
+        output_truncated = False
         batch_size = 128
         for offset in range(0, len(candidates), batch_size):
             if cancel_event is not None and cancel_event.is_set():
@@ -2583,6 +2447,7 @@ class TianChengService:
                 self.rg_executable,
                 "--json",
                 "--fixed-strings",
+                "--max-filesize", str(per_file_limit),
                 "--line-number",
                 "--sort",
                 "path",
@@ -2608,6 +2473,7 @@ class TianChengService:
                 raise RuntimeError(f"ripgrep search failed: {result['stderr'].strip()}")
             output_truncated = output_truncated or result["stdout_truncated"] or result["stderr_truncated"]
             for raw_line in result["stdout"].splitlines():
+                selection.check()
                 try:
                     record = json.loads(raw_line)
                 except json.JSONDecodeError:
@@ -2646,6 +2512,7 @@ class TianChengService:
                     break
             if len(matches) >= maximum:
                 break
+        selection.check()
         truncated = (
             len(matches) >= maximum
             or scan_truncated
@@ -2681,10 +2548,11 @@ class TianChengService:
         scan_limit: int,
         base: Path,
         cancel_event: threading.Event | None = None,
+        *, include_hidden: bool = True, respect_gitignore: bool = True,
+        include_internal: bool = False, timeout_seconds: int = 30,
     ) -> dict[str, Any]:
         if not isinstance(query, str) or not query:
             raise ValueError("query must be non-empty text")
-        matcher = compile_glob(glob_pattern)
         needle = query if case_sensitive else query.casefold()
         results: list[dict[str, Any]] = []
         scanned_bytes = 0
@@ -2692,64 +2560,46 @@ class TianChengService:
         examined_files = 0
         skipped_binary = 0
         truncated = False
-        for current, directories, files in os.walk(base, followlinks=False):
-            if cancel_event is not None and cancel_event.is_set():
-                raise JobCancelled("Job cancelled during text search")
-            current_path = Path(current)
-            safe_directories: list[str] = []
-            for name in directories:
-                if cancel_event is not None and cancel_event.is_set():
-                    raise JobCancelled("Job cancelled during text search")
-                if self._safe_walk_child(current_path / name):
-                    safe_directories.append(name)
-            directories[:] = safe_directories
-            for name in files:
-                if cancel_event is not None and cancel_event.is_set():
-                    raise JobCancelled("Job cancelled during text search")
-                examined_files += 1
-                if examined_files > MAX_SEARCH_SCANNED_FILES:
-                    truncated = True
-                    break
-                child = current_path / name
-                try:
-                    checked = self.jail.resolve(self.jail.relative(child), must_exist=True)
-                except WorkspaceSecurityError:
-                    continue
-                relative = self.jail.relative(checked)
-                match_relative = checked.relative_to(base).as_posix()
-                if not matcher.fullmatch(match_relative):
-                    continue
-                size = checked.stat().st_size
-                if size > MAX_SEARCH_FILE_BYTES or scanned_bytes + size > scan_limit:
-                    if scanned_bytes + size > scan_limit:
+        selection = SearchCandidates(self.jail, base, glob_pattern, include_hidden,
+            respect_gitignore, include_internal, scan_limit, min(MAX_SEARCH_FILE_BYTES, scan_limit),
+            MAX_SEARCH_SCANNED_FILES, timeout_seconds, cancel_event).collect()
+        truncated = selection.truncated
+        examined_files = selection.examined_entries
+        for checked in selection.paths:
+            selection.check()
+            checked = self.jail.resolve(self.jail.relative(checked), must_exist=True, expect="file")
+            relative = self.jail.relative(checked)
+            selection.check()
+            with checked.open('rb') as stream:
+                data = stream.read(min(MAX_SEARCH_FILE_BYTES, scan_limit - scanned_bytes) + 1)
+            selection.check()
+            if len(data) > min(MAX_SEARCH_FILE_BYTES, scan_limit - scanned_bytes):
+                truncated = True
+                break
+            scanned_bytes += len(data)
+            scanned_files += 1
+            try:
+                encoding = _detect_encoding(data[:8192])
+                text = _decode_text(data, encoding, allow_incomplete_tail=False)
+            except (UnicodeDecodeError, ValueError):
+                skipped_binary += 1
+                continue
+            for line_number, line in enumerate(text.splitlines(), start=1):
+                selection.check()
+                haystack = line if case_sensitive else line.casefold()
+                if needle in haystack:
+                    context = line.strip()
+                    if len(context) > 300:
+                        context = context[:297] + "..."
+                    results.append(
+                        {"path": relative, "line": line_number, "context": context}
+                    )
+                    if len(results) >= maximum:
                         truncated = True
                         break
-                    continue
-                data = checked.read_bytes()
-                scanned_bytes += len(data)
-                scanned_files += 1
-                try:
-                    encoding = _detect_encoding(data[:8192])
-                    text = _decode_text(data, encoding, allow_incomplete_tail=False)
-                except (UnicodeDecodeError, ValueError):
-                    skipped_binary += 1
-                    continue
-                for line_number, line in enumerate(text.splitlines(), start=1):
-                    haystack = line if case_sensitive else line.casefold()
-                    if needle in haystack:
-                        context = line.strip()
-                        if len(context) > 300:
-                            context = context[:297] + "..."
-                        results.append(
-                            {"path": relative, "line": line_number, "context": context}
-                        )
-                        if len(results) >= maximum:
-                            truncated = True
-                            break
-                if truncated:
-                    break
-            if truncated:
+            if len(results) >= maximum:
                 break
+        selection.check()
         return {
             "query": query,
             "glob_pattern": glob_pattern,
@@ -2765,14 +2615,8 @@ class TianChengService:
             "max_scan_bytes": scan_limit,
             "max_file_bytes": min(MAX_SEARCH_FILE_BYTES, scan_limit),
             "max_scanned_files": MAX_SEARCH_SCANNED_FILES,
+            "timeout_seconds": timeout_seconds,
         }
-
-    def _safe_walk_child(self, path: Path) -> bool:
-        try:
-            self.jail.resolve(self.jail.relative(path), must_exist=True, expect="directory")
-            return True
-        except (OSError, WorkspaceSecurityError):
-            return False
 
     def _git_environment(self) -> dict[str, str]:
         if not self.git_executable:
@@ -2831,22 +2675,13 @@ class TianChengService:
         alternates = git_directory / "objects/info/alternates"
         if alternates.exists():
             raise WorkspaceSecurityError("Git object alternates are not allowed")
-        config = git_directory / "config"
-        if not config.exists():
-            return
-        raw = config.read_text(encoding="utf-8", errors="strict")
-        lowered = raw.casefold()
-        if re.search(
-            r"(?im)^\s*\[\s*(?:include(?:if)?|filter|credential|url\b|alias|gpg|diff\b)",
-            lowered,
-        ):
-            raise WorkspaceSecurityError("Repository config contains an unsafe Git section")
-        if re.search(
-            r"(?im)^\s*(?:worktree|worktreeconfig|hookspath|excludesfile|attributesfile|"
-            r"sshcommand|fsmonitor|textconv|external|signingkey|template)\s*=",
-            lowered,
-        ) or re.search(r"(?im)^\s*gpgsign\s*=\s*true\s*$", lowered):
-            raise WorkspaceSecurityError("Repository config contains an unsafe Git setting")
+        if not self.git_executable:
+            raise RuntimeError("Git is not available")
+        GitRuntime(self.git_executable, _run_process_bounded).validate_config(
+            git_directory / "config", env=self._git_environment(),
+            timeout_seconds=10, maximum_output=2 * 1024 * 1024,
+            cancel_event=self._cancel_event(),
+        )
 
     def _git(
         self,
@@ -2862,9 +2697,20 @@ class TianChengService:
         environment = self._git_environment()
         if extra_env:
             environment.update(extra_env)
-        result = _run_process_bounded(
-            [self.git_executable, "-C", str(repo_path), *arguments],
-            cwd=repo_path,
+        # init/clone also pass here: validate an existing containing repo,
+        # then apply the same safeguards even when no repository exists yet.
+        current = repo_path
+        while True:
+            marker = current / ".git"
+            if os.path.lexists(marker):
+                checked = self.jail.resolve(self.jail.relative(marker), must_exist=True, expect="directory")
+                self._validate_git_directory(checked)
+                break
+            if current == self.jail.root:
+                break
+            current = current.parent
+        result = GitRuntime(self.git_executable, _run_process_bounded).run(
+            repo_path, arguments, allow_exec=self.allow_exec,
             env=environment,
             timeout_seconds=timeout_seconds,
             maximum_output=max_output,
@@ -3544,7 +3390,7 @@ class TianChengService:
         return {
             "process_id": record.process_id,
             "session_id": record.session_id,
-            "pid": record.process.pid,
+            "pid": record.pid,
             "command": record.command,
             "cwd": record.cwd,
             "state": state,
@@ -3552,41 +3398,115 @@ class TianChengService:
             "exit_code": record.exit_code if not running else None,
             "timed_out": record.timed_out,
             "stdin_closed": record.stdin_closed,
+            "resources_released": record.resources_released,
+            "resource_cleanup_error": getattr(record, "resource_cleanup_error", None),
+            "output_drain_incomplete": record.output_drain_incomplete,
+            "history_expires_at": (
+                _iso_timestamp(ended + PROCESS_HISTORY_SECONDS)
+                if ended is not None and record.owner == "process" else None
+            ),
             "started_at": _iso_timestamp(record.started_epoch),
             "ended_at": _iso_timestamp(ended) if ended is not None else None,
             "runtime_seconds": round((ended or time.time()) - record.started_epoch, 3),
             "max_runtime_seconds": record.max_runtime_seconds,
         }
 
-    def _watch_managed_process(self, record: _ManagedProcess) -> None:
+    def _watch_managed_process(self, record: _ManagedProcess, slot_token: object) -> None:
+        process = record.process
+        kill_job = record.kill_job
+        exit_code = None
         try:
-            exit_code = record.process.wait(timeout=record.max_runtime_seconds)
-        except subprocess.TimeoutExpired:
-            record.timed_out = True
-            if record.kill_job.active:
-                record.kill_job.terminate()
-            else:
-                _terminate_process_tree(record.process)
             try:
-                exit_code = record.process.wait(timeout=10)
+                exit_code = process.wait(timeout=record.max_runtime_seconds)
             except subprocess.TimeoutExpired:
-                record.process.kill()
-                exit_code = record.process.wait(timeout=5)
+                record.timed_out = True
+                if kill_job.active:
+                    kill_job.terminate()
+                else:
+                    _terminate_process_tree(process)
+                try:
+                    exit_code = process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    exit_code = process.wait(timeout=5)
         finally:
-            if os.name != "nt":
-                _terminate_process_tree(record.process)
-            with record.stdin_lock:
-                if record.process.stdin is not None and not record.stdin_closed:
+            cleanup_error = None
+            try:
+                with record.resource_lock:
+                    if os.name != "nt":
+                        _terminate_process_tree(process)
+                    kill_job.close()
+                    with record.stdin_lock:
+                        if process.stdin is not None:
+                            try:
+                                process.stdin.close()
+                            except OSError:
+                                pass
+                        record.stdin_closed = True
+                    drain_deadline = time.monotonic() + 2
+                    for reader in record.reader_threads:
+                        reader.join(timeout=max(0, drain_deadline - time.monotonic()))
+                    if any(reader.is_alive() for reader in record.reader_threads):
+                        record.output_drain_incomplete = True
+                        record.reader_stop.set()
+                        for reader in record.reader_threads:
+                            reader.join(timeout=1)
+                    # Readers own and close the pipes after draining. Terminating
+                    # the child tree prevents a detached child retaining a writer.
+                    for stream in (process.stdout, process.stderr):
+                        if stream is not None and not stream.closed:
+                            stream.close()
+                    handle = getattr(process, "_handle", None)
+                    if handle is not None:
+                        handle.Close()
+                    record.process = None
+                    record.kill_job = None
+                    record.reader_threads.clear()
+            except Exception as exc:
+                cleanup_error = type(exc).__name__
+                record.output_drain_incomplete = True
+                # One failed cleanup operation must not abandon the remaining
+                # pipes/readers/handle. Preserve the error in the final status.
+                record.reader_stop.set()
+                for reader in record.reader_threads:
+                    reader.join(timeout=1)
+                for stream in (process.stdin, process.stdout, process.stderr):
+                    if stream is not None:
+                        try:
+                            stream.close()
+                        except Exception:
+                            pass
+                record.stdin_closed = True
+                try:
+                    kill_job.close()
+                except Exception:
+                    pass
+                handle = getattr(process, "_handle", None)
+                if handle is not None:
                     try:
-                        record.process.stdin.close()
-                    except OSError:
+                        handle.Close()
+                    except Exception:
                         pass
-                    record.stdin_closed = True
-            record.kill_job.close()
-        for reader in record.reader_threads:
-            reader.join(timeout=5)
-        record.exit_code = exit_code
-        record.ended_epoch = time.time()
+                record.process = None
+                record.kill_job = None
+                record.reader_threads.clear()
+            self._process_slots.release(slot_token)
+            with record.lock:
+                record.exit_code = exit_code if exit_code is not None else process.returncode
+                record.ended_epoch = time.time()
+                record.resources_released = cleanup_error is None
+                record.resource_cleanup_error = cleanup_error
+                callback = record.completion_callback
+                record.completion_callback = None
+                record.finished.set()
+            if callback is not None:
+                try:
+                    callback()
+                except Exception as exc:
+                    self._record_audit_safely(tool="agent_finalize", relative_path=record.cwd,
+                        success=False, duration_ms=0, error_type=type(exc).__name__)
+            with self._process_lock:
+                self._prune_process_history_locked()
 
     def start_process(
         self,
@@ -3608,7 +3528,15 @@ class TianChengService:
             include_passthrough_env=True,
         )
 
-    def _start_managed_process_prepared(
+    def _start_managed_process_prepared(self, *args, **kwargs) -> dict[str, Any]:
+        token = self._process_slots.reserve(MAX_MANAGED_PROCESSES)
+        try:
+            return self._spawn_managed_process_prepared(*args, slot_token=token, **kwargs)
+        except BaseException:
+            self._process_slots.release(token)
+            raise
+
+    def _spawn_managed_process_prepared(
         self,
         command_key: str,
         prepared: list[str],
@@ -3624,6 +3552,7 @@ class TianChengService:
         stdin_enabled: bool = True,
         policy_root: Path | None = None,
         owner: str = "process",
+        slot_token: object,
         agent_proxy: bool = False,
         agent_launch_context: Mapping[str, Any] | None = None,
         windows_home_preflight_policy: str = "none",
@@ -3675,10 +3604,6 @@ class TianChengService:
             maximum=MAX_MANAGED_OUTPUT_BYTES,
             label="output_limit_bytes",
         )
-        with self._process_lock:
-            active = sum(record.process.poll() is None for record in self._processes.values())
-            if active >= MAX_MANAGED_PROCESSES:
-                raise RuntimeError(f"At most {MAX_MANAGED_PROCESSES} managed processes may run")
         environment = self._execution_environment(
             include_passthrough_env=include_passthrough_env,
             profile_credential_env=profile_credential_env,
@@ -3730,6 +3655,7 @@ class TianChengService:
                     "Host review is required; automatic sandbox setup was not started."
                 )
         record_launch("prepared")
+        self._check_cancelled()
         try:
             process = subprocess.Popen(
                 prepared,
@@ -3749,54 +3675,92 @@ class TianChengService:
         except OSError as exc:
             record_launch("spawn_failed", type(exc).__name__)
             raise
-        record = _ManagedProcess(
-            process_id,
-            command_key,
-            self._managed_cwd_label(working_directory),
-            process,
-            _WindowsKillJob(process),
-            output_limit,
-            runtime,
-            owner,
-        )
-        with self._process_lock:
-            self._processes[process_id] = record
-        assert process.stdout is not None
-        assert process.stderr is not None
-        stdout_thread = threading.Thread(
-            target=_drain_managed_stream,
-            args=(process.stdout, record, "stdout"),
-            daemon=True,
-        )
-        stderr_thread = threading.Thread(
-            target=_drain_managed_stream,
-            args=(process.stderr, record, "stderr"),
-            daemon=True,
-        )
-        record.reader_threads = [stdout_thread, stderr_thread]
-        stdout_thread.start()
-        stderr_thread.start()
-        threading.Thread(
-            target=self._watch_managed_process,
-            args=(record,),
-            daemon=True,
-        ).start()
+        kill_job = None
+        record = None
+        try:
+            kill_job = _WindowsKillJob(process)
+            record = _ManagedProcess(process_id, command_key,
+                self._managed_cwd_label(working_directory), process, kill_job,
+                output_limit, runtime, owner)
+            assert process.stdout is not None and process.stderr is not None
+            record.reader_threads = [
+                threading.Thread(target=_drain_managed_stream,
+                    args=(process.stdout, record, "stdout"), daemon=True),
+                threading.Thread(target=_drain_managed_stream,
+                    args=(process.stderr, record, "stderr"), daemon=True),
+            ]
+            with self._process_lock:
+                if self._process_closing:
+                    raise RuntimeError("Managed process runtime is shutting down")
+                self._processes[process_id] = record
+            for reader in record.reader_threads:
+                reader.start()
+            threading.Thread(target=self._watch_managed_process,
+                args=(record, slot_token), daemon=True).start()
+        except BaseException:
+            if kill_job is not None and kill_job.active:
+                kill_job.terminate()
+            else:
+                _terminate_process_tree(process)
+            process.wait(timeout=5)
+            if kill_job is not None:
+                kill_job.close()
+            if record is not None:
+                for reader in record.reader_threads:
+                    if reader.ident is not None:
+                        reader.join(timeout=5)
+            for stream in (process.stdin, process.stdout, process.stderr):
+                if stream is not None:
+                    stream.close()
+            handle = getattr(process, "_handle", None)
+            if handle is not None:
+                handle.Close()
+            with self._process_lock:
+                self._processes.pop(process_id, None)
+            raise
         record_launch("spawned")
         result = self._managed_process_status(record)
         if runtime_context is not None:
             result["runtime_context"] = runtime_context
         return result
 
+    def _prune_process_history_locked(self) -> None:
+        now = time.time()
+        history = sorted((record for record in self._processes.values()
+            if record.owner == "process" and record.ended_epoch is not None),
+            key=lambda record: record.ended_epoch)
+        total_bytes = sum(len(record.stdout) + len(record.stderr) for record in history)
+        count = len(history)
+        for record in history:
+            if (now - record.ended_epoch < PROCESS_HISTORY_SECONDS
+                    and count <= MAX_PROCESS_HISTORY and total_bytes <= MAX_PROCESS_HISTORY_BYTES):
+                break
+            self._processes.pop(record.process_id, None)
+            self._expired_processes[record.process_id] = now
+            count -= 1
+            total_bytes -= len(record.stdout) + len(record.stderr)
+        self._expired_processes = {
+            key: epoch for key, epoch in list(self._expired_processes.items())[-MAX_PROCESS_HISTORY * 2:]
+            if now - epoch < PROCESS_HISTORY_SECONDS
+        }
+
     def _get_managed_process(self, process_id: str) -> _ManagedProcess:
         if not isinstance(process_id, str) or not re.fullmatch(r"[0-9a-f]{32}", process_id):
             raise ValueError("process_id is invalid")
         with self._process_lock:
+            self._prune_process_history_locked()
             record = self._processes.get(process_id)
+            expired = process_id in self._expired_processes
         if record is None:
-            raise FileNotFoundError("Managed process was not found in this MCP session")
+            raise FileNotFoundError("Managed process history expired" if expired
+                else "Managed process was not found in this MCP session")
         return record
 
     def _get_public_process(self, process_id: str) -> _ManagedProcess:
+        with self._process_lock:
+            retired_agent = process_id in self._agent_process_history
+        if retired_agent:
+            raise PermissionError("Agent run processes are controlled through agent_run (inspect, events, or cancel)")
         record = self._get_managed_process(process_id)
         if record.owner == "agent_run":
             raise PermissionError(
@@ -3809,10 +3773,15 @@ class TianChengService:
         return self._managed_process_status(self._get_public_process(process_id))
 
     def _process_status(self, process_id: str) -> dict[str, Any]:
+        with self._process_lock:
+            final = self._agent_process_history.get(process_id)
+        if final is not None:
+            return dict(final)
         return self._managed_process_status(self._get_managed_process(process_id))
 
     def list_processes(self, include_exited: bool = True) -> dict[str, Any]:
         with self._process_lock:
+            self._prune_process_history_locked()
             records = [record for record in self._processes.values() if record.owner == "process"]
         statuses = [self._managed_process_status(record) for record in records]
         if not include_exited:
@@ -3822,6 +3791,10 @@ class TianChengService:
             "processes": statuses,
             "count": len(statuses),
             "max_active_processes": MAX_MANAGED_PROCESSES,
+            "active_slots": self._process_slots.active_count,
+            "history_retention_seconds": PROCESS_HISTORY_SECONDS,
+            "max_retained_processes": MAX_PROCESS_HISTORY,
+            "max_retained_output_bytes": MAX_PROCESS_HISTORY_BYTES,
         }
 
     def process_output(
@@ -4446,6 +4419,13 @@ class TianChengService:
             "succeeded" if started.get("exit_code") == 0 else "failed"
         )
         run.state = initial_state
+        record = self._get_managed_process(run.process_id)
+        with record.lock:
+            finalize_now = record.finished.is_set()
+            if not finalize_now:
+                record.completion_callback = lambda: self._refresh_agent_run(session, run)
+        if finalize_now:
+            self._refresh_agent_run(session, run)
         return {
             "execution": "background",
             "session_id": session.session_id,
@@ -4556,55 +4536,61 @@ class TianChengService:
             if profile.provider != session.provider or adapter.provider != session.provider:
                 raise RuntimeError("Agent session provider binding does not match its profile")
             display_name = adapter.display_name
-            if isinstance(run.parser, ManualApprovalParser):
-                chunk, next_offset, gap = self._get_managed_process(run.process_id).protocol_stdout(
-                    run.stdout_offset, MAX_COMMAND_OUTPUT_BYTES,
-                )
-                output = {"stdout": run.parser.decode_chunk(chunk),
-                          "stdout_next_offset_bytes": next_offset, "stdout_cursor_gap": gap}
-            else:
-                output = self._process_output(
-                    run.process_id,
-                    stream="stdout",
-                    max_bytes=MAX_COMMAND_OUTPUT_BYTES,
-                    after_bytes=run.stdout_offset,
-                )
-            run.stdout_offset = output["stdout_next_offset_bytes"]
-            if output.get("stdout_cursor_gap"):
+            if run.final_process_status is not None:
+                return dict(run.final_process_status)
+            record = self._get_managed_process(run.process_id)
+            if record.output_drain_incomplete and not run.output_gap_observed:
                 run.output_gap_observed = True
-                if isinstance(run.parser, PiJsonlParser):
+                self._append_agent_event(run, run.parser.synthetic_event("status",
+                    "Agent output drain did not reach EOF", {"reason": "output_drain_incomplete"}))
+                if isinstance(run.parser, (PiJsonlParser, ManualApprovalParser)):
                     run.terminal_override = "failed"
-                    run.error_summary = "Pi protocol output was lost"
-                    self._stop_process(run.process_id, force=True)
-                if isinstance(run.parser, ManualApprovalParser):
-                    run.parser.fail("Manual protocol output lost")
-                self._append_agent_event(
-                    run,
-                    run.parser.synthetic_event(
-                        "status",
+                    run.error_summary = "Agent protocol output drain incomplete"
+                    if isinstance(run.parser, ManualApprovalParser):
+                        run.parser.fail(run.error_summary)
+            while True:
+                status = self._managed_process_status(record)
+                chunk, next_offset, gap = record.protocol_stdout(run.stdout_offset, MAX_COMMAND_OUTPUT_BYTES)
+                run.stdout_offset = next_offset
+                if gap:
+                    run.output_gap_observed = True
+                    run.protocol_stream.reset_after_gap()
+                    if isinstance(run.parser, PiJsonlParser):
+                        run.terminal_override = "failed"
+                        run.error_summary = "Pi protocol output was lost"
+                        self._stop_process(run.process_id, force=True)
+                    if isinstance(run.parser, ManualApprovalParser):
+                        run.parser.fail("Manual protocol output lost")
+                    self._append_agent_event(run, run.parser.synthetic_event("status",
                         f"{display_name} stdout exceeded the retained process buffer",
-                        {"reason": "stdout_cursor_gap"},
-                    ),
-                )
-            run.pending_text += output.get("stdout", "")
-            lines = run.pending_text.splitlines(keepends=False)
-            if run.pending_text and not run.pending_text.endswith(("\n", "\r")):
-                run.pending_text = lines.pop() if lines else run.pending_text
-            else:
-                run.pending_text = ""
-            for line in lines:
-                self._append_agent_event(run, run.parser.feed_line(line))
-            if isinstance(run.parser, PiJsonlParser) and len(run.pending_text) > 256 * 1024:
-                run.parser.policy_violation = True
-                run.pending_text = ""
+                        {"reason": "stdout_cursor_gap"}))
+                with record.lock:
+                    exhausted = run.stdout_offset >= record.stdout_total
+                final = not status["running"] and exhausted
+                try:
+                    lines = run.protocol_stream.feed(chunk, final=final)
+                    for line in lines:
+                        self._append_agent_event(run, run.parser.feed_line(line))
+                except ProtocolStreamError as exc:
+                    run.terminal_override = "failed"
+                    run.error_summary = str(exc)
+                    self._append_agent_event(run, run.parser.synthetic_event("error", str(exc)))
+                    if isinstance(run.parser, PiJsonlParser):
+                        run.parser.policy_violation = True
+                    if isinstance(run.parser, ManualApprovalParser):
+                        run.parser.fail(str(exc))
+                    self._stop_process(run.process_id, force=True)
+                    break
+                status = self._managed_process_status(record)
+                with record.lock:
+                    exhausted = run.stdout_offset >= record.stdout_total
+                if status["running"] or (exhausted and run.protocol_stream.finished):
+                    break
             if isinstance(run.parser, PiJsonlParser) and run.parser.policy_violation:
                 run.terminal_override = "failed"
                 run.error_summary = "Pi emitted a forbidden tool or oversized protocol line"
                 self._stop_process(run.process_id, force=True)
             if isinstance(run.parser, ManualApprovalParser):
-                if len(run.pending_text.encode()) > 256 * 1024:
-                    self._append_agent_event(run, run.parser.fail("Manual protocol line too large"))
-                    run.pending_text = ""
                 try:
                     if self._process_status(run.process_id)["running"]:
                         self._flush_manual_protocol(run)
@@ -4619,7 +4605,10 @@ class TianChengService:
                     self._stop_process(run.process_id, force=True)
             self._update_agent_native_binding(session, run)
 
-            status = self._process_status(run.process_id)
+            # Use the coherent state from the drain loop. If the process exits
+            # just afterwards, its completion callback performs the final drain.
+            if run.terminal_override is not None and record.finished.is_set():
+                status = self._managed_process_status(record)
             if run.terminal_override is not None:
                 run.state = run.terminal_override
             elif status["state"] == "timed_out":
@@ -4639,10 +4628,6 @@ class TianChengService:
                 if run.state == "succeeded" and run.parser.done != "succeeded":
                     run.state = "failed"
                     run.error_summary = "App-server exited without a completed turn"
-            if terminal and run.pending_text:
-                self._append_agent_event(run, run.parser.feed_line(run.pending_text))
-                run.pending_text = ""
-                self._update_agent_native_binding(session, run)
             if (terminal and isinstance(run.parser, PiJsonlParser)
                 and run.state == "succeeded"
                 and (not run.parser.done or run.parser.final_message is None
@@ -4695,6 +4680,14 @@ class TianChengService:
                         ),
                     )
                 run.terminal_event_emitted = True
+            if terminal and record.finished.is_set():
+                status = self._managed_process_status(record)
+                run.final_process_status = dict(status)
+                # Agent events and provider summaries are the retained result;
+                # raw pipes/buffers are private and no longer needed afterwards.
+                with self._process_lock:
+                    self._agent_process_history[run.process_id] = run.final_process_status
+                    self._processes.pop(run.process_id, None)
             return status
 
     @staticmethod
@@ -4913,36 +4906,42 @@ class TianChengService:
         return self._stop_process(process_id, force)
 
     def _stop_process(self, process_id: str, force: bool = False) -> dict[str, Any]:
+        with self._process_lock:
+            final = self._agent_process_history.get(process_id)
+        if final is not None:
+            return {**final, "already_exited": True}
         record = self._get_managed_process(process_id)
-        if record.process.poll() is not None:
-            return {**self._managed_process_status(record), "already_exited": True}
-        record.stop_requested = True
-        if force and record.kill_job.active:
-            record.kill_job.terminate()
-        else:
-            try:
-                record.process.terminate()
-                record.process.wait(timeout=5)
-            except (OSError, subprocess.TimeoutExpired):
-                if record.kill_job.active:
+        with record.resource_lock:
+            process = record.process
+            if process is None or process.poll() is not None:
+                already_exited = True
+            else:
+                already_exited = False
+                record.stop_requested = True
+                if force and record.kill_job.active:
                     record.kill_job.terminate()
                 else:
-                    _terminate_process_tree(record.process)
-        try:
-            record.process.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            _terminate_process_tree(record.process)
-        deadline = time.monotonic() + 2
-        while record.ended_epoch is None and time.monotonic() < deadline:
-            time.sleep(0.01)
-        return {**self._managed_process_status(record), "already_exited": False}
+                    try:
+                        process.terminate()
+                        process.wait(timeout=5)
+                    except (OSError, subprocess.TimeoutExpired):
+                        if record.kill_job.active:
+                            record.kill_job.terminate()
+                        else:
+                            _terminate_process_tree(process)
+                try:
+                    process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    _terminate_process_tree(process)
+        record.finished.wait(timeout=2)
+        return {**self._managed_process_status(record), "already_exited": already_exited}
 
     def stop_all_processes(self) -> None:
         with self._process_lock:
             ids = [
                 process_id
                 for process_id, record in self._processes.items()
-                if record.process.poll() is None
+                if not record.resources_released
             ]
         for process_id in ids:
             try:
@@ -4953,6 +4952,9 @@ class TianChengService:
     def shutdown(self) -> None:
         """Stop managed work without waiting on uncooperative background threads."""
 
+        self._process_slots.close()
+        with self._process_lock:
+            self._process_closing = True
         self._grant_reaper_stop.set()
         if self._grant_reaper is not None and self._grant_reaper.is_alive():
             self._grant_reaper.join(timeout=1)

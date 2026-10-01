@@ -17,6 +17,7 @@ import time
 import uuid
 
 from .agent_preflight import validate_windows_home_preflight
+from .protocol_stream import JsonlStream
 
 from .agent_adapters import (
     AgentAdapter,
@@ -464,7 +465,8 @@ class AgentRunState:
     parser: AgentEventParser = field(default_factory=CodexJsonlParser)
     stdout_offset: int = 0
     stderr_offset: int = 0
-    pending_text: str = ""
+    protocol_stream: JsonlStream = field(default_factory=JsonlStream)
+    final_process_status: dict[str, Any] | None = None
     events: list[NormalizedEvent] = field(default_factory=list)
     created_epoch: float = field(default_factory=time.time)
     ended_epoch: float | None = None

@@ -12,6 +12,8 @@
   "accessPolicyPath": "config/access-policy.json",
   "agentSourcesPath": "config/agent-sources.json",
   "agentCatalogPath": "state/agent-catalog.sqlite3",
+  "agentProfilesPath": "config/agent-profiles.json",
+  "auditDir": "logs",
   "envFile": ".env",
   "proxy": {
     "http": "",
