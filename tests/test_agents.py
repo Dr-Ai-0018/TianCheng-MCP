@@ -1760,11 +1760,17 @@ def test_agent_failure_is_bounded_and_redacted(workspace, tmp_path) -> None:
     assert error["truncated"] is True
 
 
-def test_agent_events_wait_and_retention_cursor_gap(workspace, tmp_path) -> None:
+def test_agent_events_wait_and_retention_cursor_gap(workspace, tmp_path, monkeypatch) -> None:
+    ready = workspace / "child-ready"
+    release = workspace / "emit-event"
     script = tmp_path / "fake_delayed_codex.py"
     script.write_text(
-        "import json, time\n"
-        "time.sleep(0.2)\n"
+        "import json, time\nfrom pathlib import Path\n"
+        f"Path({str(ready)!r}).touch()\n"
+        "deadline = time.monotonic() + 15\n"
+        f"while not Path({str(release)!r}).exists():\n"
+        "    if time.monotonic() >= deadline: raise SystemExit(7)\n"
+        "    time.sleep(0.01)\n"
         "print(json.dumps({'type':'thread.started','thread_id':'thr_wait'}), flush=True)\n",
         encoding="utf-8",
     )
@@ -1773,10 +1779,41 @@ def test_agent_events_wait_and_retention_cursor_gap(workspace, tmp_path) -> None
     service.agent_profiles = AgentProfileRegistry(["codex"])
     session = service.agent_session_create()
     started = service.agent_run_start(session["session_id"], "wait")
-    page = service.agent_run_events(
-        session["session_id"], started["run_id"], after_seq=0, wait_ms=2_000
-    )
-    assert page["events"][0]["type"] == "thread_started"
+    try:
+        deadline = time.monotonic() + 10
+        while not ready.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert ready.exists(), "synthetic child did not finish startup"
+        assert service.agent_run_events(session["session_id"], started["run_id"])["events"] == []
+        # Release the real child only after the long poll has refreshed its
+        # state.  OS/interpreter startup is separate from the event wait.
+        polling = threading.Event()
+        refresh = service._refresh_agent_run
+
+        def refreshed(*args):
+            status = refresh(*args)
+            polling.set()
+            return status
+
+        monkeypatch.setattr(service, "_refresh_agent_run", refreshed)
+
+        def emit():
+            if polling.wait(10):
+                release.touch()
+
+        emitter = threading.Thread(target=emit)
+        emitter.start()
+        try:
+            page = service.agent_run_events(
+                session["session_id"], started["run_id"], after_seq=0, wait_ms=10_000
+            )
+            assert page["events"] and page["events"][0]["type"] == "thread_started"
+        finally:
+            polling.set()
+            emitter.join(timeout=10)
+            assert not emitter.is_alive()
+    finally:
+        service.agent_session_close(session["session_id"])
     with pytest.raises(ValueError, match="wait_ms"):
         service.agent_run_events(
             session["session_id"], started["run_id"], wait_ms=10_001
