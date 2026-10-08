@@ -33,7 +33,7 @@ def _config(tmp_path: Path, defaults: dict, local: dict) -> tuple[Path, Path]:
     return default_path, local_path
 
 
-def test_proxy_fields_merge_with_process_environment_priority(tmp_path: Path) -> None:
+def test_proxy_fields_merge_with_local_then_environment_priority(tmp_path: Path) -> None:
     defaults, local = _config(
         tmp_path,
         {"http": "http://default.test:8000", "https": "http://default.test:8001"},
@@ -45,12 +45,13 @@ def test_proxy_fields_merge_with_process_environment_priority(tmp_path: Path) ->
         {
             "http_proxy": "http://lower.test:8000",
             "HTTP_PROXY": "http://upper.test:8000",
+            "HTTPS_PROXY": "http://stale.test:7897",
             "no_proxy": "example.test",
         },
     )
     assert settings.values["http"] == "http://upper.test:8000"
     assert settings.values["https"] == "http://local.test:8001"
-    assert settings.values["noProxy"].startswith("example.test,")
+    assert settings.values["noProxy"].startswith("internal.test,")
     assert settings.agent == "always"
     target: dict[str, str] = {}
     settings.apply_to_process(target)
@@ -147,13 +148,37 @@ def test_probe_reports_only_error_class_when_transport_mentions_credentials(
     assert "secret" not in str(result)
 
 
-def test_process_empty_value_overrides_local_proxy(tmp_path: Path) -> None:
-    defaults, local = _config(tmp_path, {}, {"http": "http://local.test:8000"})
+def test_process_empty_value_overrides_default_proxy(tmp_path: Path) -> None:
+    defaults, local = _config(tmp_path, {"http": "http://default.test:8000"}, {})
     settings = ProxySettings.load(defaults, local, {"HTTP_PROXY": ""})
     target = {"HTTP_PROXY": "stale", "http_proxy": "stale"}
     settings.apply_to_process(target)
     assert "HTTP_PROXY" not in target
     assert "http_proxy" not in target
+
+
+@pytest.mark.parametrize("field, names", [
+    ("http", ("HTTP_PROXY", "http_proxy")),
+    ("https", ("HTTPS_PROXY", "https_proxy")),
+    ("noProxy", ("NO_PROXY", "no_proxy")),
+])
+def test_local_clear_overrides_inherited_proxy(tmp_path: Path, field: str, names: tuple) -> None:
+    stale = "stale.test" if field == "noProxy" else "http://stale.test:7897"
+    defaults, local = _config(tmp_path, {field: stale}, {field: ""})
+    target = dict.fromkeys(names, stale)
+    settings = ProxySettings.load(defaults, local, target)
+    assert settings.configured
+    settings.apply_to_process(target)
+    if field == "noProxy":
+        assert target[names[0]] == "localhost,127.0.0.1,::1"
+    else:
+        assert all(name not in target for name in names)
+
+
+def test_local_proxy_survives_empty_process_value(tmp_path: Path) -> None:
+    defaults, local = _config(tmp_path, {}, {"http": "http://local.test:8000"})
+    settings = ProxySettings.load(defaults, local, {"HTTP_PROXY": ""})
+    assert settings.values["http"] == "http://local.test:8000"
 
 
 @pytest.mark.parametrize("url", ["http://proxy.test:bad", "http://[broken", "file://proxy.test"])

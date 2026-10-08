@@ -480,6 +480,44 @@ def test_proxy_menu_invalid_input_returns_to_menu_without_saving(tmp_path: Path)
     assert "invalid-proxy" not in result.stdout + result.stderr
 
 
+def test_proxy_menu_saved_settings_override_inherited_environment(tmp_path: Path) -> None:
+    config = tmp_path / "launcher.json"
+    write_test_config(config, env_file=tmp_path / ".env", profile_dir=tmp_path / "profiles")
+    environment = without_proxy_environment()
+    environment.update(HTTP_PROXY="http://127.0.0.1:7897", HTTPS_PROXY="http://127.0.0.1:7897")
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        unused_port = listener.getsockname()[1]
+    new_url = f"http://menu-user:menu-secret@127.0.0.1:{unused_port}"
+    result = run_powershell(
+        PROJECT_ROOT / "tc.ps1", "-Action", "proxy", "-ConfigPath", str(config),
+        "-NoPause", input_text=f"1\n{new_url}\n6\n8\n0\n", environment=environment,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "[进程环境]" in result.stdout
+    assert "HTTP 代理已设置" in result.stdout
+    assert "HTTPS 代理已清除" in result.stdout
+    assert "当前显示待保存配置" in result.stdout
+    assert "无需重开 PowerShell" in result.stdout
+    assert "http 检测: 失败（ConnectError）" in result.stdout
+    assert "https 检测: 未配置" in result.stdout
+    assert "先选 0 保存" not in result.stdout
+    assert "menu-user" not in result.stdout + result.stderr
+    assert "menu-secret" not in result.stdout + result.stderr
+    saved = json.loads(config.read_text(encoding="utf-8"))
+    assert saved["proxy"] == {"http": new_url, "https": ""}
+
+    reopened = run_powershell(
+        PROJECT_ROOT / "tc.ps1", "-Action", "proxy", "-ConfigPath", str(config),
+        "-NoPause", input_text="0\n", environment=environment,
+    )
+    assert reopened.returncode == 0, reopened.stdout + reopened.stderr
+    assert f"http : 已配置 http://127.0.0.1:{unused_port}，含认证 [本机配置]" in reopened.stdout
+    assert "https : 未配置 [本机配置]" in reopened.stdout
+    assert "[进程环境]" not in reopened.stdout
+    assert "没有更改" in reopened.stdout
+
+
 def test_supervisor_disabled_selects_legacy_direct_launch_mode(tmp_path: Path) -> None:
     config = tmp_path / "launcher.json"
     write_test_config(config, env_file=tmp_path / ".env", profile_dir=tmp_path / "profiles")

@@ -47,7 +47,8 @@ class ProxySettings:
         environment: Mapping[str, str] | None = None,
     ) -> "ProxySettings":
         section = _read_proxy_section(defaults_path)
-        section.update(_read_proxy_section(local_path))
+        local = _read_proxy_section(local_path)
+        section.update(local)
         source = os.environ if environment is None else environment
         agent = section.get("agent", "off")
         if agent == "inherit":  # Existing local configs keep their old meaning.
@@ -60,13 +61,17 @@ class ProxySettings:
             raw = section.get(field, "")
             if not isinstance(raw, str):
                 raise ValueError(f"proxy.{field} must be a string")
-            for name in variants:
-                if name in source:
-                    raw = source[name]
-                    configured = True
-                    break
+            if field in local:
+                # Even an empty saved value must override an inherited proxy.
+                configured = True
             else:
-                configured |= bool(raw)
+                for name in variants:
+                    if name in source:
+                        raw = source[name]
+                        configured = True
+                        break
+                else:
+                    configured |= bool(raw)
             if (
                 not isinstance(raw, str)
                 or any(ord(character) < 32 for character in raw)

@@ -1154,7 +1154,7 @@ function Get-ProxyOverrides {
 }
 
 function Show-ProxySummary {
-    param([System.Collections.IDictionary]$Overrides)
+    param([System.Collections.IDictionary]$Overrides, [switch]$Pending)
 
     $defaults = Read-JsonHashtable -Path $script:DefaultsPath
     $local = if ($null -eq $Overrides) { Get-ProxyOverrides } else { $Overrides }
@@ -1170,17 +1170,18 @@ function Show-ProxySummary {
         }
         $value = $null
         $source = '默认'
-        foreach ($name in $names) {
-            $candidate = [Environment]::GetEnvironmentVariable($name, 'Process')
-            if ($null -ne $candidate) {
-                $value = $candidate
-                $source = '进程环境'
-                break
-            }
-        }
-        if ($null -eq $value -and $local.ContainsKey($field)) {
+        if ($local.ContainsKey($field)) {
             $value = [string]$local[$field]
             $source = '本机配置'
+        } else {
+            foreach ($name in $names) {
+                $candidate = [Environment]::GetEnvironmentVariable($name, 'Process')
+                if ($null -ne $candidate) {
+                    $value = $candidate
+                    $source = '进程环境'
+                    break
+                }
+            }
         }
         if ($null -eq $value -and $defaultProxy.ContainsKey($field)) {
             $value = [string]$defaultProxy[$field]
@@ -1214,6 +1215,9 @@ function Show-ProxySummary {
         default { 'Agent 模式配置无效' }
     }
     Write-Host "  Agent 模式: $agentLabel"
+    if ($Pending) {
+        Write-Host '  当前显示待保存配置；选 0 保存。' -ForegroundColor Yellow
+    }
     if (-not $hasProxy -and $agent -ne 'off') {
         Write-Host '  当前没有可注入的代理；Agent 模式仅在配置代理后起作用。' -ForegroundColor Yellow
     }
@@ -1278,12 +1282,20 @@ function Read-ProxyUrl {
     return (Read-SecretText -Prompt $Prompt)
 }
 
+function Save-ProxySettings {
+    param([Parameter(Mandatory)][System.Collections.IDictionary]$Overrides)
+
+    Save-LauncherOverrides -Changes @{ proxy = $Overrides }
+    Write-Host '代理设置已保存；下次检测/启动读取新配置，已运行的 MCP/Tunnel 需重启；无需重开 PowerShell。' -ForegroundColor Green
+}
+
 function Edit-ProxySettingsInteractive {
     $proxy = Get-ProxyOverrides
     $changed = $false
     $script:ProxyProbeResult = $null
     while ($true) {
-        Show-ProxySummary -Overrides $proxy
+        Show-ProxySummary -Overrides $proxy -Pending:$changed
+        Write-Host '  优先级：本机配置 > 进程环境 > 默认；清除会禁用对应代理。' -ForegroundColor DarkGray
         Write-Host '  1. 设置 HTTP 目标的代理 URL'
         Write-Host '  2. 设置 HTTPS 目标的代理 URL'
         Write-Host '  3. 设置 NO_PROXY 直连列表'
@@ -1291,19 +1303,25 @@ function Edit-ProxySettingsInteractive {
         Write-Host '  5. 清除本机 HTTP 代理'
         Write-Host '  6. 清除本机 HTTPS 代理'
         Write-Host '  7. 清除本机 NO_PROXY'
-        Write-Host '  8. 检测已保存代理的连通性与出口 IP'
+        Write-Host '  8. 保存并检测当前代理的连通性与出口 IP'
         Write-Host '  0. 保存并返回'
         $choice = Read-Host '代理设置'
         switch ($choice) {
             '1' {
                 $value = Read-ProxyUrl -Prompt 'HTTP 目标代理 URL'
-                try { Assert-ProxyUrl -Value $value; $proxy.http = $value; $changed = $true }
+                try {
+                    Assert-ProxyUrl -Value $value; $proxy.http = $value; $changed = $true
+                    Write-Host 'HTTP 代理已设置，选 0 保存。' -ForegroundColor Green
+                }
                 catch { Write-Host '代理 URL 无效，请检查协议、主机、端口与凭据的 URL 编码。' -ForegroundColor Yellow }
                 finally { $value = $null }
             }
             '2' {
                 $value = Read-ProxyUrl -Prompt 'HTTPS 目标代理 URL'
-                try { Assert-ProxyUrl -Value $value; $proxy.https = $value; $changed = $true }
+                try {
+                    Assert-ProxyUrl -Value $value; $proxy.https = $value; $changed = $true
+                    Write-Host 'HTTPS 代理已设置，选 0 保存。' -ForegroundColor Green
+                }
                 catch { Write-Host '代理 URL 无效，请检查协议、主机、端口与凭据的 URL 编码。' -ForegroundColor Yellow }
                 finally { $value = $null }
             }
@@ -1315,6 +1333,7 @@ function Edit-ProxySettingsInteractive {
                 }
                 $proxy.noProxy = $value
                 $changed = $true
+                Write-Host 'NO_PROXY 已设置，选 0 保存。' -ForegroundColor Green
             }
             '4' {
                 Write-Host 'off = 全局 Agent 透传网络：保持原有环境，不注入项目代理'
@@ -1327,19 +1346,24 @@ function Edit-ProxySettingsInteractive {
                 }
                 $proxy.agent = $value
                 $changed = $true
+                Write-Host 'Agent 模式已设置，选 0 保存。' -ForegroundColor Green
             }
-            '5' { $proxy.http = ''; $changed = $true }
-            '6' { $proxy.https = ''; $changed = $true }
-            '7' { $proxy.noProxy = ''; $changed = $true }
+            '5' { $proxy.http = ''; $changed = $true; Write-Host 'HTTP 代理已清除，选 0 保存。' }
+            '6' { $proxy.https = ''; $changed = $true; Write-Host 'HTTPS 代理已清除，选 0 保存。' }
+            '7' { $proxy.noProxy = ''; $changed = $true; Write-Host 'NO_PROXY 已清除，选 0 保存。' }
             '8' {
                 if ($changed) {
-                    Write-Host '先选 0 保存，再重新进入菜单检测新配置。' -ForegroundColor Yellow
-                } else { Test-ConfiguredProxy }
+                    Save-ProxySettings -Overrides $proxy
+                    $changed = $false
+                    $script:ProxyProbeResult = $null
+                }
+                Test-ConfiguredProxy
             }
             '0' {
                 if ($changed) {
-                    Save-LauncherOverrides -Changes @{ proxy = $proxy }
-                    Write-Host '代理设置已保存；重启 MCP/Tunnel 后生效。' -ForegroundColor Green
+                    Save-ProxySettings -Overrides $proxy
+                } else {
+                    Write-Host '代理设置没有更改，已返回。' -ForegroundColor DarkGray
                 }
                 return
             }
