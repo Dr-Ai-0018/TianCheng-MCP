@@ -93,7 +93,7 @@ function Show-TuiResult {
         try {
             $state=Get-TuiConsoleState; [Console]::CursorVisible=$false
             while ($true) {
-                $width=[Console]::WindowWidth-1; $height=[Console]::WindowHeight-1; $top=[Console]::WindowTop
+                $width=[Math]::Min(112,[Console]::WindowWidth-1); $height=[Console]::WindowHeight-1; $top=[Console]::WindowTop
                 if ($width -lt 59 -or $height -lt 19) { break }
                 if ($width -ne $wrapWidth) { $rows=@(Split-TuiResultLines $Lines $width); $wrapWidth=$width }
                 $offset=[Math]::Min($offset,[Math]::Max(0,$rows.Count-($height-4)))

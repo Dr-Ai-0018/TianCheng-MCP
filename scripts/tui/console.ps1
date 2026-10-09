@@ -156,7 +156,8 @@ function Get-TuiFrame {
     $start = [Math]::Max(0, [Math]::Min($selectedLine - $available + 1, $body.Count - $available))
     $end = [Math]::Min($body.Count, $start + $available)
     for ($i=$start; $i -lt $end; $i++) { $lines.Add($body[$i]) }
-    while ($lines.Count -lt $Height - $footerCount) { $lines.Add(@{Text=''; Style='normal'}) }
+    # Keep context help adjacent to the menu, even in a very tall window.
+    if ($lines.Count -lt $Height - $footerCount) { $lines.Add(@{Text=''; Style='normal'}) }
     $lines.Add(@{Text=('─' * $Width); Style='muted'})
     $lines.Add(@{Text=$Items[$Index].Help; Style='muted'})
     $note = $pageInfo.Note
@@ -169,6 +170,7 @@ function Get-TuiFrame {
         $lines.Add(@{Text=$navigation; Style='muted'})
         $lines.Add(@{Text=$right; Style='muted'})
     }
+    while ($lines.Count -lt $Height) { $lines.Add(@{Text=''; Style='normal'}) }
     foreach ($line in $lines) {
         [pscustomobject]@{ Text=(Format-TuiText $line.Text $Width); Style=$line.Style }
     }
@@ -188,6 +190,9 @@ function Write-TuiFrame {
         }
         $text=$Lines[$i].Text
         [Console]::Write($text + (' ' * [Math]::Max(0, $Width - (Get-TuiTextWidth $text))))
+        # Clear the rest of a wide/resized window without stretching selection.
+        [Console]::BackgroundColor=$Background
+        [Console]::Write(' ' * [Math]::Max(0, [Console]::WindowWidth - 1 - $Width))
     }
 }
 
@@ -202,7 +207,7 @@ function Read-TuiChoice {
         $foreground=$state.Foreground; $background=$state.Background
         [Console]::CursorVisible=$false
         while ($true) {
-            $width=[Console]::WindowWidth - 1; $height=[Console]::WindowHeight - 1
+            $width=[Math]::Min(112,[Console]::WindowWidth - 1); $height=[Console]::WindowHeight - 1
             $top=[Console]::WindowTop
             if ($width -lt 59 -or $height -lt 19) { return '__text' }
             $size="$width/$height/$top"

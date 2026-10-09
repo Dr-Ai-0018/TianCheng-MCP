@@ -58,6 +58,18 @@ API key 加载优先级为：当前进程 → Windows 用户环境变量 → `.e
 后会尝试移除继承 ACL 并只授权当前 Windows 用户；它仍然是明文文件，不是加密保险箱。
 `.env` 只由 `tc` 加载，直接执行 tunnel-client 不会自动读取它。
 
+## 截图与界面预览
+
+需要向别人展示界面时，可运行独立预览入口，不安装快捷命令：
+
+```powershell
+pwsh -NoProfile -File .\scripts\preview-tui.ps1
+```
+
+预览使用与控制台相同的渲染器和菜单定义，醒目标记“演示数据”；不加载本机配置、Key 或 Profile，也不连接 Tunnel。5/8 展示 Doctor 和完整状态的示例说明，其他操作仅显示预览提示。上下键、H/V 和返回仍可体验；退出后正常运行 `tc` 即可使用正式控制台。
+
+可通过 `-Page doctor` 或 `-Page status` 直接打开对应示例页。Doctor 示例未执行真实检查，不能作为连接成功或工具验收证据。宽窗口中的菜单与结果页限制为 112 列，菜单的灰色提示紧跟内容，建议以约 100 列 × 30 行窗口截图。
+
 ## Tunnel 自动恢复与连接 TTL
 
 `tc start` 和 `tc start-new` 默认不再直接裸跑 `tunnel-client`，而是由本地 Supervisor

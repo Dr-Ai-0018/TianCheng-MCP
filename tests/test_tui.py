@@ -41,7 +41,7 @@ $checks=@(for ($index=0; $index -lt $items.Count; $index++) {{
     @{{ rows=$frame.Count; widths=@($frame | ForEach-Object {{ Get-TuiTextWidth $_.Text }});
         selected=@($frame | Where-Object Style -eq selected).Count;
         selection=($frame | Where-Object Style -eq selected).Text;
-        bottom=$frame[-1].Text }}
+        bottom=($frame | Where-Object Text -match "Esc / 0" | Select-Object -Last 1).Text }}
 }})
 ConvertTo-Json -InputObject $checks -Depth 5
 """)
@@ -276,3 +276,35 @@ $status=Get-DeveloperToolStatus
     assert result["status"]["gcmConfigured"] is None
     assert result["status"]["ghAuthenticated"] is True
     assert "SECRET-account" not in str(result)
+
+
+def test_tall_window_keeps_context_help_next_to_menu(tmp_path: Path):
+    result = run_script(tmp_path, """
+$frame=@(Get-TuiFrame -Page main -Items @(Get-TuiMenuItems main) -Status @('示例状态') -Index 1 -Width 112 -Height 79)
+$menuEnd=0; $help=0
+for ($i=0;$i -lt $frame.Count;$i++) {
+    if ($frame[$i].Text -match 'B  ') { $menuEnd=$i }
+    if ($frame[$i].Text -match '^在独立 PowerShell') { $help=$i }
+}
+@{rows=$frame.Count; distance=$help-$menuEnd; help=$help} | ConvertTo-Json
+""")
+    assert result["rows"] == 79
+    assert result["distance"] == 3
+    assert result["help"] < 30
+
+
+@pytest.mark.parametrize("page", ["main", "doctor", "status"])
+def test_preview_is_explicit_sample_data_and_does_not_read_keys(tmp_path: Path, page: str):
+    environment=dict(os.environ, CONTROL_PLANE_API_KEY='SECRET-preview-key')
+    result=subprocess.run(
+        [powershell_path(ROOT), '-NoLogo', '-NoProfile', '-File', str(ROOT/'scripts/preview-tui.ps1'), '-Page', page, '-NoPause'],
+        input='2\n5\n8\n0\n' if page=='main' else None,
+        capture_output=True, text=True, encoding='utf-8', env=environment, cwd=tmp_path, timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert '演示' in result.stdout
+    assert 'SECRET-preview-key' not in result.stdout + result.stderr
+    assert '未执行真实 Doctor' in result.stdout if page in ('main','doctor') else '未查询机器或网络状态' in result.stdout
+    assert not list(tmp_path.iterdir())
+    if page=='main':
+        assert '不执行菜单操作' in result.stdout
