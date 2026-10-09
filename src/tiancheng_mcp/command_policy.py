@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -16,6 +17,13 @@ BUILTINS = frozenset({"python", "pytest", "py", "uv", "git", "gh", "node", "rg",
 
 class CommandPolicyError(ValueError):
     pass
+
+
+def execution_denied(code: str, reason: str, hint: str) -> PermissionError:
+    """Keep exception compatibility and never include request arguments/paths."""
+    error = PermissionError(f"[{code}] {reason}；{hint}")
+    error.reason_code = code
+    return error
 
 
 def command_name(value: object) -> str:
@@ -137,7 +145,11 @@ class CommandRule:
 
     def check(self, arguments: list[str]) -> None:
         if self.exact is not None and tuple(arguments) not in self.exact:
-            raise PermissionError("Command arguments are denied by the selected command policy")
+            raise execution_denied(
+                "ARGUMENTS_NOT_ALLOWED",
+                "Command arguments are denied by the selected command policy",
+                "参数不匹配完整模板；按运行策略允许的参数调用，或由本机修改规则后重启 MCP。",
+            )
 
 
 def _rules(value: object, source: str, workspace: Path | None) -> dict[str, CommandRule]:
@@ -167,12 +179,20 @@ class CommandPolicy:
 
     def request_key(self, command: str) -> str:
         if self.unrestricted and (not command or len(command) > 8192 or "\x00" in command):
-            raise PermissionError("Executable name/path must be bounded text")
+            raise execution_denied(
+                "INVALID_COMMAND",
+                "Executable name/path must be bounded text",
+                "程序名称或绝对路径须为有长度限制且不含 NUL 的文本。",
+            )
         if self.unrestricted and Path(command).is_absolute():
             return command
         if self.unrestricted:
             if command in {".", ".."} or any(token in command for token in ("/", "\\", ":")):
-                raise PermissionError("Command must be a program name or an absolute executable path")
+                raise execution_denied(
+                    "INVALID_COMMAND",
+                    "Command must be a program name or an absolute executable path",
+                    "使用程序名；unrestricted 也支持完整绝对程序路径，不能传相对路径。",
+                )
             # Preserve case and punctuation for POSIX PATH names, while known
             # configured aliases retain their existing normalization.
             normalized = command.casefold().removesuffix(".exe")
@@ -180,18 +200,29 @@ class CommandPolicy:
         try:
             return command_name(command)
         except CommandPolicyError as exc:
-            raise PermissionError("Command must be an alias or, in unrestricted, an absolute executable path") from exc
+            raise execution_denied(
+                "INVALID_COMMAND",
+                "Command must be an alias or, in unrestricted, an absolute executable path",
+                "使用合法命令别名；绝对程序路径只在 unrestricted 下支持。",
+            ) from exc
 
     def command_prefix(self, key: str, resolved: Mapping[str, list[str]]) -> list[str]:
-        name = Path(key).name.casefold().removesuffix(".exe")
-        if name in self.disabled:
-            raise PermissionError("Command is not allowlisted by the selected command policy")
+        self.check_entry(key)
         if key in self.rules:
             if key not in resolved:
-                raise PermissionError("Configured command is unavailable")
+                raise execution_denied(
+                    "COMMAND_UNAVAILABLE",
+                    "Configured command is unavailable",
+                    "所选规则的程序未安装或启动时未找到；安装/修正程序配置后重启 MCP。",
+                )
+            target = Path(resolved[key][0])
+            if not target.is_file() or (os.name != "nt" and not os.access(target, os.X_OK)):
+                raise execution_denied(
+                    "COMMAND_UNAVAILABLE",
+                    "Configured command is unavailable",
+                    "启动快照中的程序已不存在或不可执行；恢复程序后重试，程序路径改变则需重启 MCP。",
+                )
             return list(resolved[key])
-        if not self.unrestricted:
-            raise PermissionError("Command is not allowlisted by the selected command policy")
         executable = key if Path(key).is_absolute() else None
         if executable is None:
             # Search only captured absolute PATH directories. shutil.which on
@@ -205,12 +236,30 @@ class CommandPolicy:
                     executable = str(candidate)
                     break
         if not executable:
-            raise PermissionError("Executable is unavailable in the startup PATH")
+            raise execution_denied(
+                "COMMAND_UNAVAILABLE",
+                "Executable is unavailable in the startup PATH",
+                "启动时 PATH 未找到程序；安装程序/修正 PATH 后重启，或使用 unrestricted 的绝对路径。",
+            )
         target = Path(executable).resolve()
+        if not target.exists():
+            raise execution_denied(
+                "COMMAND_UNAVAILABLE",
+                "Executable is unavailable",
+                "所选绝对程序路径不存在；确认程序安装位置后重试。",
+            )
         if not target.is_file() or (os.name != "nt" and not os.access(target, os.X_OK)):
-            raise PermissionError("Executable must be an executable regular file")
+            raise execution_denied(
+                "INVALID_EXECUTABLE",
+                "Executable must be an executable regular file",
+                "目标须是现存且有执行权限的普通程序文件。",
+            )
         if os.name == "nt" and target.suffix.casefold() != ".exe":
-            raise PermissionError("Windows executable must be .exe; use an explicit interpreter for scripts")
+            raise execution_denied(
+                "INVALID_EXECUTABLE",
+                "Windows executable must be .exe; use an explicit interpreter for scripts",
+                "Windows 只直接启动 .exe；脚本须通过显式解释器调用。",
+            )
         return [str(target)]
 
     @classmethod
@@ -260,17 +309,43 @@ class CommandPolicy:
                 result[name] = list(prefix)
         return result
 
-    def check(self, name: str, arguments: list[str]) -> None:
+    def check_entry(self, name: str) -> None:
         alias = Path(name).name.casefold().removesuffix(".exe")
-        if alias in self.disabled or (not self.unrestricted and name not in self.rules):
-            raise PermissionError("Command is not allowlisted by the selected command policy")
+        if alias in self.disabled:
+            raise execution_denied(
+                "COMMAND_DISABLED",
+                "Command is not allowlisted by the selected command policy",
+                "本机 disable 已禁用此直接调用；由本机撤销禁用并重启 MCP 后生效。",
+            )
+        if not self.unrestricted and name not in self.rules:
+            raise execution_denied(
+                "COMMAND_NOT_ALLOWED",
+                "Command is not allowlisted by the selected command policy",
+                "当前预设没有此命令；查看 workspace_info.command_policy，按需由本机添加规则/切换预设并重启。",
+            )
+
+    def check(self, name: str, arguments: list[str]) -> None:
+        self.check_entry(name)
         if name in self.rules:
             self.rules[name].check(arguments)
 
-    def summary(self, resolved: Mapping[str, list[str]], *, enabled: bool) -> dict:
+    @property
+    def revision(self) -> str:
+        document = {
+            "preset": self.preset, "disabled": sorted(self.disabled),
+            "rules": {name: {"builtin": rule.builtin, "argv": rule.argv,
+                              "exact": rule.exact, "source": rule.source}
+                      for name, rule in sorted(self.rules.items())},
+        }
+        payload = json.dumps(document, sort_keys=True, ensure_ascii=False).encode("utf-8")
+        return hashlib.sha256(payload).hexdigest()
+
+    def summary(self, resolved: Mapping[str, list[str]], *, enabled: bool | None,
+                configuration_role: str = "runtime_snapshot") -> dict:
         return {
             "schema_version": 1, "preset": self.preset, "execution_enabled": enabled,
             "scope": "ordinary_commands_only", "reload": "restart",
+            "configuration_role": configuration_role, "policy_revision": self.revision,
             "mode": "unrestricted" if self.unrestricted else "allowlist",
             "command_list_complete": not self.unrestricted,
             "absolute_executable_paths": self.unrestricted,

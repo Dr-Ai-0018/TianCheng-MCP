@@ -94,7 +94,7 @@ def main() -> None:
         else:
             policy = edit_policy(args.policy, workspace, args.action, getattr(args, "name", None))
         resolved = policy.resolve(discover_exec_commands(workspace), workspace)
-        print(json.dumps(policy.summary(resolved, enabled=False), ensure_ascii=False))
+        print(json.dumps(policy.summary(resolved, enabled=None, configuration_role="next_start"), ensure_ascii=False))
     except Exception as exc:
         # Parse/path errors can embed fixed argv or credentials. Never echo the
         # exception text or the input payload to the terminal.

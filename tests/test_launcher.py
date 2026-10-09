@@ -85,6 +85,18 @@ def test_removed_totp_setup_is_not_a_launcher_action() -> None:
     assert "ValidateSet" in result.stderr
 
 
+def test_menu_bad_config_remains_exitable_and_does_not_echo_secret(tmp_path: Path) -> None:
+    config = tmp_path / "broken.json"
+    config.write_text('{"SECRET-config": broken}', encoding="utf-8")
+    result = run_powershell(
+        PROJECT_ROOT / "tc.ps1", "-ConfigPath", str(config), "-NoPause",
+        "-NoUserEnvironment", input_text="5\n0\n",
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "操作不可用" in result.stdout
+    assert "SECRET-config" not in result.stdout + result.stderr
+
+
 def test_custom_configuration_rejects_unmigrated_profile_before_doctor(tmp_path: Path) -> None:
     config = tmp_path / "launcher.json"
     write_test_config(config, env_file=tmp_path / ".env", profile_dir=tmp_path / "profiles")
@@ -335,6 +347,54 @@ def test_alias_installer_is_idempotent_and_preserves_profile(tmp_path: Path) -> 
     assert "function global:tc" in text
     assert str(PROJECT_ROOT / "tc.ps1") in text
 
+    config = tmp_path / "launcher.json"
+    write_test_config(config, env_file=tmp_path / ".env", profile_dir=tmp_path / "profiles")
+    runner = tmp_path / "invoke-shortcut.ps1"
+    runner.write_text(
+        "param($ProfileFile, $ConfigFile, $OtherDirectory)\n"
+        ". $ProfileFile\nSet-Location -LiteralPath $OtherDirectory\n"
+        "tc -Action info -Json -ConfigPath $ConfigFile -NoUserEnvironment\n",
+        encoding="utf-8",
+    )
+    invoked = run_powershell(runner, str(profile), str(config), str(tmp_path))
+    assert invoked.returncode == 0, invoked.stdout + invoked.stderr
+    assert Path(json.loads(invoked.stdout)["workspace"]) == tmp_path / "workspace"
+
+
+@pytest.mark.parametrize(
+    ("route", "explanation"),
+    [
+        ("H\n0\n", "1：先 Doctor"),
+        ("6\nH\n0\n0\n", "4：SAFE"),
+        ("7\nH\n0\n0\n", "整个 .env 被删除"),
+        ("P\nH\n0\n0\n", "主动访问 api.ipify.org"),
+        ("C\nH\n0\n0\n", "next_start"),
+        ("D\nH\n0\n0\n", "不读取文件或授予新权限"),
+        ("E\nH\n0\n0\n", "不删除原始 Agent 会话文件"),
+    ],
+)
+def test_menu_help_is_read_only(tmp_path: Path, route: str, explanation: str) -> None:
+    config = tmp_path / "launcher.json"
+    env_file = tmp_path / ".env"
+    write_test_config(config, env_file=env_file, profile_dir=tmp_path / "profiles")
+    payload = json.loads(config.read_text(encoding="utf-8"))
+    for field in ("commandPolicyPath", "accessPolicyPath", "agentProfilesPath"):
+        payload[field] = str(tmp_path / f"{field}.json")
+    config.write_text(json.dumps(payload), encoding="utf-8")
+    env_file.write_text("CONTROL_PLANE_API_KEY=help-must-not-expose-secret\n", encoding="utf-8")
+    before = {p.name: p.read_bytes() for p in tmp_path.iterdir() if p.is_file()}
+    result = run_powershell(
+        PROJECT_ROOT / "tc.ps1", "-ConfigPath", str(config), "-NoPause",
+        "-NoUserEnvironment", input_text=route,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert explanation in result.stdout
+    assert "H. 查看每个选项的作用" in result.stdout
+    assert "无效选择" not in result.stdout
+    assert "help-must-not-expose-secret" not in result.stdout + result.stderr
+    after = {p.name: p.read_bytes() for p in tmp_path.iterdir() if p.is_file()}
+    assert after == before
+
 
 def test_settings_menu_persists_interactive_timeout_without_cli_flags(tmp_path: Path) -> None:
     config = tmp_path / "launcher.json"
@@ -351,6 +411,31 @@ def test_settings_menu_persists_interactive_timeout_without_cli_flags(tmp_path: 
     assert result.returncode == 0, result.stdout + result.stderr
     saved = json.loads(config.read_text(encoding="utf-8"))
     assert saved["interactiveTimeoutSeconds"] == 82
+
+
+def test_rich_proxy_invalid_mode_waits_once_and_does_not_save(tmp_path: Path) -> None:
+    config = tmp_path / "launcher.json"
+    write_test_config(config, env_file=tmp_path / ".env", profile_dir=tmp_path / "profiles")
+    before = config.read_bytes()
+    runner = tmp_path / "proxy-feedback.ps1"
+    runner.write_text(
+        "param($Root,$ConfigFile)\n"
+        ". (Join-Path $Root 'tc.ps1') -Action info -Json -ConfigPath $ConfigFile -NoUserEnvironment | Out-Null\n"
+        "$script:Selections=0; $script:Pauses=0\n"
+        "function Test-TuiConsole { return $true }\n"
+        "function Read-TuiChoice { $script:Selections++; if ($script:Selections -eq 1) { return '4' }; return '0' }\n"
+        "function Read-Host { return 'invalid' }\n"
+        "function Pause-Tq { $script:Pauses++ }\n"
+        "function Test-ConfiguredProxy { throw 'Unexpected network check' }\n"
+        "Edit-ProxySettingsInteractive 6>$null\n"
+        "@{pauses=$script:Pauses; selections=$script:Selections} | ConvertTo-Json\n",
+        encoding="utf-8",
+    )
+    result = run_powershell(runner, str(PROJECT_ROOT), str(config))
+    assert result.returncode == 0, result.stdout + result.stderr
+    state = json.loads(result.stdout)
+    assert state == {"pauses": 1, "selections": 2}
+    assert config.read_bytes() == before
 
 
 def test_settings_menu_persists_supervisor_and_transport_ttl(tmp_path: Path) -> None:
@@ -735,3 +820,35 @@ def test_command_policy_high_preset_menu_and_mode(tmp_path: Path, preset: str) -
     assert state['mode'] == ('unrestricted' if preset == 'unrestricted' else 'allowlist')
     assert state['disabled'] == ['python']
     assert state['available_presets'] == ['minimal', 'balanced', 'elevated', 'unrestricted']
+
+def test_command_policy_menu_marks_saved_config_revision_not_running_state(tmp_path: Path) -> None:
+    config = tmp_path / 'launcher.json'
+    write_test_config(config, env_file=tmp_path / '.env', profile_dir=tmp_path / 'profiles')
+    payload = json.loads(config.read_text(encoding='utf-8'))
+    payload['commandPolicyPath'] = str(tmp_path / 'commands.json')
+    config.write_text(json.dumps(payload), encoding='utf-8')
+    result = run_powershell(PROJECT_ROOT / 'tc.ps1', '-Action', 'commands', '-ConfigPath', str(config), '-NoPause', input_text='0\n')
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert '不代表当前运行值' in result.stdout
+    assert '配置版本' in result.stdout and 'policy_revision' in result.stdout
+    status = run_powershell(PROJECT_ROOT / 'tc.ps1', '-Action', 'commands', '-ConfigPath', str(config), '-Json')
+    state = json.loads(status.stdout)
+    assert state['configuration_role'] == 'next_start' and state['execution_enabled'] is None
+    assert len(state['policy_revision']) == 64
+
+
+@pytest.mark.parametrize("input_text", ["8\nCANCEL\n0\n", "invalid\n0\n"])
+def test_command_menu_cancel_does_not_report_saved(tmp_path: Path, input_text: str) -> None:
+    config = tmp_path / "launcher.json"
+    write_test_config(config, env_file=tmp_path / ".env", profile_dir=tmp_path / "profiles")
+    payload = json.loads(config.read_text(encoding="utf-8"))
+    policy = tmp_path / "commands.json"
+    payload["commandPolicyPath"] = str(policy)
+    config.write_text(json.dumps(payload), encoding="utf-8")
+    result = run_powershell(
+        PROJECT_ROOT / "tc.ps1", "-Action", "commands", "-ConfigPath", str(config),
+        "-NoPause", input_text=input_text,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "命令策略已保存" not in result.stdout
+    assert not policy.exists()

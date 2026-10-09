@@ -26,7 +26,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 from . import __version__
 from .proxy import add_agent_proxy
-from .command_policy import CommandPolicy
+from .command_policy import CommandPolicy, execution_denied
 from .command_discovery import discover_exec_commands
 from .agent_catalog import AgentCatalog
 from .agent_diagnostics import launch_metadata
@@ -3270,25 +3270,32 @@ class TianChengService:
                 identity = builtin
         lowered = [value.casefold() for value in [*prefix[1:], *arguments]]
         if identity == "git" and any(value in _SENSITIVE_GIT_COMMANDS for value in lowered):
-            raise PermissionError(
-                "Credential plumbing commands are blocked because they can print keyring secrets"
-            )
+            raise execution_denied("CREDENTIAL_OUTPUT_BLOCKED",
+                "Credential plumbing commands are blocked because they can print keyring secrets",
+                "直接输出凭据的 Git 命令被拒绝；普通开发操作仍可使用 Git/GCM。")
         if identity == "gh" and lowered[:2] == ["auth", "token"]:
-            raise PermissionError("gh auth token is blocked because it prints a secret")
+            raise execution_denied(
+                "CREDENTIAL_OUTPUT_BLOCKED",
+                "gh auth token is blocked because it prints a secret",
+                "此直接调用会输出凭据；请使用无需返回 token 的开发操作。",
+            )
         return [*prefix, *arguments]
 
     def _validated_exec_request(
         self, command: str, args: list[str] | None, cwd: str
     ) -> tuple[str, list[str], Path, list[str]]:
         if not self.allow_exec:
-            raise PermissionError("Command execution is disabled; restart with --allow-exec")
+            raise execution_denied(
+                "EXEC_DISABLED",
+                "Command execution is disabled; restart with --allow-exec",
+                "SAFE/DEV 执行总开关未开放；按需切换 DEV 并重启 MCP，修改命令预设不会开启执行。",
+            )
         if not isinstance(command, str):
             raise TypeError("command must be text")
         key = self.command_policy.request_key(command)
+        self.command_policy.check_entry(key)
         if not self.command_policy.unrestricted and key not in self._ordinary_exec_commands:
-            raise PermissionError(
-                "Command is not allowlisted; use one of: " + ", ".join(sorted(self._ordinary_exec_commands))
-            )
+            self.command_policy.command_prefix(key, self._ordinary_exec_commands)
         arguments = args or []
         if not isinstance(arguments, list) or len(arguments) > 256:
             raise ValueError("args must be a list with at most 256 entries")
@@ -3519,7 +3526,11 @@ class TianChengService:
         windows_home_preflight_policy: str = "none",
     ) -> dict[str, Any]:
         if not self.allow_exec:
-            raise PermissionError("Command execution is disabled; restart with --allow-exec")
+            raise execution_denied(
+                "EXEC_DISABLED",
+                "Command execution is disabled; restart with --allow-exec",
+                "SAFE/DEV 执行总开关未开放；按需切换 DEV 并重启 MCP，修改命令预设不会开启执行。",
+            )
         registered_prefix = (
             self._agent_only_commands.get(command_key) or self._exec_commands.get(command_key)
             if owner == "agent_run" else self.command_policy.command_prefix(command_key, self._ordinary_exec_commands)

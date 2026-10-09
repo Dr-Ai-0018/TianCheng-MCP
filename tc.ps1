@@ -24,6 +24,8 @@ $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 
 $script:ProjectRoot = $PSScriptRoot
+. (Join-Path $script:ProjectRoot 'scripts\menu-help.ps1')
+. (Join-Path $script:ProjectRoot 'scripts\tui\console.ps1')
 $script:WorkspaceCache = ''
 $script:ProxyProbeResult = $null
 $script:DefaultsPath = Join-Path $PSScriptRoot 'config\launcher.defaults.json'
@@ -82,8 +84,11 @@ function Get-Workspace {
 function Get-LauncherConfig {
     $bootstrap = if ($env:TIANCHENG_PYTHON) { $env:TIANCHENG_PYTHON }
     else { Join-Path $script:ProjectRoot '.venv\Scripts\python.exe' }
-    $resolved = & $bootstrap (Join-Path $script:ProjectRoot 'scripts\resolve_launcher.py') `
-        --local $script:LocalConfigPath
+    $resolved = if ($script:TuiStatusProbe -or $Action -eq 'menu') {
+        Invoke-TuiProbeProcess -FilePath $bootstrap -Arguments @((Join-Path $script:ProjectRoot 'scripts\resolve_launcher.py'),'--local',$script:LocalConfigPath)
+    } else {
+        & $bootstrap (Join-Path $script:ProjectRoot 'scripts\resolve_launcher.py') --local $script:LocalConfigPath
+    }
     if ($LASTEXITCODE -ne 0) { throw 'Launcher configuration could not be resolved' }
     $config = ($resolved -join "`n") | ConvertFrom-Json -AsHashtable
     return (Resolve-LauncherConfig -Config $config)
@@ -152,7 +157,9 @@ function Get-ProfileNames {
 
     Assert-FileExists -Path ([string]$Config.tunnelClient) -Label 'tunnel-client'
     $profileArguments = Get-ProfileDirectoryArguments -Config $Config
-    $raw = & ([string]$Config.tunnelClient) profiles list --json @profileArguments 2>$null
+    $raw = if ($script:TuiStatusProbe) {
+        Invoke-TuiProbeProcess -FilePath ([string]$Config.tunnelClient) -Arguments (@('profiles','list','--json') + $profileArguments)
+    } else { & ([string]$Config.tunnelClient) profiles list --json @profileArguments 2>$null }
     if ($LASTEXITCODE -ne 0) {
         throw 'tunnel-client could not list profiles.'
     }
@@ -182,7 +189,9 @@ function Get-ProfileRecords {
 
     Assert-FileExists -Path ([string]$Config.tunnelClient) -Label 'tunnel-client'
     $profileArguments = Get-ProfileDirectoryArguments -Config $Config
-    $raw = & ([string]$Config.tunnelClient) profiles list --json @profileArguments 2>$null
+    $raw = if ($script:TuiStatusProbe) {
+        Invoke-TuiProbeProcess -FilePath ([string]$Config.tunnelClient) -Arguments (@('profiles','list','--json') + $profileArguments)
+    } else { & ([string]$Config.tunnelClient) profiles list --json @profileArguments 2>$null }
     if ($LASTEXITCODE -ne 0) {
         throw 'tunnel-client could not list profiles.'
     }
@@ -636,7 +645,7 @@ function Select-ProfileInteractive {
 }
 
 function Invoke-Doctor {
-    param([hashtable]$Config, [string]$Name)
+    param([hashtable]$Config, [string]$Name, [ref]$Report)
 
     if (-not (Test-ProfileExists -Config $Config -Name $Name)) {
         throw "Profile '$Name' does not exist."
@@ -646,11 +655,19 @@ function Invoke-Doctor {
     if (-not $key.Configured) {
         throw 'CONTROL_PLANE_API_KEY is not configured. Use the key menu first.'
     }
-    Write-Host "使用密钥来源：$($key.Source)（值不会显示）" -ForegroundColor DarkGray
+    $sourceLine="使用密钥来源：$($key.Source)（值不会显示）"
+    if ($null -ne $Report) { $Report.Value=@($sourceLine) }
+    else { Write-Host $sourceLine -ForegroundColor DarkGray }
     $arguments = @('doctor', '--profile', $Name, '--explain')
     $arguments += Get-ProfileDirectoryArguments -Config $Config
-    & ([string]$Config.tunnelClient) @arguments | Out-Host
-    $exitCode = $LASTEXITCODE
+    if ($null -ne $Report) {
+        $output=@(& ([string]$Config.tunnelClient) @arguments 2>&1)
+        $exitCode=$LASTEXITCODE
+        $Report.Value += @($output | ForEach-Object { [string]$_ })
+    } else {
+        & ([string]$Config.tunnelClient) @arguments | Out-Host
+        $exitCode=$LASTEXITCODE
+    }
     if ($exitCode -eq 0 -and (Test-SupervisorEnabled -Config $Config)) {
         Assert-FileExists -Path ([string]$Config.python) -Label 'TianCheng Python environment'
         $supervisorArguments = @(
@@ -660,10 +677,26 @@ function Invoke-Doctor {
             '--profile', $Name,
             '--check'
         )
-        & ([string]$Config.python) @supervisorArguments | Out-Host
-        $exitCode = $LASTEXITCODE
+        if ($null -ne $Report) {
+            $output=@(& ([string]$Config.python) @supervisorArguments 2>&1)
+            $exitCode=$LASTEXITCODE
+            $Report.Value += @($output | ForEach-Object { [string]$_ })
+        } else {
+            & ([string]$Config.python) @supervisorArguments | Out-Host
+            $exitCode=$LASTEXITCODE
+        }
     }
     return $exitCode
+}
+
+function Show-DoctorResult {
+    param([hashtable]$Config, [string]$Name)
+    $report=@()
+    $exitCode=Invoke-Doctor -Config $Config -Name $Name -Report ([ref]$report)
+    $label=if ($exitCode -eq 0) { '检查通过' } else { '检查失败；请按上面的诊断处理后重试' }
+    $report += "Doctor 退出码：$exitCode · $label"
+    $report += '检查通过不等于 MCP 文件工具 roundtrip 已验收。'
+    Show-TuiResult -Title '连接准备检查 / Doctor' -Lines $report
 }
 
 function Confirm-ExecProfile {
@@ -791,9 +824,9 @@ function Get-HealthListenerConflict {
         }
         $owner = $null
         try {
-            $owner = Get-NetTCPConnection -LocalPort $uri.Port -State Listen -ErrorAction Stop |
+            $owner = if (-not $script:TuiStatusProbe) { Get-NetTCPConnection -LocalPort $uri.Port -State Listen -ErrorAction Stop |
                 Where-Object { $_.LocalAddress -in @($uri.Host, '0.0.0.0', '::') } |
-                Select-Object -First 1
+                Select-Object -First 1 }
         } catch { }
         return [PSCustomObject]@{
             Endpoint = '{0}:{1}' -f $uri.Host, $uri.Port
@@ -829,7 +862,8 @@ function Get-RunningTunnelRecords {
     try {
         $expected = [System.IO.Path]::GetFullPath([string]$Config.tunnelClient)
         return @(
-            Get-CimInstance Win32_Process -Filter "Name = 'tunnel-client.exe'" -ErrorAction Stop |
+            $(if ($script:TuiStatusProbe) { Get-TuiProcessRecords -Kind tunnel }
+                else { Get-CimInstance Win32_Process -Filter "Name = 'tunnel-client.exe'" -ErrorAction Stop }) |
                 ForEach-Object {
                     if ([string]::IsNullOrWhiteSpace([string]$_.ExecutablePath) -or
                         -not [System.IO.Path]::GetFullPath([string]$_.ExecutablePath).Equals(
@@ -845,6 +879,7 @@ function Get-RunningTunnelRecords {
                 }
         )
     } catch {
+        if ($script:TuiStatusProbe) { throw }
         return @()
     }
 }
@@ -858,7 +893,8 @@ function Get-RunningSupervisorRecords {
         $expectedPrefix = '^\s*"?' + [regex]::Escape($expected) +
             '"?\s+-m\s+tiancheng_mcp\.tunnel_supervisor(?:\s|$)'
         return @(
-            Get-CimInstance Win32_Process -ErrorAction Stop |
+            $(if ($script:TuiStatusProbe) { Get-TuiProcessRecords -Kind supervisor }
+                else { Get-CimInstance Win32_Process -ErrorAction Stop }) |
                 Where-Object { $_.Name -in @('python.exe', 'pythonw.exe') } |
                 ForEach-Object {
                     $commandLine = [string]$_.CommandLine
@@ -876,6 +912,7 @@ function Get-RunningSupervisorRecords {
                 }
         )
     } catch {
+        if ($script:TuiStatusProbe) { throw }
         return @()
     }
 }
@@ -893,17 +930,33 @@ function Get-SupervisorState {
 }
 
 function Get-DeveloperToolStatus {
-    $git = Get-Command git -ErrorAction SilentlyContinue
-    $gh = Get-Command gh -ErrorAction SilentlyContinue
+    $git = Get-Command git -ErrorAction SilentlyContinue | Select-Object -First 1
+    $gh = Get-Command gh -ErrorAction SilentlyContinue | Select-Object -First 1
     $gcmConfigured = $false
     $ghAuthenticated = $false
     if ($null -ne $git) {
-        $accounts = & git credential-manager github list --no-ui 2>$null
-        $gcmConfigured = $LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace(($accounts -join "`n"))
+        if ($script:TuiStatusProbe) {
+            try {
+                $accounts=Invoke-TuiProbeProcess -FilePath $git.Source -Arguments @('credential-manager','github','list','--no-ui')
+                $gcmConfigured=-not [string]::IsNullOrWhiteSpace(($accounts -join "`n"))
+            } catch [TimeoutException] { throw }
+              catch { $gcmConfigured=$null }
+        } else {
+            $accounts = & git credential-manager github list --no-ui 2>$null
+            $gcmConfigured = $LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace(($accounts -join "`n"))
+        }
     }
     if ($null -ne $gh) {
-        & gh auth status *> $null
-        $ghAuthenticated = $LASTEXITCODE -eq 0
+        if ($script:TuiStatusProbe) {
+            try {
+                [void](Invoke-TuiProbeProcess -FilePath $gh.Source -Arguments @('auth','status'))
+                $ghAuthenticated=$true
+            } catch [TimeoutException] { throw }
+              catch { $ghAuthenticated=$null }
+        } else {
+            & gh auth status *> $null
+            $ghAuthenticated = $LASTEXITCODE -eq 0
+        }
     }
     return [ordered]@{
         gitAvailable = $null -ne $git
@@ -1057,8 +1110,10 @@ function Show-Status {
     Write-Host "密钥来源     : $($status.keySource)"
     Write-Host "Tunnel Ready     : $($status.tunnelReady)（不等于 MCP roundtrip 已验证）"
     Write-Host "管理地址     : $($status.healthBaseUrl)/ui"
-    Write-Host "Git / GCM    : $($developer.gitAvailable) / $($developer.gcmConfigured)"
-    Write-Host "gh / 已登录  : $($developer.ghAvailable) / $($developer.ghAuthenticated)"
+    $gcmLabel=if ($null -eq $developer.gcmConfigured) { '未知（查询失败）' } else { [string]$developer.gcmConfigured }
+    $ghLabel=if ($null -eq $developer.ghAuthenticated) { '未知（查询失败）' } else { [string]$developer.ghAuthenticated }
+    Write-Host "Git / GCM    : $($developer.gitAvailable) / $gcmLabel"
+    Write-Host "gh / 已登录  : $($developer.ghAvailable) / $ghLabel"
 }
 
 function Show-Profiles {
@@ -1294,19 +1349,12 @@ function Edit-ProxySettingsInteractive {
     $proxy = Get-ProxyOverrides
     $changed = $false
     $script:ProxyProbeResult = $null
+    $textOnly = $false
     while ($true) {
-        Show-ProxySummary -Overrides $proxy -Pending:$changed
-        Write-Host '  优先级：本机配置 > 进程环境 > 默认；清除会禁用对应代理。' -ForegroundColor DarkGray
-        Write-Host '  1. 设置 HTTP 目标的代理 URL'
-        Write-Host '  2. 设置 HTTPS 目标的代理 URL'
-        Write-Host '  3. 设置 NO_PROXY 直连列表'
-        Write-Host '  4. 选择 Agent 模式（off/selective/always）'
-        Write-Host '  5. 清除本机 HTTP 代理'
-        Write-Host '  6. 清除本机 HTTPS 代理'
-        Write-Host '  7. 清除本机 NO_PROXY'
-        Write-Host '  8. 保存并检测当前代理的连通性与出口 IP'
-        Write-Host '  0. 保存并返回'
-        $choice = Read-Host '代理设置'
+        $statusLines=@(Get-TuiStatusLines -CacheKey 'proxy' { Show-ProxySummary -Overrides $proxy -Pending:$changed })
+        $menu=Read-LauncherMenuChoice -Page proxy -Status $statusLines -TextOnly ([ref]$textOnly)
+        $choice=$menu.Choice; $rich=$menu.Rich
+        if ($choice -eq 'r') { continue }
         switch ($choice) {
             '1' {
                 $value = Read-ProxyUrl -Prompt 'HTTP 目标代理 URL'
@@ -1360,6 +1408,8 @@ function Edit-ProxySettingsInteractive {
                 }
                 Test-ConfiguredProxy
             }
+            'r' { continue }
+            'h' { Show-MenuHelp -Section 'proxy' }
             '0' {
                 if ($changed) {
                     Save-ProxySettings -Overrides $proxy
@@ -1371,6 +1421,7 @@ function Edit-ProxySettingsInteractive {
             default { Write-Host '无效选择。' -ForegroundColor Yellow }
         }
         if ($changed) { $script:ProxyProbeResult = $null }
+        if ($rich -and $choice -ne 'h') { Pause-Tq }
     }
 }
 
@@ -1383,7 +1434,9 @@ function Invoke-CommandPolicyAdmin {
         else { Join-Path $script:ProjectRoot 'config\command-policy.local.json' }
     $base = @('-m', 'tiancheng_mcp.command_policy_admin', '--policy', $policyPath,
         '--workspace', [string]$Config.workspace)
-    $raw = if ($PSBoundParameters.ContainsKey('RuleInput')) { $RuleInput | & $python @base @Arguments 2>$null }
+    $raw = if ($script:TuiStatusProbe -and $Arguments[0] -eq 'status') {
+        Invoke-TuiProbeProcess -FilePath $python -Arguments ($base + $Arguments)
+    } elseif ($PSBoundParameters.ContainsKey('RuleInput')) { $RuleInput | & $python @base @Arguments 2>$null }
         else { & $python @base @Arguments 2>$null }
     if ($LASTEXITCODE -ne 0) {
         $failure = ($raw -join "`n") | ConvertFrom-Json -AsHashtable -ErrorAction SilentlyContinue
@@ -1399,6 +1452,10 @@ function Show-CommandPolicyState {
     param([hashtable]$State)
 
     Write-Host "命令策略：$($State.preset)（下次启动配置）" -ForegroundColor Cyan
+    Write-Host '这里读取保存配置，不代表当前运行值；运行快照请看 workspace_info.command_policy。'
+    if ($State.policy_revision) {
+        Write-Host "配置版本：$($State.policy_revision.Substring(0, 12))；与运行快照 policy_revision 不同则需重启 MCP。"
+    }
     Write-Host '仅管理普通命令；SAFE/DEV、固定模板 Agent、专用 Git 和路径授权独立。'
     Write-Host '开发代码和 Shell 使用 MCP 宿主账户权限；elevated 不提权。修改后需重启 MCP。' -ForegroundColor Yellow
     if ($State.mode -eq 'unrestricted') {
@@ -1416,22 +1473,18 @@ function Show-CommandPolicyState {
 function Show-CommandPolicyMenu {
     param([hashtable]$Config)
 
+    $textOnly = $false
     while ($true) {
-        try {
-            $state = Invoke-CommandPolicyAdmin -Config $Config -Arguments @('status')
-            Show-CommandPolicyState -State $state
-        } catch { Write-Host '当前策略无法读取；可选 8 恢复默认。' -ForegroundColor Yellow }
-        Write-Host '  1. 选择预设（minimal 最小可用 / balanced 均衡开发 / elevated 显式 Shell / unrestricted 命令不设限）'
-        Write-Host '  2. 添加/修改内置工具别名（任意参数）'
-        Write-Host '  3. 添加/修改自定义规则（单行 JSON，输入隐藏）'
-        Write-Host '  4. 禁用命令（禁用优先）'
-        Write-Host '  5. 撤销本机禁用'
-        Write-Host '  6. 移除本机添加（同名预设规则会恢复）'
-        Write-Host '  8. 恢复默认（清除本机添加和禁用）'
-        Write-Host '  0. 返回（每项合法修改即时保存）'
-        $choice = Read-Host '命令策略'
+        $statusLines=@(Get-TuiStatusLines -CacheKey 'commands' {
+                $state=Invoke-CommandPolicyAdmin -Config $Config -Arguments @('status')
+                Show-CommandPolicyState -State $state
+        })
+        $menu=Read-LauncherMenuChoice -Page commands -Status $statusLines -TextOnly ([ref]$textOnly)
+        $choice=$menu.Choice
         if ($choice -eq '0') { return }
+        if ($choice -eq 'r') { continue }
         try {
+            $cancelled = $false
             switch ($choice) {
                 '1' {
                     Write-Host '切换预设会保留本机添加和禁用；要清空覆盖请先选 8 恢复默认。' -ForegroundColor Yellow
@@ -1464,20 +1517,22 @@ function Show-CommandPolicyMenu {
                     [void](Invoke-CommandPolicyAdmin -Config $Config -Arguments @('remove', $name))
                 }
                 '8' {
-                    if ((Read-Host '输入 RESET 恢复默认') -cne 'RESET') { continue }
+                    if ((Read-Host '输入 RESET 恢复默认') -cne 'RESET') { $cancelled=$true; Write-Host '已取消恢复默认。'; continue }
                     [void](Invoke-CommandPolicyAdmin -Config $Config -Arguments @('reset'))
                 }
-                default { Write-Host '无效选择。' -ForegroundColor Yellow; continue }
+                default { $cancelled=$true; Write-Host '无效选择。' -ForegroundColor Yellow; continue }
             }
-            Write-Host '命令策略已保存；重启 MCP 后生效，SAFE/DEV 总开关不变。' -ForegroundColor Green
+            if (-not $cancelled) { Write-Host '命令策略已保存；重启 MCP 后生效，SAFE/DEV 总开关不变。' -ForegroundColor Green }
         } catch { Write-Host $_.Exception.Message -ForegroundColor Yellow }
+        if ($menu.Rich) { Pause-Tq }
     }
 }
 
 function Edit-SettingsInteractive {
     param([hashtable]$Config)
 
-    Write-Host '直接回车表示保持现值；代理凭据不会显示在菜单中。' -ForegroundColor DarkGray
+    Write-Host 'A 设置会依次询问程序路径、健康地址、等待预算、Doctor、自动恢复和连接 TTL。' -ForegroundColor DarkGray
+    Write-Host '直接回车表示保持现值；保存后需重启已运行实例。TTL 不改变 Agent 生命周期。' -ForegroundColor DarkGray
     $interactiveTimeout = if ($Config.ContainsKey('interactiveTimeoutSeconds')) {
         [int]$Config.interactiveTimeoutSeconds
     } else { 75 }
@@ -1769,22 +1824,19 @@ function Edit-AccessPolicyRuleInteractive {
 }
 
 function Show-AccessPolicyMenu {
+    $textOnly = $false
     while ($true) {
-        Clear-Host
-        Write-Host "`n访问策略 / 外部路径白名单" -ForegroundColor Cyan
-        Show-AccessPolicy
-        Write-Host '  1. 新增规则'
-        Write-Host '  2. 删除规则'
-        Write-Host '  3. 编辑 / 启用 / 禁用规则'
-        Write-Host '  4. 测试路径权限（只读解释）'
-        Write-Host '  5. 验证策略并提示 reload'
-        Write-Host '  0. 返回'
-        switch (Read-Host '选择') {
+        $statusLines=@(Get-TuiStatusLines -CacheKey 'policy' { Show-AccessPolicy })
+        $menu=Read-LauncherMenuChoice -Page policy -Status $statusLines -TextOnly ([ref]$textOnly)
+        $choice=$menu.Choice
+        if ($choice -eq 'r') { continue }
+        switch ($choice) {
             '1' { Add-AccessPolicyRuleInteractive; Pause-Tq }
             '2' { Remove-AccessPolicyRuleInteractive; Pause-Tq }
             '3' { Edit-AccessPolicyRuleInteractive; Pause-Tq }
             '4' { Explain-AccessPolicyInteractive; Pause-Tq }
             '5' { Validate-AccessPolicyInteractive; Pause-Tq }
+            'h' { Show-MenuHelp -Section 'policy' }
             '0' { return }
             default { Write-Host '无效选择。' -ForegroundColor Yellow; Pause-Tq }
         }
@@ -1820,7 +1872,9 @@ function Invoke-AgentSourceAdmin {
         '--catalog', (Get-AgentCatalogPath -Config $Config),
         '--workspace', (Get-Workspace)
     )
-    $raw = & $python @base @Arguments 2>&1
+    $raw = if ($script:TuiStatusProbe -and $Arguments[0] -in @('discover','status')) {
+        Invoke-TuiProbeProcess -FilePath $python -Arguments ($base + $Arguments)
+    } else { & $python @base @Arguments 2>&1 }
     if ($LASTEXITCODE -ne 0) {
         throw (($raw -join [Environment]::NewLine).Trim())
     }
@@ -2055,22 +2109,14 @@ function Invoke-AgentSmokeInteractive {
 function Show-AgentSourceMenu {
     param([hashtable]$Config)
 
+    $textOnly = $false
     while ($true) {
-        if (-not [Console]::IsOutputRedirected) { Clear-Host }
-        Write-Host "`n本地 Agent / 会话源管理" -ForegroundColor Cyan
-        Write-Host 'Claude 命令档位由本机 profile 决定；workspace_info 显示当前加载值。' -ForegroundColor DarkGray
-        Write-Host 'trusted-shell 可运行宿主命令；Windows 原生环境不保证项目路径隔离。' -ForegroundColor DarkYellow
-        [void](Show-AgentSourceState -Config $Config)
-        Write-Host '  1. 添加固定 provider 会话源'
-        Write-Host '  2. 启用 / 禁用 source'
-        Write-Host '  3. 删除 source'
-        Write-Host '  4. 验证配置'
-        Write-Host '  5. 刷新一个 source 的 metadata Catalog'
-        Write-Host '  6. 重建 Catalog（需先停止 Tunnel/MCP）'
-        Write-Host '  7. 真实最小 Agent smoke（消耗额度，二次确认）'
-        Write-Host '  0. 返回'
+        $statusLines=@(Get-TuiStatusLines -CacheKey 'agents' { Write-Host 'Claude 命令档位由本机 profile 决定；workspace_info 显示当前加载值。'; Write-Host 'trusted-shell 可运行宿主命令；Windows 原生环境不保证项目路径隔离。'; Show-AgentSourceState -Config $Config })
+        $menu=Read-LauncherMenuChoice -Page agents -Status $statusLines -TextOnly ([ref]$textOnly)
+        $choice=$menu.Choice
+        if ($choice -eq 'r') { continue }
         try {
-            switch (Read-Host '选择') {
+            switch ($choice) {
                 '1' { Add-AgentSourceInteractive -Config $Config; Pause-Tq }
                 '2' { Toggle-AgentSourceInteractive -Config $Config; Pause-Tq }
                 '3' { Remove-AgentSourceInteractive -Config $Config; Pause-Tq }
@@ -2078,6 +2124,7 @@ function Show-AgentSourceMenu {
                 '5' { Refresh-AgentSourceInteractive -Config $Config; Pause-Tq }
                 '6' { Rebuild-AgentCatalogInteractive -Config $Config; Pause-Tq }
                 '7' { Invoke-AgentSmokeInteractive -Config $Config; Pause-Tq }
+                'h' { Show-MenuHelp -Section 'agents' }
                 '0' { return }
                 default { Write-Host '无效选择。' -ForegroundColor Yellow; Pause-Tq }
             }
@@ -2095,16 +2142,13 @@ function Pause-Tq {
 function Show-KeyMenu {
     param([hashtable]$Config)
 
+    $textOnly = $false
     while ($true) {
-        Write-Host "`n密钥管理（永远不会显示密钥值）" -ForegroundColor Cyan
-        Show-KeyStatus -Config $Config
-        Write-Host '  1. 写入当前 PowerShell 环境'
-        Write-Host '  2. 写入 Windows 用户环境变量'
-        Write-Host '  3. 写入项目 .env（明文 + 收紧 ACL）'
-        Write-Host '  4. 删除 Windows 用户环境变量'
-        Write-Host '  5. 删除项目 .env'
-        Write-Host '  0. 返回'
-        switch (Read-Host '选择') {
+        $statusLines=@(Get-TuiStatusLines -CacheKey 'key' { Show-KeyStatus -Config $Config })
+        $menu=Read-LauncherMenuChoice -Page key -Status $statusLines -TextOnly ([ref]$textOnly)
+        $choice=$menu.Choice
+        if ($choice -eq 'r') { continue }
+        switch ($choice) {
             '1' { Set-ProcessKeyInteractive }
             '2' { Set-UserKeyInteractive }
             '3' { Set-DotEnvKeyInteractive -Config $Config }
@@ -2122,29 +2166,24 @@ function Show-KeyMenu {
                     Write-Host '已删除 .env。' -ForegroundColor Green
                 }
             }
+            'h' { Show-MenuHelp -Section 'key' }
             '0' { return }
             default { Write-Host '无效选择。' -ForegroundColor Yellow }
         }
+        if ($menu.Rich -and $choice -ne 'h') { Pause-Tq }
     }
 }
 
 function Show-ProfileMenu {
     param([hashtable]$Config)
 
+    $textOnly = $false
     while ($true) {
-        Write-Host "`nProfile 管理" -ForegroundColor Cyan
-        Show-Profiles -Config $Config
-        Write-Host '  1. 创建或重建 Profile'
-        Write-Host '  2. 选择默认 Profile'
-        Write-Host '  3. 使用 tunnel-client 编辑 Profile'
-        Write-Host '  4. 一键切换当前 Profile 为 SAFE'
-        Write-Host '  5. 一键切换当前 Profile 为 DEV（工作区命令 + 远程 Git）'
-        Write-Host '  6. 启用聊天外部授权（一次性 challenge）'
-        Write-Host '  7. 启用聊天外部授权 + Exec（外部命令也可用）'
-        Write-Host '  8. 开启策略热重载（高危：批准后可当场扩大白名单，无需重启）'
-        Write-Host '  9. 关闭策略热重载（回到冷重载：改白名单必须重启）'
-        Write-Host '  0. 返回'
-        switch (Read-Host '选择') {
+        $statusLines=@(Get-TuiStatusLines -CacheKey 'profile' { Show-Profiles -Config $Config })
+        $menu=Read-LauncherMenuChoice -Page profile -Status $statusLines -TextOnly ([ref]$textOnly)
+        $choice=$menu.Choice
+        if ($choice -eq 'r') { continue }
+        switch ($choice) {
             '1' { Configure-ProfileInteractive -Config (Get-LauncherConfig); $Config = Get-LauncherConfig }
             '2' { Select-ProfileInteractive -Config $Config; $Config = Get-LauncherConfig }
             '3' {
@@ -2196,9 +2235,11 @@ function Show-ProfileMenu {
                     $Config = Get-LauncherConfig
                 }
             }
+            'h' { Show-MenuHelp -Section 'profile' }
             '0' { return }
             default { Write-Host '无效选择。' -ForegroundColor Yellow }
         }
+        if ($menu.Rich -and $choice -ne 'h') { Pause-Tq }
     }
 }
 
@@ -2209,65 +2250,46 @@ function Install-Alias {
 }
 
 function Show-MainMenu {
+    $textOnly = $false
     while ($true) {
-        $config = Get-LauncherConfig
-        $selected = Resolve-SelectedProfile -Config $config -Requested $Profile
-        $key = Get-KeyRecord -Config $config
-        $modeLabel = Get-ProfileMode -Config $config -Name $selected
-        $runningProfiles = @(
-            @(Get-RunningTunnelRecords -Config $config | ForEach-Object Profile) +
-            @(Get-RunningSupervisorRecords -Config $config | ForEach-Object Profile) |
-                Sort-Object -Unique
-        )
-        $listenerConflict = if ($runningProfiles.Count -eq 0) {
-            Get-HealthListenerConflict -Config $config
-        } else { $null }
-        Clear-Host
-        Write-Host '╔══════════════════════════════════════╗' -ForegroundColor Cyan
-        Write-Host '║       天澄 Local MCP 控制台          ║' -ForegroundColor Cyan
-        Write-Host '╚══════════════════════════════════════╝' -ForegroundColor Cyan
-        Write-Host "Profile: $selected [$modeLabel]   Key: $($key.Configured)" -ForegroundColor DarkGray
-        if ($modeLabel -eq 'GRANTS') {
-            Write-Host '能力提示：聊天外部授权已开；工作区 run_command/远程 Git 未开。到“6→7”可开启外部 Exec。' -ForegroundColor Yellow
-        } elseif ($modeLabel -eq 'GRANTS+EXEC') {
-            Write-Host '能力提示：外部授权、工作区命令、远程 Git 和外部 Exec 均已开。' -ForegroundColor Yellow
-        } elseif ($modeLabel -eq 'DEV') {
-            Write-Host '能力提示：工作区命令与远程 Git 已开；外部路径仍需单独启用聊天授权。' -ForegroundColor Yellow
-        } elseif ($modeLabel -eq 'SAFE') {
-            Write-Host '能力提示：仅工作区文件与本地 Git，命令执行关闭。' -ForegroundColor DarkGray
-        }
-        Write-Host "MCP 自动转后台等待: $($config.interactiveTimeoutSeconds)s" -ForegroundColor DarkGray
-        $runningLabel = if ($runningProfiles.Count) { $runningProfiles -join ', ' }
-            elseif ($null -ne $listenerConflict) { "未识别到 Profile；健康端口 $($listenerConflict.Endpoint) 已占用" }
-            else { 'none' }
-        Write-Host "Running: $runningLabel" -ForegroundColor DarkGray
-        Write-Host
-        Write-Host '  1. 一键检查并启动 MCP + Tunnel'
-        Write-Host '  2. 在新窗口启动 MCP + Tunnel'
-        Write-Host '  3. 停止当前 Profile'
-        Write-Host '  4. 重启当前 Profile（新窗口）'
-        Write-Host '  5. Doctor 检查'
-        Write-Host '  6. Profile 管理 / SAFE-DEV 切换'
-        Write-Host '  7. API Key 管理'
-        Write-Host '  8. 状态（含 Git/GCM/gh）'
-        Write-Host '  9. 打开 Tunnel 管理 UI'
-        Write-Host '  A. 启动器设置 / 出站代理'
-        Write-Host '  P. 出站代理设置'
-        Write-Host '  B. 安装/修复 tc 快捷命令'
-        Write-Host '  D. 外部路径白名单 / 访问策略'
-        Write-Host '  E. 本地 Agent / 会话源管理'
-        Write-Host '  C. 命令白名单 / 开发权限预设'
-        Write-Host '  0. 退出'
         try {
-            switch (Read-Host '选择') {
+            $config=Get-LauncherConfig
+            $selected=Resolve-SelectedProfile -Config $config -Requested $Profile
+        } catch {
+            $menu=Read-LauncherMenuChoice -Page main -Status @('启动配置读取失败 · 操作不可用 · R 重试 / 0 退出') -TextOnly ([ref]$textOnly)
+            if ($menu.Choice -eq '0') { return }
+            if ($menu.Choice -ne 'r') { Write-Host '请先修复本机启动配置。'; Pause-Tq }
+            continue
+        }
+        $statusLines=@(Get-TuiStatusLines -CacheKey 'main' {
+            $key=Get-KeyRecord -Config $config
+            $modeLabel = Get-ProfileMode -Config $config -Name $selected
+            $runningProfiles = @(
+                @(Get-RunningTunnelRecords -Config $config | ForEach-Object Profile) +
+                @(Get-RunningSupervisorRecords -Config $config | ForEach-Object Profile) |
+                    Sort-Object -Unique
+            )
+            $listenerConflict = if ($runningProfiles.Count -eq 0) {
+                Get-HealthListenerConflict -Config $config
+            } else { $null }
+            $runningLabel = if ($runningProfiles.Count) { $runningProfiles -join ', ' }
+                elseif ($null -ne $listenerConflict) { '未知（健康端口已占用）' } else { '未启动' }
+            $keyLabel = if ($key.Configured) { '已配置' } else { '未配置' }
+            "Profile  $selected    模式  $modeLabel    Key  $keyLabel",
+            "受管运行  $runningLabel    云端连接  未检测    刷新  $(Get-Date -Format 'HH:mm:ss')"
+        })
+        $menu=Read-LauncherMenuChoice -Page main -Status $statusLines -TextOnly ([ref]$textOnly)
+        $choice=$menu.Choice
+        try {
+            switch ($choice) {
                 '1' { Start-TunnelForeground -Config $config -Name $selected -SkipDoctorCheck:$false -ExecAlreadyAllowed:$false }
                 '2' { Start-TunnelWindow -Config $config -Name $selected -ExecAlreadyAllowed:$false; Pause-Tq }
                 '3' { [void](Stop-TunnelProfile -Config $config -Name $selected -Confirmed:$false); Pause-Tq }
                 '4' { Restart-TunnelProfile -Config $config -Name $selected -Confirmed:$false; Pause-Tq }
-                '5' { [void](Invoke-Doctor -Config $config -Name $selected); Pause-Tq }
+                '5' { Show-DoctorResult -Config $config -Name $selected }
                 '6' { Show-ProfileMenu -Config $config }
                 '7' { Show-KeyMenu -Config $config }
-                '8' { Show-Status -Config $config; Pause-Tq }
+                '8' { Show-TuiResult -Title '完整状态' -Lines @(Get-TuiStatusLines -CacheKey full-status { Show-Status -Config $config }) }
                 '9' { Open-AdminUi -Config $config; Pause-Tq }
                 { $_ -match '^(?i)a$' } { Edit-SettingsInteractive -Config $config; Pause-Tq }
                 { $_ -match '^(?i)p$' } { Edit-ProxySettingsInteractive; Pause-Tq }
@@ -2275,6 +2297,8 @@ function Show-MainMenu {
                 { $_ -match '^(?i)d$' } { Show-AccessPolicyMenu }
                 { $_ -match '^(?i)e$' } { Show-AgentSourceMenu -Config $config }
                 { $_ -match '^(?i)c$' } { Show-CommandPolicyMenu -Config $config }
+                'r' { continue }
+                'h' { Show-MenuHelp -Section 'main' }
                 '0' { return }
                 default { Write-Host '无效选择。' -ForegroundColor Yellow; Pause-Tq }
             }
@@ -2285,8 +2309,10 @@ function Show-MainMenu {
     }
 }
 
-$config = Get-LauncherConfig
-$selectedProfile = Resolve-SelectedProfile -Config $config -Requested $Profile
+if ($Action -ne 'menu') {
+    $config = Get-LauncherConfig
+    $selectedProfile = Resolve-SelectedProfile -Config $config -Requested $Profile
+}
 
 switch ($Action) {
     'menu' { Show-MainMenu }

@@ -372,3 +372,109 @@ def test_unrestricted_native_filename_disable_admin_round_trip(workspace, tmp_pa
             policy.check(policy.request_key(name), [])
     edit_policy(path, workspace, "enable", "my.tool-2")
     assert not CommandPolicy.load(path, workspace).disabled
+@pytest.mark.parametrize('case, code', [
+    ('safe', 'EXEC_DISABLED'), ('disabled', 'COMMAND_DISABLED'),
+    ('unknown', 'COMMAND_NOT_ALLOWED'), ('missing', 'COMMAND_UNAVAILABLE'),
+    ('arguments', 'ARGUMENTS_NOT_ALLOWED'),
+])
+def test_command_rejection_feedback_is_specific_compatible_and_redacted(workspace, tmp_path, monkeypatch, case, code):
+    from tiancheng_mcp import command_discovery
+    monkeypatch.setattr(command_discovery, 'discover_shell_commands', lambda root: {})
+    fields = {}
+    command = 'python'
+    if case == 'disabled':
+        fields['disable'] = ['python']
+    elif case == 'unknown':
+        fields['preset'] = 'minimal'
+    elif case == 'missing':
+        fields['add'] = {'missing-shell': {'builtin': 'bash'}}
+        command = 'missing-shell'
+    elif case == 'arguments':
+        fields['add'] = {'python': {'builtin': 'python', 'arguments': {'exact': [['--version']]}}}
+    service = TianChengService(workspace, None, allow_exec=case != 'safe', command_policy_path=local_policy(tmp_path, **fields))
+    try:
+        for method in (service.run_command, service.start_process):
+            with pytest.raises(PermissionError) as caught:
+                method(command, ['-c', 'secret-request-argument'])
+            assert type(caught.value) is PermissionError
+            assert caught.value.reason_code == code
+            assert str(caught.value).startswith(f'[{code}]')
+            assert 'secret-request-argument' not in str(caught.value)
+        assert service._process_slots.active_count == 0
+    finally:
+        service.shutdown()
+
+
+def test_running_snapshot_and_saved_config_revision_are_distinct(workspace, tmp_path):
+    import subprocess
+    path = local_policy(tmp_path, preset='balanced')
+    service = TianChengService(workspace, None, allow_exec=True, command_policy_path=path)
+    try:
+        running = service.workspace_info()['command_policy']
+        assert running['configuration_role'] == 'runtime_snapshot'
+        assert running['execution_enabled'] is True
+        def admin_status():
+            result = subprocess.run([sys.executable, '-m', 'tiancheng_mcp.command_policy_admin', '--policy', str(path), '--workspace', str(workspace), 'status'], capture_output=True, text=True, encoding='utf-8', check=True)
+            return json.loads(result.stdout)
+        saved = admin_status()
+        assert saved['configuration_role'] == 'next_start'
+        assert saved['execution_enabled'] is None
+        assert saved['policy_revision'] == running['policy_revision']
+        path.write_text('{"schema_version":1,"preset":"minimal"}', encoding='utf-8')
+        changed = admin_status()
+        assert changed['policy_revision'] != running['policy_revision']
+        assert service.workspace_info()['command_policy']['policy_revision'] == running['policy_revision']
+        assert service.run_command('python', ['--version'])['exit_code'] == 0
+    finally:
+        service.shutdown()
+
+
+def test_effective_revision_ignores_config_location_key_order_and_availability(tmp_path):
+    a = tmp_path / 'a.json'
+    b = tmp_path / 'b.json'
+    a.write_text('{"schema_version":1,"disable":["gh","python"],"preset":"balanced"}', encoding='utf-8')
+    b.write_text('{"preset":"balanced","disable":["python","gh"],"schema_version":1}', encoding='utf-8')
+    policy_a = CommandPolicy.load(a)
+    policy_b = CommandPolicy.load(b)
+    assert policy_a.revision == policy_b.revision
+    assert policy_a.summary({}, enabled=True)['policy_revision'] == policy_a.summary({'git': ['anything']}, enabled=True)['policy_revision']
+
+
+def test_background_failure_keeps_specific_rejection_reason(workspace, tmp_path):
+    service = TianChengService(workspace, None, allow_exec=True, command_policy_path=local_policy(tmp_path, disable=['python']))
+    try:
+        job = service.jobs.submit('run_command', lambda cancel: service.run_command('python', ['-c', 'secret-job-argument']))
+        assert job.done.wait(15)
+        status = service.job_status(job.job_id)
+        assert status['state'] == 'failed' and status['error_type'] == 'PermissionError'
+        assert status['error'].startswith('[COMMAND_DISABLED]')
+        assert 'secret-job-argument' not in status['error']
+    finally:
+        service.shutdown()
+
+
+def test_removed_configured_program_reports_unavailable_without_path_leak(workspace, tmp_path):
+    tool = tmp_path / ("removed-tool.exe" if os.name == "nt" else "removed-tool")
+    shutil.copy2(Path(shutil.which("cmd") if os.name == "nt" else sys.executable).resolve(), tool)
+    service = TianChengService(workspace, None, allow_exec=True, command_policy_path=local_policy(tmp_path, add={"helper": {"argv": [str(tool)]}}))
+    try:
+        tool.unlink()
+        for method in (service.run_command, service.start_process):
+            with pytest.raises(PermissionError) as caught:
+                method("helper", [])
+            assert caught.value.reason_code == "COMMAND_UNAVAILABLE"
+            assert str(tool) not in str(caught.value)
+    finally:
+        service.shutdown()
+
+
+def test_nonexistent_absolute_program_reports_unavailable_without_path_leak(workspace, tmp_path):
+    service = TianChengService(workspace, None, allow_exec=True, command_policy_path=local_policy(tmp_path, preset="unrestricted"))
+    missing = tmp_path / "missing-private-tool.exe"
+    try:
+        with pytest.raises(PermissionError) as caught:
+            service.run_command(str(missing), [])
+        assert caught.value.reason_code == "COMMAND_UNAVAILABLE"
+        assert str(missing) not in str(caught.value)
+    finally:
+        service.shutdown()
