@@ -1,0 +1,59 @@
+{
+  "schema_version": 1,
+  "default_preset": "balanced",
+  "presets": {
+    "minimal": {
+      "git": {"builtin": "git", "arguments": {"exact": [["--version"]]}},
+      "rg": {"builtin": "rg", "arguments": {"exact": [["--version"]]}}
+    },
+    "balanced": {
+      "python": {"builtin": "python", "arguments": "any"},
+      "pytest": {"builtin": "pytest", "arguments": "any"},
+      "py": {"builtin": "py", "arguments": "any"},
+      "uv": {"builtin": "uv", "arguments": "any"},
+      "git": {"builtin": "git", "arguments": "any"},
+      "gh": {"builtin": "gh", "arguments": "any"},
+      "node": {"builtin": "node", "arguments": "any"},
+      "rg": {"builtin": "rg", "arguments": "any"},
+      "npm": {"builtin": "npm", "arguments": "any"},
+      "npx": {"builtin": "npx", "arguments": "any"},
+      "codex": {"builtin": "codex", "arguments": "any"}
+    },
+    "elevated": {
+      "python": {"builtin": "python", "arguments": "any"},
+      "pytest": {"builtin": "pytest", "arguments": "any"},
+      "py": {"builtin": "py", "arguments": "any"},
+      "uv": {"builtin": "uv", "arguments": "any"},
+      "git": {"builtin": "git", "arguments": "any"},
+      "gh": {"builtin": "gh", "arguments": "any"},
+      "node": {"builtin": "node", "arguments": "any"},
+      "rg": {"builtin": "rg", "arguments": "any"},
+      "npm": {"builtin": "npm", "arguments": "any"},
+      "npx": {"builtin": "npx", "arguments": "any"},
+      "codex": {"builtin": "codex", "arguments": "any"},
+      "pwsh": {"builtin": "pwsh", "arguments": "any"},
+      "powershell": {"builtin": "powershell", "arguments": "any"},
+      "cmd": {"builtin": "cmd", "arguments": "any"},
+      "bash": {"builtin": "bash", "arguments": "any"},
+      "sh": {"builtin": "sh", "arguments": "any"}
+    },
+    "unrestricted": {
+      "python": {"builtin": "python", "arguments": "any"},
+      "pytest": {"builtin": "pytest", "arguments": "any"},
+      "py": {"builtin": "py", "arguments": "any"},
+      "uv": {"builtin": "uv", "arguments": "any"},
+      "git": {"builtin": "git", "arguments": "any"},
+      "gh": {"builtin": "gh", "arguments": "any"},
+      "node": {"builtin": "node", "arguments": "any"},
+      "rg": {"builtin": "rg", "arguments": "any"},
+      "npm": {"builtin": "npm", "arguments": "any"},
+      "npx": {"builtin": "npx", "arguments": "any"},
+      "codex": {"builtin": "codex", "arguments": "any"},
+      "pwsh": {"builtin": "pwsh", "arguments": "any"},
+      "powershell": {"builtin": "powershell", "arguments": "any"},
+      "cmd": {"builtin": "cmd", "arguments": "any"},
+      "bash": {"builtin": "bash", "arguments": "any"},
+      "sh": {"builtin": "sh", "arguments": "any"}
+    }
+  }
+}

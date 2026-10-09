@@ -8,6 +8,19 @@
 
 ## [Unreleased]
 
+### Added
+
+- 命令预设增加 elevated（显式平台 Shell）和 unrestricted（PATH 程序名/绝对程序路径）。
+  默认仍 balanced；SAFE/DEV、环境透传、路径授权及进程限制保持独立，不提权或提供 OS sandbox。
+  unrestricted 的直接调用禁用按别名/文件名生效，配置规则仍优先；状态明确命令列表不完整。
+
+- 普通命令执行支持版本化 command-policy 默认预设及本机覆盖：minimal 仅开放 Git/rg 的精确版本查询，
+  balanced 保持现有 DEV 工具及参数范围；本机添加与禁用合并，禁用优先，新增自定义可信 argv 前缀。
+  SAFE/DEV 总开关、固定模板 Agent、专用 Git、外部路径授权和环境透传独立；这不是 OS sandbox。
+- TUI 新增 C / commands 管理入口，支持预设切换、添加、禁用、恢复、移除和恢复默认；
+  配置先验证再原子保存，修改后重启生效，不提供聊天写配置或热重载。
+  CLI --command-policy 与 launcher.commandPolicyPath 支持所选本机配置路径；workspace_info 展示实际策略。
+
 ### Fixed
 
 - 出站代理菜单保存的本机配置优先于继承的进程环境，修复修改/清除代理后仍使用旧地址的问题。

@@ -3,6 +3,7 @@
   "tunnelClient": "",
   "powerShell": "",
   "profileDir": "",
+  "commandPolicyPath": "config/command-policy.local.json",
   "proxy": {
     "http": "",
     "https": "",

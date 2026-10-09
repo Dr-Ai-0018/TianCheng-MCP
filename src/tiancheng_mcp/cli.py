@@ -63,6 +63,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Register the high-risk allowlisted run_command tool",
     )
     parser.add_argument(
+        "--command-policy", default=str(config_dir / "command-policy.local.json"),
+        help="Server-owned local command policy; does not enable execution",
+    )
+    parser.add_argument(
         "--pass-env",
         action="append",
         default=[],
@@ -157,6 +161,7 @@ def main(argv: list[str] | None = None) -> None:
             args.agent_profiles,
             args.agent_env_file,
             args.launcher_local_config,
+            args.command_policy,
         )
         def prepare(directory: Path) -> None:
             canonical = directory.resolve(strict=False)
@@ -184,6 +189,7 @@ def main(argv: list[str] | None = None) -> None:
         workspace=args.workspace,
         audit_directory=args.audit_dir,
         allow_exec=args.allow_exec,
+        command_policy_path=args.command_policy,
         passthrough_env=args.pass_env,
         allow_external_grants=args.allow_external_grants,
         interactive_timeout_seconds=args.interactive_timeout_seconds,

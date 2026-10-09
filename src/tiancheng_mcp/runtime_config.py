@@ -9,13 +9,14 @@ from collections.abc import Mapping
 PROJECT_RELATIVE_KEYS = {
     "python", "mcpScript", "mcpExecScript", "mcpGrantsScript", "workspace",
     "accessPolicyPath", "agentSourcesPath", "agentCatalogPath", "envFile",
-    "agentProfilesPath", "auditDir", "piCliEntry", "profileDir",
+    "agentProfilesPath", "auditDir", "piCliEntry", "profileDir", "commandPolicyPath",
 }
 RUNTIME_OPTIONS = {
     "workspace": "--workspace", "accessPolicyPath": "--access-policy",
     "agentSourcesPath": "--agent-sources", "agentCatalogPath": "--agent-catalog",
     "agentProfilesPath": "--agent-profiles", "envFile": "--agent-env-file",
     "auditDir": "--audit-dir", "piCliEntry": "--pi-cli-entry",
+    "commandPolicyPath": "--command-policy",
 }
 
 

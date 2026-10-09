@@ -103,12 +103,17 @@ async def test_native_launchers_use_selected_config_end_to_end(tmp_path, mode):
     catalog = tmp_path / "selected-catalog.sqlite3"
     env_path = tmp_path / "selected.env"
     env_path.write_text('EXAMPLE_AGENT_KEY=synthetic-selected\nUNSELECTED_TEST_KEY=synthetic-unselected\n', encoding="utf-8")
+    command_policy_path = tmp_path / "selected-command-policy.json"
+    command_policy_path.write_text(json.dumps({"schema_version": 1, "add": {
+        "selected-python": {"builtin": "python", "arguments": {"exact": [["--version"]]}}
+    }}), encoding="utf-8")
     config_path = tmp_path / "chosen launcher.json"
     config_path.write_text(json.dumps({
         "workspace": str(workspace), "python": sys.executable, "powerShell": pwsh,
         "accessPolicyPath": str(policy_path), "agentSourcesPath": str(sources_path),
         "agentCatalogPath": str(catalog), "agentProfilesPath": str(tmp_path / "profiles.json"),
         "envFile": str(env_path), "auditDir": str(tmp_path / "selected-audit"),
+        "commandPolicyPath": str(tmp_path / "selected-command-policy.json"),
         "interactiveTimeoutSeconds": 42,
     }), encoding="utf-8")
     environment = {"PATH": os.environ.get("PATH", ""), "CONTROL_PLANE_API_KEY": "synthetic-parent-secret"}
@@ -120,6 +125,7 @@ async def test_native_launchers_use_selected_config_end_to_end(tmp_path, mode):
         payload = json.loads(info.stdout)
         assert payload["workspace"] == str(workspace)
         assert payload["accessPolicyPath"] == str(policy_path)
+        assert payload["commandPolicyPath"] == str(tmp_path / "selected-command-policy.json")
         command = shlex.split(payload["mcpCommand"])
     else:
         script = "run-mcp-exec.ps1" if mode == "dev" else "run-mcp-grants.ps1"
@@ -136,6 +142,8 @@ async def test_native_launchers_use_selected_config_end_to_end(tmp_path, mode):
         info = result.structured_content
         assert info["workspace_root"] == str(workspace)
         assert info["interactive_timeout_seconds"] == 42
+        assert any(rule["name"] == "selected-python" and rule["source"] == "local"
+            for rule in info["command_policy"]["commands"])
         assert any(rule["path"] == str(workspace / "blocked") and rule["mode"] == "deny"
             for rule in info["access_policy"]["rules"])
         assert info["agent_sources"]["source_count"] == 1

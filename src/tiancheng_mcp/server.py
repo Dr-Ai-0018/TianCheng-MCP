@@ -616,7 +616,7 @@ def create_server(service: TianChengService) -> MCPServer:
     if service.external_grants.enabled:
 
         @mcp.tool(
-            description="Run an allowlisted command: with grant_id use an absolute cwd within its root or a grant-relative cwd (default '.' is the root); without grant_id supply an absolute cwd covered by a no-approval static exec policy rule.",
+            description="Run a command under the selected command policy: with grant_id use an absolute cwd within its root or a grant-relative cwd (default '.' is the root); without grant_id supply an absolute cwd covered by a no-approval static exec policy rule.",
             annotations=EXECUTION,
         )
         def external_run_command(
@@ -1118,10 +1118,13 @@ def create_server(service: TianChengService) -> MCPServer:
 
         @mcp.tool(
             description=(
-                "Run an allowlisted developer command with separated args, a workspace cwd, "
+                "Run a command allowed by the configured command policy (see workspace_info.command_policy), "
+                "with separated args and a workspace cwd, "
                 "global Git/GCM access, a secret-scrubbed environment, process-tree timeout, "
                 "and bounded output. Credential-printing commands are blocked. This is not an "
-                "OS sandbox."
+                "OS sandbox. minimal allows only git/rg --version; balanced permits development code; "
+                "elevated adds explicit Shells; unrestricted accepts executable names or absolute paths "
+                "under the server account."
             ),
             annotations=EXECUTION,
         )
@@ -1147,7 +1150,7 @@ def create_server(service: TianChengService) -> MCPServer:
 
         @mcp.tool(
             description=(
-                "Start an allowlisted long-running developer process in a workspace cwd. "
+                "Start a command-policy controlled long-running developer process in a workspace cwd. "
                 "Output is kept only in bounded memory and the process has a hard lifetime."
             ),
             annotations=EXECUTION,

@@ -480,6 +480,54 @@ def test_proxy_menu_invalid_input_returns_to_menu_without_saving(tmp_path: Path)
     assert "invalid-proxy" not in result.stdout + result.stderr
 
 
+def test_command_policy_menu_round_trip_and_effective_json(tmp_path: Path) -> None:
+    config = tmp_path / "launcher.json"
+    write_test_config(config, env_file=tmp_path / ".env", profile_dir=tmp_path / "profiles")
+    payload = json.loads(config.read_text(encoding="utf-8"))
+    policy = tmp_path / "commands.json"
+    payload["commandPolicyPath"] = str(policy)
+    config.write_text(json.dumps(payload), encoding="utf-8")
+    result = run_powershell(
+        PROJECT_ROOT / "tc.ps1", "-Action", "commands", "-ConfigPath", str(config), "-NoPause",
+        input_text="1\nminimal\n2\npython\npython\n4\npython\n0\n",
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "命令策略已保存" in result.stdout
+    assert "已禁用 / 本机添加" in result.stdout
+    saved = json.loads(policy.read_text(encoding="utf-8"))
+    assert saved["preset"] == "minimal"
+    assert saved["disable"] == ["python"]
+    status = run_powershell(
+        PROJECT_ROOT / "tc.ps1", "-Action", "commands", "-ConfigPath", str(config), "-Json",
+    )
+    assert status.returncode == 0, status.stdout + status.stderr
+    state = json.loads(status.stdout)
+    assert state["preset"] == "minimal"
+    assert state["scope"] == "ordinary_commands_only"
+    assert next(row for row in state["commands"] if row["name"] == "python")["status"] == "disabled"
+
+
+def test_command_policy_menu_invalid_rule_never_echoes_or_overwrites(tmp_path: Path) -> None:
+    config = tmp_path / "launcher.json"
+    write_test_config(config, env_file=tmp_path / ".env", profile_dir=tmp_path / "profiles")
+    payload = json.loads(config.read_text(encoding="utf-8"))
+    policy = tmp_path / "commands.json"
+    policy.write_text('{"schema_version":1,"preset":"minimal"}', encoding="utf-8")
+    payload["commandPolicyPath"] = str(policy)
+    config.write_text(json.dumps(payload), encoding="utf-8")
+    before = policy.read_bytes()
+    rule = json.dumps({"argv": ["relative.exe", "secret-fixed-argument"]})
+    result = run_powershell(
+        PROJECT_ROOT / "tc.ps1", "-Action", "commands", "-ConfigPath", str(config), "-NoPause",
+        input_text=f"3\nhelper\n{rule}\n0\n",
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "secret-fixed-argument" not in result.stdout + result.stderr
+    assert "relative.exe" not in result.stdout + result.stderr
+    assert "must be an absolute path" in result.stdout
+    assert policy.read_bytes() == before
+
+
 def test_proxy_menu_saved_settings_override_inherited_environment(tmp_path: Path) -> None:
     config = tmp_path / "launcher.json"
     write_test_config(config, env_file=tmp_path / ".env", profile_dir=tmp_path / "profiles")
@@ -669,3 +717,21 @@ def test_launcher_reports_policy_hot_reload_mode(tmp_path: Path) -> None:
     )
     assert cold.returncode == 0, cold.stderr
     assert json.loads(cold.stdout)["profileModes"]["hot-profile"] == "GRANTS+EXEC"
+
+@pytest.mark.parametrize('preset', ['elevated', 'unrestricted'])
+def test_command_policy_high_preset_menu_and_mode(tmp_path: Path, preset: str) -> None:
+    config = tmp_path / 'launcher.json'
+    write_test_config(config, env_file=tmp_path / '.env', profile_dir=tmp_path / 'profiles')
+    payload = json.loads(config.read_text(encoding='utf-8'))
+    policy = tmp_path / 'commands.json'
+    payload['commandPolicyPath'] = str(policy)
+    config.write_text(json.dumps(payload), encoding='utf-8')
+    result = run_powershell(PROJECT_ROOT / 'tc.ps1', '-Action', 'commands', '-ConfigPath', str(config), '-NoPause', input_text=f'1\n{preset}\n4\npython\n0\n')
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert 'elevated 不提权' in result.stdout
+    assert json.loads(policy.read_text(encoding='utf-8'))['preset'] == preset
+    status = run_powershell(PROJECT_ROOT / 'tc.ps1', '-Action', 'commands', '-ConfigPath', str(config), '-Json')
+    state = json.loads(status.stdout)
+    assert state['mode'] == ('unrestricted' if preset == 'unrestricted' else 'allowlist')
+    assert state['disabled'] == ['python']
+    assert state['available_presets'] == ['minimal', 'balanced', 'elevated', 'unrestricted']

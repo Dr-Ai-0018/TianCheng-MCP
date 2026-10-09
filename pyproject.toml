@@ -26,6 +26,9 @@ tiancheng-mcp = "tiancheng_mcp.cli:main"
 [tool.hatch.build.targets.wheel]
 packages = ["src/tiancheng_mcp"]
 
+[tool.hatch.build.targets.wheel.force-include]
+"config/command-policy.defaults.json" = "tiancheng_mcp/data/command-policy.defaults.json"
+
 [tool.pytest.ini_options]
 addopts = "-ra"
 testpaths = ["tests"]

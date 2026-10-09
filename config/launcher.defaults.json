@@ -10,6 +10,7 @@
   "mcpExecScript": "run-mcp-exec.ps1",
   "mcpGrantsScript": "run-mcp-grants.ps1",
   "accessPolicyPath": "config/access-policy.json",
+  "commandPolicyPath": "config/command-policy.local.json",
   "agentSourcesPath": "config/agent-sources.json",
   "agentCatalogPath": "state/agent-catalog.sqlite3",
   "agentProfilesPath": "config/agent-profiles.json",

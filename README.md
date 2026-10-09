@@ -438,6 +438,63 @@ uv run python .\scripts\smoke_exec_stdio.py
 上述边界的目标是保证 MCP 文件和 Git 工具不会把用户提供的路径解析到
 `<WORKSPACE>` 之外。安全检查故意保守：即使链接最终仍指向工作区内部，也会拒绝。
 
+### 命令白名单与开发预设
+
+普通 `run_command`、`start_process`、`external_run_command` 及其后台调用共用启动时加载的命令策略。
+SAFE/DEV 仍决定是否开放执行，选择预设或添加命令不会自行打开执行。
+专用 Git 工具和固定模板 Agent 使用自己的能力边界，不受此普通命令名单控制。
+
+| 预设 | 普通命令能力 |
+| --- | --- |
+| `minimal` | 只允许已安装 Git/rg 的完整参数 `--version`；日常文件与 Git 操作使用已有专用工具 |
+| `balanced`（默认） | 与原 DEV 工具名单兼容，允许 Python、Node、uv 等开发代码运行；不是 OS sandbox |
+| `elevated` | balanced 加当前平台已安装 Shell：Windows 的 pwsh/powershell/cmd，POSIX 的 bash/sh |
+| `unrestricted` | elevated 加任意程序名或绝对程序路径；保留本机直接调用禁用规则 |
+
+主菜单 `C` 或 `tc -Action commands` 可以查看工具可用性、切换预设、添加内置工具别名或自定义规则、
+禁用命令、撤销禁用、移除本机添加和恢复默认。合法修改即时保存，**重启 MCP 后生效**。
+`tc -Action commands -Json` 查看下次启动配置；运行实例的实际快照看 `workspace_info.command_policy`。
+`elevated` 增加显式 Shell；`unrestricted` 取消普通命令名单。两档使用 MCP 的宿主账户，均不申请管理员权限。
+`unrestricted` 支持启动时 PATH 绝对目录中的程序名，以及绝对可执行文件路径（包括工作区程序）。
+Windows 只直接执行 `.exe`，`.cmd/.bat/.ps1` 通过显式解释器运行；POSIX 需要可执行权限。
+名称调用仍优先应用本机 `add` 的固定前缀和精确参数，禁用按直接调用别名或绝对路径文件名生效。
+绝对路径调用不使用别名参数模板；别名/路径是不同调用方式，禁用不递归限制 Shell 或子进程。
+`workspace_info.command_policy.mode` 报告模式；无限制下命令列表只列配置规则，不能枚举全部程序。
+
+例如 elevated 下可显式调用 `command="pwsh"`、`args=["-NoProfile", "-Command", "Write-Output 'hello'"]`；
+POSIX 使用 `command="bash"`、`args=["-c", "printf 'hello\\n'"]`。
+服务器始终使用分离的 argv 和 `shell=False`；Shell 解析只发生在调用者选定的解释器内。
+unrestricted 支持直接选择绝对程序路径，但仍检查执行开关、cwd 授权、参数大小和直接 Git/gh 凭据输出。
+本机禁用只控制直接入口；允许 Shell 或开发代码时，不能据此保证某个程序或系统操作永远无法发生。
+
+
+默认预设在 `config/command-policy.defaults.json`，也随 wheel 打包。
+本机覆盖在忽略的 `config/command-policy.local.json`，示例见 `config/command-policy.local.example.json`。
+通过 launcher 的 `commandPolicyPath` 或 CLI 的 `--command-policy <绝对路径>` 可选择独立配置；
+配置必须位于工作区外。合并规则是“预设 + add，最后 disable”，禁用优先。
+切换预设会保留本机添加和禁用；若要使用纯预设，先恢复默认清除覆盖，再选择预设。
+禁用作用于命令别名的直接调用，不拦截已授权程序启动的子进程；自定义规则可能扩大原预设能力。
+只删 `add` 中的条目会恢复同名预设规则；要真正关闭该命令，应加入 `disable`。
+
+```json
+{
+  "schema_version": 1,
+  "preset": "balanced",
+  "add": {
+    "git-version": {"builtin": "git", "arguments": {"exact": [["--version"]]}}
+  },
+  "disable": ["gh"]
+}
+```
+
+每条规则必须二选一：`builtin` 引用已知内置工具，或 `argv` 指定可信程序和固定参数数组。
+`arguments` 为 `"any"` 或 `{"exact": [["--version"]]}`；exact 匹配完整参数，不是前缀或 Shell 表达式。
+自定义 `argv` 首项必须是工作区外、现存、非链接的可执行程序绝对路径；Windows 首项必须是 `.exe`。
+pnpm 等脚本包装器须配置可信 Node 的绝对路径，以及 CLI 脚本的固定参数，不能隐式执行 `.cmd/.ps1`。
+别名添加到普通名单不会替换固定模板 Agent 的启动程序；任何自定义开发程序仍可能执行代码和访问宿主。
+状态不显示固定参数或精确参数内容；配置文件会明文保存这些值，不应放入凭据。
+非法配置失败关闭；缺少内置工具只标记为不可用。运行中的实例及它创建的外部目录服务共享策略快照。
+
 ### 重要：路径 jail 不等于 OS sandbox
 
 `run_command` 能启动 Python、Node、Git、GitHub CLI、Codex、ripgrep、uv 等开发工具。任意代码执行本身就可能读取
@@ -445,11 +502,11 @@ uv run python .\scripts\smoke_exec_stdio.py
 构成 Windows OS 沙箱。因此：
 
 - exec 默认关闭且 tool 不注册；
-- 开启后只允许启动时解析出的 allowlist 命令，禁止传入 executable path；
+- 开启后遵守所选命令策略；前三档使用启动时解析的名单，unrestricted 支持动态程序及绝对路径；
 - `command` 与 `args` 分离，始终 `shell=False`；
 - cwd 仍需通过 workspace jail；
-- `cmd`、PowerShell、`del`、`rm` 等 shell/直接删除入口不在 allowlist；删除应走
-  trash-aware 的 `delete` 工具；
+- minimal/balanced 默认不开放 Shell；elevated/unrestricted 显式允许 Shell，其系统访问由宿主账户决定；
+  需要回收站语义的删除应使用 trash-aware `delete` 工具；
 - Git 与 `gh` 在 Dev Profile 中可执行本地和远程开发工作流，并复用用户 Git config/GCM；
   只有会直接输出 keyring token 的 credential plumbing 命令被硬拒绝；
 - 子进程环境使用最小 allowlist，默认不继承 `CONTROL_PLANE_API_KEY` 或其他环境 secret；只有

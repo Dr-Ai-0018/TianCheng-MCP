@@ -3,7 +3,7 @@ param(
     [ValidateSet(
         'menu', 'start', 'start-new', 'doctor', 'profiles', 'configure-profile',
         'select-profile', 'edit-profile', 'key', 'key-status', 'status',
-        'set-mode', 'stop', 'restart', 'open-ui', 'settings', 'proxy', 'info', 'install-alias', 'policy', 'agents'
+        'set-mode', 'stop', 'restart', 'open-ui', 'settings', 'proxy', 'info', 'install-alias', 'policy', 'agents', 'commands'
     )]
     [string]$Action = 'menu',
     [string]$Profile,
@@ -1112,6 +1112,7 @@ function Show-Info {
         workspace = [string]$Config.workspace
         python = [string]$Config.python
         accessPolicyPath = [string]$Config.accessPolicyPath
+        commandPolicyPath = [string]$Config.commandPolicyPath
         agentSourcesPath = [string]$Config.agentSourcesPath
         agentCatalogPath = [string]$Config.agentCatalogPath
         mcpCommand = if ((Test-Path -LiteralPath ([string]$Config.powerShell) -PathType Leaf) -and
@@ -1370,6 +1371,106 @@ function Edit-ProxySettingsInteractive {
             default { Write-Host '无效选择。' -ForegroundColor Yellow }
         }
         if ($changed) { $script:ProxyProbeResult = $null }
+    }
+}
+
+function Invoke-CommandPolicyAdmin {
+    param([hashtable]$Config, [string[]]$Arguments, [string]$RuleInput)
+
+    $python = [string]$Config.python
+    Assert-FileExists -Path $python -Label 'Python environment'
+    $policyPath = if ($Config.ContainsKey('commandPolicyPath')) { [string]$Config.commandPolicyPath }
+        else { Join-Path $script:ProjectRoot 'config\command-policy.local.json' }
+    $base = @('-m', 'tiancheng_mcp.command_policy_admin', '--policy', $policyPath,
+        '--workspace', [string]$Config.workspace)
+    $raw = if ($PSBoundParameters.ContainsKey('RuleInput')) { $RuleInput | & $python @base @Arguments 2>$null }
+        else { & $python @base @Arguments 2>$null }
+    if ($LASTEXITCODE -ne 0) {
+        $failure = ($raw -join "`n") | ConvertFrom-Json -AsHashtable -ErrorAction SilentlyContinue
+        if ($failure -and $failure.ContainsKey('reason')) {
+            throw "命令策略校验失败：$($failure.reason)。非法配置未保存。"
+        }
+        throw '命令策略操作失败；请检查格式、可信程序路径及工作区外配置位置。'
+    }
+    return (($raw -join "`n") | ConvertFrom-Json -AsHashtable)
+}
+
+function Show-CommandPolicyState {
+    param([hashtable]$State)
+
+    Write-Host "命令策略：$($State.preset)（下次启动配置）" -ForegroundColor Cyan
+    Write-Host '仅管理普通命令；SAFE/DEV、固定模板 Agent、专用 Git 和路径授权独立。'
+    Write-Host '开发代码和 Shell 使用 MCP 宿主账户权限；elevated 不提权。修改后需重启 MCP。' -ForegroundColor Yellow
+    if ($State.mode -eq 'unrestricted') {
+        Write-Host '命令不设限：支持 PATH 程序名/绝对程序路径；下列只列配置规则。禁用按直接调用文件名生效。' -ForegroundColor Yellow
+    }
+    foreach ($entry in $State.commands) {
+        $source = if ($entry.source -eq 'local') { '本机添加' } else { '默认预设' }
+        $status = switch ($entry.status) { 'available' { '可用' }; 'disabled' { '已禁用' }; default { '未安装/不可用' } }
+        $arguments = if ($entry.arguments -eq 'exact') { '精确参数模板' } else { '任意开发参数' }
+        Write-Host "  $($entry.name): $status / $source / $arguments"
+    }
+    if ($State.disabled.Count) { Write-Host "  本机禁用：$($State.disabled -join ', ')" }
+}
+
+function Show-CommandPolicyMenu {
+    param([hashtable]$Config)
+
+    while ($true) {
+        try {
+            $state = Invoke-CommandPolicyAdmin -Config $Config -Arguments @('status')
+            Show-CommandPolicyState -State $state
+        } catch { Write-Host '当前策略无法读取；可选 8 恢复默认。' -ForegroundColor Yellow }
+        Write-Host '  1. 选择预设（minimal 最小可用 / balanced 均衡开发 / elevated 显式 Shell / unrestricted 命令不设限）'
+        Write-Host '  2. 添加/修改内置工具别名（任意参数）'
+        Write-Host '  3. 添加/修改自定义规则（单行 JSON，输入隐藏）'
+        Write-Host '  4. 禁用命令（禁用优先）'
+        Write-Host '  5. 撤销本机禁用'
+        Write-Host '  6. 移除本机添加（同名预设规则会恢复）'
+        Write-Host '  8. 恢复默认（清除本机添加和禁用）'
+        Write-Host '  0. 返回（每项合法修改即时保存）'
+        $choice = Read-Host '命令策略'
+        if ($choice -eq '0') { return }
+        try {
+            switch ($choice) {
+                '1' {
+                    Write-Host '切换预设会保留本机添加和禁用；要清空覆盖请先选 8 恢复默认。' -ForegroundColor Yellow
+                    $preset = Read-Host '预设：minimal / balanced / elevated / unrestricted'
+                    [void](Invoke-CommandPolicyAdmin -Config $Config -Arguments @('preset', $preset))
+                }
+                '2' {
+                    $name = Read-Host '命令别名（如 python 或 git-version）'
+                    $builtin = Read-Host '内置工具：python/pytest/py/uv/git/gh/node/rg/npm/npx/codex/pwsh/powershell/cmd/bash/sh'
+                    [void](Invoke-CommandPolicyAdmin -Config $Config -Arguments @('add-builtin', $name, $builtin))
+                }
+                '3' {
+                    $name = Read-Host '命令别名'
+                    Write-Host '规则字段：builtin 或 argv（二选一）；arguments 为 any 或 {"exact":[["--version"]]}。'
+                    Write-Host 'argv 首项须为工作区外可信程序绝对路径；固定参数不会显示在状态中。'
+                    $rule = Read-ProxyUrl -Prompt '单行规则 JSON'
+                    try { [void](Invoke-CommandPolicyAdmin -Config $Config -Arguments @('add-rule', $name) -RuleInput $rule) }
+                    finally { $rule = $null }
+                }
+                '4' {
+                    $name = Read-Host '禁用的命令别名'
+                    [void](Invoke-CommandPolicyAdmin -Config $Config -Arguments @('disable', $name))
+                }
+                '5' {
+                    $name = Read-Host '撤销禁用的命令别名'
+                    [void](Invoke-CommandPolicyAdmin -Config $Config -Arguments @('enable', $name))
+                }
+                '6' {
+                    $name = Read-Host '移除的本机命令别名'
+                    [void](Invoke-CommandPolicyAdmin -Config $Config -Arguments @('remove', $name))
+                }
+                '8' {
+                    if ((Read-Host '输入 RESET 恢复默认') -cne 'RESET') { continue }
+                    [void](Invoke-CommandPolicyAdmin -Config $Config -Arguments @('reset'))
+                }
+                default { Write-Host '无效选择。' -ForegroundColor Yellow; continue }
+            }
+            Write-Host '命令策略已保存；重启 MCP 后生效，SAFE/DEV 总开关不变。' -ForegroundColor Green
+        } catch { Write-Host $_.Exception.Message -ForegroundColor Yellow }
     }
 }
 
@@ -2155,6 +2256,7 @@ function Show-MainMenu {
         Write-Host '  B. 安装/修复 tc 快捷命令'
         Write-Host '  D. 外部路径白名单 / 访问策略'
         Write-Host '  E. 本地 Agent / 会话源管理'
+        Write-Host '  C. 命令白名单 / 开发权限预设'
         Write-Host '  0. 退出'
         try {
             switch (Read-Host '选择') {
@@ -2172,6 +2274,7 @@ function Show-MainMenu {
                 { $_ -match '^(?i)b$' } { Install-Alias; Pause-Tq }
                 { $_ -match '^(?i)d$' } { Show-AccessPolicyMenu }
                 { $_ -match '^(?i)e$' } { Show-AgentSourceMenu -Config $config }
+                { $_ -match '^(?i)c$' } { Show-CommandPolicyMenu -Config $config }
                 '0' { return }
                 default { Write-Host '无效选择。' -ForegroundColor Yellow; Pause-Tq }
             }
@@ -2214,6 +2317,10 @@ switch ($Action) {
     'open-ui' { Open-AdminUi -Config $config }
     'settings' { Edit-SettingsInteractive -Config $config }
     'proxy' { Edit-ProxySettingsInteractive }
+    'commands' {
+        if ($Json) { Invoke-CommandPolicyAdmin -Config $config -Arguments @('status') | ConvertTo-Json -Depth 8 }
+        else { Show-CommandPolicyMenu -Config $config }
+    }
     'info' { Show-Info -Config $config }
     'install-alias' { Install-Alias }
     'policy' { Show-AccessPolicy }

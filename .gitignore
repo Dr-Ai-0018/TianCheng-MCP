@@ -12,6 +12,7 @@ logs/*.jsonl
 /.env
 /exec-env.allowlist
 /config/launcher.local.json
+/config/command-policy.local.json
 /config/agent-profiles.json
 /config/access-policy.json
 /config/agent-sources.json

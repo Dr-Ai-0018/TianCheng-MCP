@@ -26,6 +26,8 @@ from urllib.parse import urlsplit, urlunsplit
 
 from . import __version__
 from .proxy import add_agent_proxy
+from .command_policy import CommandPolicy
+from .command_discovery import discover_exec_commands
 from .agent_catalog import AgentCatalog
 from .agent_diagnostics import launch_metadata
 from .agent_preflight import inspect_windows_codex_home
@@ -119,20 +121,6 @@ _PROTECTED_ENVIRONMENT_NAMES = frozenset(
         "OPENAI_SECRET_KEY",
     }
 )
-def _desktop_codex_roots() -> tuple[Path, ...]:
-    """Install roots of the Codex Desktop app's private, versioned builds."""
-    roots: list[Path] = []
-    for name in ("LOCALAPPDATA", "APPDATA", "PROGRAMFILES", "PROGRAMFILES(X86)"):
-        base = os.environ.get(name)
-        if not base:
-            continue
-        try:
-            roots.append((Path(base) / "OpenAI" / "Codex").resolve())
-        except OSError:
-            continue
-    return tuple(roots)
-
-
 _EXEC_ENVIRONMENT_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _AGENT_ENVIRONMENT_OVERRIDE_NAMES = frozenset({"AWZ_ROUTE"})
 _T = TypeVar("_T")
@@ -497,6 +485,8 @@ class TianChengService:
         pi_cli_entry: str | Path | None = None,
         agent_proxy_environment: Mapping[str, str] | None = None,
         agent_proxy_mode: str | None = None,
+        command_policy_path: str | Path | None = None,
+        command_policy: CommandPolicy | None = None,
     ) -> None:
         self.jail = WorkspaceJail(workspace, create=True)
         self.access_policy_path = Path(access_policy_path) if access_policy_path else (
@@ -520,6 +510,11 @@ class TianChengService:
             self.audit = AuditLogger(audit_path)
             self.audit_directory = audit_path
         self.allow_exec = allow_exec
+        self.command_policy = command_policy or CommandPolicy.load(
+            Path(command_policy_path) if command_policy_path else
+            Path(__file__).resolve().parents[2] / "config/command-policy.local.json",
+            self.jail.root,
+        )
         self.allow_policy_hot_reload = bool(allow_policy_hot_reload)
         self._policy_changes: dict[str, dict[str, Any]] = {}
         self._policy_change_lock = threading.Lock()
@@ -555,6 +550,8 @@ class TianChengService:
                 raise WorkspaceSecurityError("Refusing ripgrep executable from inside workspace")
         self._pi_cli_entry = pi_cli_entry
         self._exec_commands = self._discover_exec_commands() if allow_exec else {}
+        # Keep fixed-template Agent discovery independent of ordinary commands.
+        self._ordinary_exec_commands = self.command_policy.resolve(self._exec_commands, self.jail.root) if allow_exec else {}
         self._agent_only_commands = (
             self._discover_agent_only_commands() if allow_exec else {}
         )
@@ -955,11 +952,12 @@ class TianChengService:
             "command_execution_policy": (
                 "guarded-development" if self.allow_exec else "disabled"
             ),
+            "command_policy": self.command_policy.summary(self._ordinary_exec_commands, enabled=self.allow_exec),
             "explicit_env_passthrough_enabled": bool(self.passthrough_env),
             "agent_proxy_mode": self.agent_proxy_mode,
             "agent_proxy_configured": bool(self._agent_proxy_environment),
             "available_exec_commands": (
-                sorted(self._exec_commands) if self.allow_exec else []
+                sorted(self._ordinary_exec_commands) if self.allow_exec else []
             ),
             "available_agent_profiles": list(self.agent_profiles.names()),
             "agent_profile_metadata": list(self.agent_profiles.profile_summaries()),
@@ -1390,6 +1388,7 @@ class TianChengService:
             context.root, None, allow_exec=allow_exec,
             passthrough_env=self.passthrough_env, enable_jobs=False,
             enable_agent_catalog=False, access_policy=AccessPolicy.default(context.root),
+            command_policy=self.command_policy,
         )
         scoped.jail = ContextJail(context)
         return scoped
@@ -3130,52 +3129,7 @@ class TianChengService:
         return response
 
     def _discover_exec_commands(self) -> dict[str, list[str]]:
-        discovered: dict[str, list[str]] = {
-            "python": [sys.executable],
-            "pytest": [sys.executable, "-m", "pytest"],
-        }
-        for name in ("py", "uv", "git", "gh", "node", "rg"):
-            executable = shutil.which(name)
-            if executable:
-                discovered[name] = [str(Path(executable).resolve())]
-        node = discovered.get("node")
-        if node:
-            for name, script_name in (("npm", "npm-cli.js"), ("npx", "npx-cli.js")):
-                command_file = shutil.which(name)
-                if not command_file:
-                    continue
-                candidate = Path(command_file).resolve().parent / "node_modules/npm/bin" / script_name
-                if candidate.is_file():
-                    discovered[name] = [*node, str(candidate)]
-        # Require the npm-managed launcher.  It supplies
-        # CODEX_MANAGED_PACKAGE_ROOT so the native runtime resolves its own
-        # codex-resources (sandbox setup helper and command runner). Keep this
-        # service's launcher selection stable when Desktop updates change PATH.
-        # Different build numbers alone do not establish marker incompatibility
-        # or prevent CLI/Desktop coexistence; setup also depends on home state.
-        codex_executable = shutil.which("codex") or shutil.which("codex.exe")
-        if codex_executable:
-            codex_path = Path(codex_executable).resolve()
-            from_desktop = any(
-                codex_path.is_relative_to(root) for root in _desktop_codex_roots()
-            )
-            if from_desktop:
-                pass  # Never mix a Desktop build with the npm-managed release.
-            elif codex_path.suffix.casefold() in {".cmd", ".ps1"}:
-                codex_script = codex_path.parent / "node_modules/@openai/codex/bin/codex.js"
-                node = discovered.get("node")
-                if node and codex_script.is_file():
-                    discovered["codex"] = [*node, str(codex_script)]
-            elif os.name != "nt":
-                discovered["codex"] = [str(codex_path)]
-        for command in discovered.values():
-            executable = Path(command[0]).resolve()
-            try:
-                executable.relative_to(self.jail.root)
-            except ValueError:
-                continue
-            raise WorkspaceSecurityError("Refusing an allowlisted executable from inside the workspace")
-        return discovered
+        return discover_exec_commands(self.jail.root)
 
     def _discover_agent_only_commands(self) -> dict[str, list[str]]:
         discovered: dict[str, list[str]] = {}
@@ -3241,7 +3195,8 @@ class TianChengService:
     ) -> dict[str, str]:
         system_root = os.environ.get("SystemRoot", r"C:\Windows")
         executable_directories = {
-            str(Path(command[0]).resolve().parent) for command in self._exec_commands.values()
+            str(Path(command[0]).resolve().parent)
+            for command in {**self._exec_commands, **self._ordinary_exec_commands}.values()
         }
         temporary = self.jail.root / ".tiancheng-tmp"
         temporary.mkdir(parents=True, exist_ok=True)
@@ -3304,13 +3259,21 @@ class TianChengService:
         return environment
 
     def _prepare_exec_command(self, key: str, arguments: list[str]) -> list[str]:
-        prefix = self._exec_commands[key]
-        lowered = [value.casefold() for value in arguments]
-        if key == "git" and any(value in _SENSITIVE_GIT_COMMANDS for value in lowered):
+        self.command_policy.check(key, arguments)
+        prefix = self.command_policy.command_prefix(key, self._ordinary_exec_commands)
+        rule = self.command_policy.rules.get(key)
+        identity = rule.builtin if rule else Path(prefix[0]).name.casefold().removesuffix(".exe")
+        # Aliases/custom prefixes must not bypass credential-output guards.
+        for builtin in ("git", "gh"):
+            original = self._exec_commands.get(builtin)
+            if original and Path(original[0]).resolve() == Path(prefix[0]).resolve():
+                identity = builtin
+        lowered = [value.casefold() for value in [*prefix[1:], *arguments]]
+        if identity == "git" and any(value in _SENSITIVE_GIT_COMMANDS for value in lowered):
             raise PermissionError(
                 "Credential plumbing commands are blocked because they can print keyring secrets"
             )
-        if key == "gh" and lowered[:2] == ["auth", "token"]:
+        if identity == "gh" and lowered[:2] == ["auth", "token"]:
             raise PermissionError("gh auth token is blocked because it prints a secret")
         return [*prefix, *arguments]
 
@@ -3321,12 +3284,10 @@ class TianChengService:
             raise PermissionError("Command execution is disabled; restart with --allow-exec")
         if not isinstance(command, str):
             raise TypeError("command must be text")
-        key = command.casefold()
-        if key.endswith(".exe"):
-            key = key[:-4]
-        if key not in self._exec_commands or any(token in command for token in ("/", "\\", ":")):
+        key = self.command_policy.request_key(command)
+        if not self.command_policy.unrestricted and key not in self._ordinary_exec_commands:
             raise PermissionError(
-                "Command is not allowlisted; use one of: " + ", ".join(sorted(self._exec_commands))
+                "Command is not allowlisted; use one of: " + ", ".join(sorted(self._ordinary_exec_commands))
             )
         arguments = args or []
         if not isinstance(arguments, list) or len(arguments) > 256:
@@ -3559,9 +3520,10 @@ class TianChengService:
     ) -> dict[str, Any]:
         if not self.allow_exec:
             raise PermissionError("Command execution is disabled; restart with --allow-exec")
-        registered_prefix = self._agent_only_commands.get(
-            command_key
-        ) or self._exec_commands.get(command_key)
+        registered_prefix = (
+            self._agent_only_commands.get(command_key) or self._exec_commands.get(command_key)
+            if owner == "agent_run" else self.command_policy.command_prefix(command_key, self._ordinary_exec_commands)
+        )
         if not registered_prefix:
             raise PermissionError("Prepared command is not registered by this server")
         if (
@@ -3579,6 +3541,10 @@ class TianChengService:
             raise PermissionError("Prepared command does not match its registered executable")
         if not isinstance(working_directory, Path):
             raise TypeError("working_directory must be a Path")
+        if owner != "agent_run":
+            checked = self._prepare_exec_command(command_key, prepared[len(registered_prefix):])
+            if checked != prepared:
+                raise PermissionError("Prepared command no longer matches its registered executable")
         # Defence in depth: re-resolve the directory through a jail before
         # spawning, so a caller cannot hand over a path that passed an earlier
         # check but no longer resolves safely.  A whitelisted agent cwd is
