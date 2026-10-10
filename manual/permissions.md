@@ -112,8 +112,8 @@ pnpm 等脚本包装器须配置可信 Node 的绝对路径，以及 CLI 脚本�
   需要回收站语义的删除应使用 trash-aware `delete` 工具；
 - Git 与 `gh` 在 Dev Profile 中可执行本地和远程开发工作流，并复用用户 Git config/GCM；
   只有会直接输出 keyring token 的 credential plumbing 命令被硬拒绝；
-- 子进程环境使用最小 allowlist，默认不继承 `CONTROL_PLANE_API_KEY` 或其他环境 secret；只有
-  启动时显式配置的 `--pass-env NAME` 才会透传对应变量；
+- 普通命令默认使用 basic 基础环境，不继承任意业务 secret；可显式允许或禁止变量名称。
+  本机可选择 inherit 兼容透传业务环境，但固定控制面密钥仍被过滤；Agent、专用 Git 和搜索独立。详见 [执行环境](configuration.md#执行环境默认基础环境按需开放)；
 - Python、uv、pip、npm 缓存和临时目录重定向到 workspace 内的 `.tiancheng-tmp`；
 - 默认 timeout 60 秒，最大 300 秒；stdout/stderr 分别有内存与返回上限；
 - Windows 使用 kill-on-close Job Object；超时会终止整个子进程树，正常退出也不允许遗留

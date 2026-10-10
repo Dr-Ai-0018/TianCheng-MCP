@@ -1,6 +1,6 @@
 # Menu copy is shared by the interactive selector and context help.
 function Get-TuiMenuItems {
-    param([ValidateSet('main','proxy','profile','key','commands','policy','agents')][string]$Page)
+    param([ValidateSet('main','proxy','profile','key','commands','policy','agents','environment')][string]$Page)
     switch ($Page) {
     'main' {
         $rows = @(
@@ -15,6 +15,7 @@ function Get-TuiMenuItems {
             @('7','配置与权限','Tunnel Key','保存或删除本机 Tunnel 运行 Key；不在网站生成新 Key。'),
             @('P','配置与权限','出站代理','修改出站代理；可手动联网检测出口 IP，输入凭据隐藏。'),
             @('C','配置与权限','命令规则与预设','选择预设、添加或禁用命令；保存后重启，不自动开启 DEV。'),
+            @('N','配置与权限','执行环境','选择最小、基础或兼容透传；管理额外变量名称，保存后重启。'),
             @('D','配置与权限','外部路径权限','配置外部目录的浏览、读取、写入和执行权限。'),
             @('E','工具与维护','Agent 与历史来源','管理历史 metadata 来源；真实 smoke 需要确认且消耗额度。'),
             @('A','工具与维护','启动设置','配置程序路径、健康地址、等待时间、自动恢复和连接 TTL。'),
@@ -66,6 +67,16 @@ function Get-TuiMenuItems {
             @('8','恢复','恢复默认策略','清除本机添加和禁用；需要 RESET 确认。')
         )
     }
+    'environment' {
+        $rows = @(
+            @('1','环境等级','选择环境等级','minimal 精简；basic 推荐；inherit 继承父环境，需本机明确确认。'),
+            @('2','额外变量','添加允许变量','只保存名称；已有父环境值优先，Windows 非 SAFE 可从 .env 补值。'),
+            @('3','额外变量','移除配置允许项','只删除本页配置；旧文件允许项保持不变，可用禁止项覆盖。'),
+            @('4','额外变量','禁止变量','禁止优先于允许和继承；系统强制变量不可禁止。'),
+            @('5','额外变量','撤销禁止','撤销本页禁止项，不自动允许基础名单以外的变量。'),
+            @('8','恢复','恢复基础默认','清空本页允许和禁止项，恢复 basic；旧白名单文件保留。')
+        )
+    }
     'policy' {
         $rows = @(
             @('1','路径规则','新增外部路径规则','添加宿主批准的路径规则；deny/browse/read/write/full 范围不同。'),
@@ -94,13 +105,14 @@ function Get-TuiMenuItems {
 
 function Get-TuiPageInfo {
     param([string]$Page)
-    $titles = @{ main='首页'; proxy='出站代理'; profile='Profile 与权限模式'; key='Tunnel Key'; commands='命令规则与预设'; policy='外部路径权限'; agents='Agent 与历史来源' }
+    $titles = @{ main='首页'; proxy='出站代理'; profile='Profile 与权限模式'; key='Tunnel Key'; commands='命令规则与预设'; policy='外部路径权限'; agents='Agent 与历史来源'; environment='执行环境' }
     $notes = @{
         main='退出控制台不停止其他窗口实例；H 查看完整说明。'
         proxy='本机配置 > 进程环境；更改后运行实例需重启。'
         profile='模式只写启动配置；SAFE 允许文件修改，切换后需重启。'
         key='优先级：当前进程 > 用户环境 > .env；保存后仍需验证权限。'
         commands='显示 next_start 配置；重启生效，不自动开启 DEV。'
+        environment='每次操作校验后保存；重启生效。清空额外名单不是零环境变量。'
         policy='外部文件工具还需 GRANTS；写权限不自动授予执行权限。'
         agents='来源只索引 metadata；Agent 运行另需 DEV、原生 CLI 和登录态。'
     }

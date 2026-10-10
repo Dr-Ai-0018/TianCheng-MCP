@@ -75,10 +75,41 @@ Agent 的 `proxy_enabled` 状态可在 session 返回值中查看，`workspace_i
 访问 `api.ipify.org`，显示代理出口 IP 或错误类别；不会在每次打开菜单时自动联网。
 在真实交互终端输入代理 URL 时，输入内容会隐藏。菜单保存的本地配置优先于进程环境变量，菜单会标明来源。已有配置不会因查看菜单而改写。
 
-## 显式透传一个业务环境变量
+## 执行环境：默认基础环境，按需开放
 
-DEV 子进程默认仍然拿不到任意业务 secret。如果确实需要让某个开发工具读取一个变量，
-只把变量名加入服务仓库内、MCP 工作区外的执行白名单文件（文件只存名称，不存值）：
+主菜单 **N. 执行环境**，或输入 `tc -Action environment`。它管理普通命令的运行环境，和 **C. 命令规则**、SAFE/DEV 开关、外部路径权限分别设置；选择任何环境等级都不会打开执行权限。
+
+| 等级 | 含义 | PATH |
+| --- | --- | --- |
+| `minimal` 最小环境 | 精简运行骨架、固定用户目录变量、额外允许项 | 注册工具目录与系统目录 |
+| `basic` 基础环境（默认） | minimal 加上 Windows 系统安装目录变量，适合日常使用 | 注册工具目录与系统目录 |
+| `inherit` 兼容透传 | 继承 MCP 启动进程的业务环境，过滤受保护密钥；选择时需输入 INHERIT 确认 | 注册工具目录优先，再合并父 PATH |
+
+**清空额外白名单不是零环境变量。** 三种模式都保留系统启动、临时目录、缓存、编码和 Git 非交互设置。Windows 基础环境额外保留存在的 `ProgramFiles`、`ProgramW6432`、`ProgramFiles(x86)` 和三种 `CommonProgramFiles` 目录变量，不硬编码安装磁盘。依赖系统安装位置的工具不必逐台补白名单。
+
+inherit 可能让普通命令读取云凭据、代理认证、SDK 加载选项等业务变量；固定密钥过滤无法识别所有秘密。它是环境兼容选项，不是操作系统沙箱。Agent 不跟随这个模式，仍按所选 profile 注入凭据、home 和可选代理；专用 Git 与搜索也不继承普通命令的完整业务环境。已声明 Agent 凭据不会仅因 inherit 自动进入普通命令；若显式把同名业务变量加入允许项，它仍可按既有白名单契约传递。
+
+页面每次操作校验后立即保存，支持添加/移除允许项、禁止/撤销禁止项和恢复基础默认。**禁止优先于允许**。恢复默认只清空本页配置，不删除旧 `exec-env.allowlist`；旧文件允许项可用禁止项覆盖。只保存变量名称，不保存值。
+
+配置在本机 `config/launcher.local.json` 的 `executionEnvironment` 中保存，例如：
+
+```json
+{
+  "executionEnvironment": {
+    "mode": "basic",
+    "allow": ["CUDA_PATH", "EXAMPLE_AGENT_KEY"],
+    "deny": ["UNWANTED_BUSINESS_KEY"]
+  }
+}
+```
+
+默认和本机配置按字段合并，本机 allow/deny 数组替换对应默认数组。CLI 的 `--exec-env-mode` 优先于配置模式；`--pass-env`、配置 allow 和旧文件名称合并去重，最终 deny 优先。每类名单最多 32 个不同名称；Windows 忽略大小写去重，Unix 保留大小写差异。
+
+新增允许项可以从当前父环境取值；Windows 非 SAFE 启动脚本还会从选定 `.env` 为缺失项补值，已有进程值（包括空值）优先。直接 Python CLI 不会自动执行这段 PowerShell 的 `.env` 加载。可选 `.env` 无法读取时，诊断显示未知，不把它当成未配置。
+
+### 显式透传一个业务变量
+
+默认 basic 下，DEV 子进程拿不到任意业务 secret。可以在 N 页面添加名称，也可继续使用服务仓库内、MCP 工作区外的旧白名单文件。已有文件不要用 Set-Content 覆盖；下面是新文件示例（只存名称，不存值）：
 
 ```powershell
 Set-Content -LiteralPath .\exec-env.allowlist `
@@ -94,10 +125,18 @@ Set-Content -LiteralPath .\exec-env.allowlist `
   --allow-exec --pass-env EXAMPLE_AGENT_KEY
 ```
 
-`--pass-env` 可以重复使用，但只接受合法环境变量名；`CONTROL_PLANE_API_KEY`、OpenAI
-控制面 key、PATH/SystemRoot/TEMP 等策略变量永远不能透传。值不会写入审计日志或 workspace，
+`--pass-env` 可以重复使用，但只接受合法环境变量名；`CONTROL_PLANE_API_KEY` 和受保护的 OpenAI
+key 永远不能透传。PATH/SystemRoot/TEMP、工具缓存、编码及 Git 非交互设置不能用允许/禁止项覆盖；inherit 可以按上述规则合并父 PATH。值不会写入审计日志或 workspace，
 但被透传的程序本身可以读取、打印或上传它，所以这仍属于 DEV 高风险能力。修改白名单后，
 必须重启 Tunnel/MCP；在 ChatGPT Plugins 中打开连接并选择 **Refresh**。
+
+### 检查保存与生效
+
+`tc -Action environment -Json` 返回安全摘要：等级、允许/禁止名称、旧文件来源、当前父环境缺失项和策略版本，不显示变量值。它表示 **next_start（下次启动配置）**；没有在线证据时运行值显示 unknown，不能据此判断服务已经采用新配置。
+
+MCP 的 `workspace_info.execution_environment` 表示 **active（实例加载策略）**，包含等级、策略版本和加载时间。对照两边的 `policy_revision` 可发现配置不一致；变量值不参与指纹，修改值仍需主动重启。已有子进程不会被保存操作改变。
+
+修改 Windows 用户/系统环境后，请先打开新的 PowerShell，再从新终端启动 tc 并重启 MCP/Tunnel。旧 tc 控制台新开的子窗口也可能继承旧环境；只重开运行子窗口不保证刷新持久变量。查看新实例摘要并实际执行一次需要的命令后，再判断修复是否生效。
 
 真实执行验收入口及模型调用边界见 [开发说明](development.md)。
 

@@ -9,5 +9,10 @@
     "https": "",
     "noProxy": "",
     "agent": "off"
+  },
+  "executionEnvironment": {
+    "mode": "basic",
+    "allow": [],
+    "deny": []
   }
 }

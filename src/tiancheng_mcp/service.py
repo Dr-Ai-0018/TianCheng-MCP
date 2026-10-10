@@ -25,6 +25,7 @@ from typing import Any, TypeVar
 from urllib.parse import urlsplit, urlunsplit
 
 from . import __version__
+from .execution_environment import base_environment, EnvironmentPolicy, validate_names
 from .proxy import add_agent_proxy
 from .command_policy import CommandPolicy, execution_denied
 from .command_discovery import discover_exec_commands
@@ -102,26 +103,6 @@ _GIT_TOKEN_RE = re.compile(
     r"glpat-[A-Za-z0-9_-]+|xox[baprs]-[A-Za-z0-9-]+|sk-[A-Za-z0-9_-]+)\b"
 )
 _GIT_URL_CREDENTIAL_RE = re.compile(r"(?i)(\b(?:https?|ssh|git)://)[^\s/@:]+:[^\s/@]+@")
-_SAFE_USER_ENVIRONMENT_NAMES = (
-    "APPDATA",
-    "HOME",
-    "HOMEDRIVE",
-    "HOMEPATH",
-    "LOCALAPPDATA",
-    "PROGRAMDATA",
-    "SSH_AUTH_SOCK",
-    "USERPROFILE",
-    "CODEX_HOME",
-)
-_PROTECTED_ENVIRONMENT_NAMES = frozenset(
-    {
-        "CONTROL_PLANE_API_KEY",
-        "OPENAI_API_KEY",
-        "OPENAI_ADMIN_KEY",
-        "OPENAI_SECRET_KEY",
-    }
-)
-_EXEC_ENVIRONMENT_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _AGENT_ENVIRONMENT_OVERRIDE_NAMES = frozenset({"AWZ_ROUTE"})
 _T = TypeVar("_T")
 
@@ -470,6 +451,7 @@ class TianChengService:
         *,
         allow_exec: bool = False,
         passthrough_env: Sequence[str] = (),
+        execution_environment: Mapping[str, object] | None = None,
         allow_external_grants: bool = False,
         interactive_timeout_seconds: int = DEFAULT_INTERACTIVE_TIMEOUT_SECONDS,
         enable_jobs: bool = True,
@@ -530,6 +512,10 @@ class TianChengService:
             access_policy=self.access_policy,
         )
         self.passthrough_env = self._validate_passthrough_env(passthrough_env)
+        policy_document = EnvironmentPolicy.parse(dict(execution_environment or {})).document()
+        policy_document["allow"] = list(validate_names([*policy_document["allow"], *self.passthrough_env]))
+        self.execution_environment = EnvironmentPolicy.parse(policy_document)
+        self._environment_loaded_at = datetime.now(UTC).isoformat()
         self._agent_proxy_environment = dict(agent_proxy_environment or {})
         self.agent_proxy_mode = (
             agent_proxy_mode
@@ -582,6 +568,14 @@ class TianChengService:
             credential_env = self.agent_profiles.get(profile_name).credential_env
             if credential_env is not None:
                 self._validate_passthrough_env((credential_env,))
+        self._environment_credential_names = tuple(sorted({
+            *[self.agent_profiles.get(name).credential_env for name in self.agent_profiles.names()
+              if self.agent_profiles.get(name).credential_env is not None],
+            *[definition["credential_env"] for definition in (profile_definitions or ())
+              if definition.get("credential_env") is not None],
+        }))
+        for name in self._environment_credential_names:
+            self._validate_passthrough_env((name,))
         self._agent_credentials = self._load_agent_credentials(agent_env_file)
         self.agent_source_policy_path = (
             Path(agent_source_policy_path)
@@ -718,30 +712,7 @@ class TianChengService:
 
     @staticmethod
     def _validate_passthrough_env(names: Sequence[str]) -> tuple[str, ...]:
-        if isinstance(names, (str, bytes)):
-            raise ValueError("passthrough_env must be a sequence of variable names")
-        normalized: list[str] = []
-        for name in names:
-            if not isinstance(name, str) or not _EXEC_ENVIRONMENT_NAME.fullmatch(name):
-                raise ValueError(f"Invalid passthrough environment variable name: {name!r}")
-            upper = name.upper()
-            if upper in _PROTECTED_ENVIRONMENT_NAMES:
-                raise PermissionError(f"Environment variable {upper} is never passed to child processes")
-            if upper in {
-                "PATH",
-                "PATHEXT",
-                "COMSPEC",
-                "SYSTEMROOT",
-                "WINDIR",
-                "TEMP",
-                "TMP",
-            }:
-                raise PermissionError(f"Environment variable {upper} cannot override execution policy")
-            if name not in normalized:
-                normalized.append(name)
-        if len(normalized) > 32:
-            raise ValueError("At most 32 passthrough environment variables may be configured")
-        return tuple(normalized)
+        return validate_names(names)
 
     def audited(
         self,
@@ -953,7 +924,12 @@ class TianChengService:
                 "guarded-development" if self.allow_exec else "disabled"
             ),
             "command_policy": self.command_policy.summary(self._ordinary_exec_commands, enabled=self.allow_exec),
-            "explicit_env_passthrough_enabled": bool(self.passthrough_env),
+            "explicit_env_passthrough_enabled": bool(self.execution_environment.allow),
+            "execution_environment": {
+                **self.execution_environment.summary(credential_names=self._environment_credential_names),
+                "configuration_role": "active",
+                "loaded_at": self._environment_loaded_at,
+            },
             "agent_proxy_mode": self.agent_proxy_mode,
             "agent_proxy_configured": bool(self._agent_proxy_environment),
             "available_exec_commands": (
@@ -1386,10 +1362,12 @@ class TianChengService:
     def _scoped_service(self, context: AccessContext, *, allow_exec: bool = False) -> TianChengService:
         scoped = TianChengService(
             context.root, None, allow_exec=allow_exec,
-            passthrough_env=self.passthrough_env, enable_jobs=False,
+            passthrough_env=self.passthrough_env,
+            execution_environment=self.execution_environment.document(), enable_jobs=False,
             enable_agent_catalog=False, access_policy=AccessPolicy.default(context.root),
             command_policy=self.command_policy,
         )
+        scoped._environment_credential_names = self._environment_credential_names
         scoped.jail = ContextJail(context)
         return scoped
 
@@ -2643,10 +2621,7 @@ class TianChengService:
             "PAGER": "cat",
             "LC_ALL": "C.UTF-8",
         }
-        for name in _SAFE_USER_ENVIRONMENT_NAMES:
-            value = os.environ.get(name)
-            if value:
-                environment[name] = value
+        environment.update(base_environment())
         return environment
 
     def _find_repo(self, repo: str) -> tuple[Path, Path]:
@@ -3219,15 +3194,9 @@ class TianChengService:
             "GIT_TERMINAL_PROMPT": "0",
             "GCM_INTERACTIVE": "Never",
         }
-        for name in _SAFE_USER_ENVIRONMENT_NAMES:
-            value = os.environ.get(name)
-            if value:
-                environment[name] = value
-        if include_passthrough_env:
-            for name in self.passthrough_env:
-                value = os.environ.get(name)
-                if value is not None:
-                    environment[name] = value
+        profile_keys = self._environment_credential_names
+        policy = self.execution_environment if include_passthrough_env else EnvironmentPolicy()
+        environment = policy.build(environment, credential_names=profile_keys)
         if profile_credential_env is not None:
             # A process-level value wins over the optional dotenv fallback.
             # Crucially, only the credential bound to the selected profile is

@@ -28,7 +28,7 @@ def run_script(tmp_path: Path, body: str):
     return json.loads(result.stdout)
 
 
-@pytest.mark.parametrize("page", ["main", "proxy", "profile", "key", "commands", "policy", "agents"])
+@pytest.mark.parametrize("page", ["main", "proxy", "profile", "key", "commands", "policy", "agents", "environment"])
 @pytest.mark.parametrize("size", [(100, 30), (140, 40), (80, 24), (60, 20)])
 def test_frame_scrolls_and_keeps_help_inside_window(tmp_path: Path, page: str, size):
     width, height = size
@@ -58,7 +58,7 @@ def test_keyboard_mapping_and_text_fallback(tmp_path: Path):
 $items=@(Get-TuiMenuItems main)
 $results=@(
     (Resolve-TuiKey UpArrow '' 0 $items),
-    (Resolve-TuiKey DownArrow '' 14 $items),
+    (Resolve-TuiKey DownArrow '' ($items.Count-1) $items),
     (Resolve-TuiKey End '' 0 $items),
     (Resolve-TuiKey Home '' 14 $items),
     (Resolve-TuiKey Enter '' 9 $items),
@@ -73,7 +73,7 @@ $results=@(
 """)
     assert result["rich"] is False
     keys = result["keys"]
-    assert [entry["Index"] for entry in keys[:4]] == [14, 0, 14, 0]
+    assert [entry["Index"] for entry in keys[:4]] == [15, 0, 15, 0]
     assert [entry["Action"] for entry in keys[4:]] == ["P", "0", "P", "H", "R", "", "V"]
 
 

@@ -8,6 +8,26 @@
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-10-09
+
+### Added
+
+- 普通命令支持 minimal / basic / inherit 三级执行环境，默认 basic；N 菜单管理等级与额外允许/禁止名称，每次校验后保存，重启生效。inherit 需要本机明确选择，会继承其他业务凭据；固定过滤无法识别所有秘密。
+- 新增本机环境解释 CLI 与 workspace_info.execution_environment 实例摘要：只显示变量名称、模式、策略版本和加载时间，不输出值；next_start 与 active 分开，离线运行值明确未知。
+- launcher executionEnvironment 配置、--exec-env-mode / --deny-env 参数；旧 exec-env.allowlist 和 --pass-env 保留，禁止优先。
+
+### Fixed
+
+- Windows 基础环境补齐存在的 ProgramFiles / ProgramW6432 / x86 与 CommonProgramFiles 安装目录，修复部分正常工具的初始化兼容问题。
+- Windows 变量名忽略大小写去重，支持系统目录名称中的括号；防止额外变量覆盖工具缓存、编码和 Git 非交互约束。
+- 普通、受管后台和外部目录执行使用同一策略；Agent 保持独立凭据/home/代理契约，专用 Git 与搜索不继承普通命令的完整业务环境。
+
+### Migration
+
+- 未配置等级时从旧精简环境改为 basic；minimal 可恢复旧精简语义。系统安装目录是新增默认继承项，不会自动继承任意 SDK 或业务变量。
+- 以前在额外名单中覆盖缓存、编码、Git 非交互设置的配置现在会拒绝启动；移除这些执行器拥有的名称。已有本机配置与旧白名单不自动改写。
+- 环境过滤不是操作系统隔离；inherit 合并父 PATH，父程序的后代程序不受入口白名单逐一限制。修改持久环境后从新 PowerShell 启动并重启实例。
+
 ## [0.16.0] - 2026-10-09
 
 ### Added

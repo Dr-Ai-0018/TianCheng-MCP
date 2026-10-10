@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 from collections.abc import Mapping
+from .execution_environment import EnvironmentPolicy
 
 PROJECT_RELATIVE_KEYS = {
     "python", "mcpScript", "mcpExecScript", "mcpGrantsScript", "workspace",
@@ -30,6 +31,14 @@ def launcher_config(project_root: Path, local_path: Path | None = None,
             value = json.loads(path.read_text(encoding="utf-8-sig"))
             if not isinstance(value, dict):
                 raise ValueError(f"Launcher config must be an object: {path}")
+            if "executionEnvironment" in value:
+                environment_policy = value["executionEnvironment"]
+                if not isinstance(environment_policy, dict):
+                    raise ValueError("executionEnvironment must be an object")
+                EnvironmentPolicy.parse(environment_policy)
+                value["executionEnvironment"] = {
+                    **merged.get("executionEnvironment", {}), **environment_policy,
+                }
             merged.update(value)
     source = os.environ if environment is None else environment
     if source.get("TIANCHENG_WORKSPACE"):
@@ -46,6 +55,7 @@ def launcher_config(project_root: Path, local_path: Path | None = None,
     if isinstance(timeout, bool) or not isinstance(timeout, int) or not 1 <= timeout <= 90:
         raise ValueError("interactiveTimeoutSeconds must be an integer from 1 to 90")
     merged["interactiveTimeoutSeconds"] = timeout
+    merged["executionEnvironment"] = EnvironmentPolicy.parse(merged.get("executionEnvironment")).document()
     return merged
 
 
@@ -56,4 +66,10 @@ def runtime_arguments(config: Mapping[str, object], local_path: Path) -> list[st
         if value:
             arguments.extend((option, str(value)))
     arguments.extend(("--interactive-timeout-seconds", str(config["interactiveTimeoutSeconds"])))
+    policy = EnvironmentPolicy.parse(config.get("executionEnvironment"))
+    arguments.extend(("--exec-env-mode", policy.mode))
+    for name in policy.allow:
+        arguments.extend(("--pass-env", name))
+    for name in policy.deny:
+        arguments.extend(("--deny-env", name))
     return arguments

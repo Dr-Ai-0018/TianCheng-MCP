@@ -3,7 +3,7 @@ param(
     [ValidateSet(
         'menu', 'start', 'start-new', 'doctor', 'profiles', 'configure-profile',
         'select-profile', 'edit-profile', 'key', 'key-status', 'status',
-        'set-mode', 'stop', 'restart', 'open-ui', 'settings', 'proxy', 'info', 'install-alias', 'policy', 'agents', 'commands'
+        'set-mode', 'stop', 'restart', 'open-ui', 'settings', 'proxy', 'info', 'install-alias', 'policy', 'agents', 'commands', 'environment'
     )]
     [string]$Action = 'menu',
     [string]$Profile,
@@ -26,6 +26,7 @@ $ErrorActionPreference = 'Stop'
 $script:ProjectRoot = $PSScriptRoot
 . (Join-Path $script:ProjectRoot 'scripts\menu-help.ps1')
 . (Join-Path $script:ProjectRoot 'scripts\tui\console.ps1')
+. (Join-Path $script:ProjectRoot 'scripts\tui\environment.ps1')
 $script:WorkspaceCache = ''
 $script:ProxyProbeResult = $null
 $script:DefaultsPath = Join-Path $PSScriptRoot 'config\launcher.defaults.json'
@@ -2297,6 +2298,7 @@ function Show-MainMenu {
                 { $_ -match '^(?i)d$' } { Show-AccessPolicyMenu }
                 { $_ -match '^(?i)e$' } { Show-AgentSourceMenu -Config $config }
                 { $_ -match '^(?i)c$' } { Show-CommandPolicyMenu -Config $config }
+                { $_ -match '^(?i)n$' } { Show-EnvironmentMenu -Config $config }
                 'r' { continue }
                 'h' { Show-MenuHelp -Section 'main' }
                 '0' { return }
@@ -2346,6 +2348,10 @@ switch ($Action) {
     'commands' {
         if ($Json) { Invoke-CommandPolicyAdmin -Config $config -Arguments @('status') | ConvertTo-Json -Depth 8 }
         else { Show-CommandPolicyMenu -Config $config }
+    }
+    'environment' {
+        if ($Json) { Invoke-EnvironmentAdmin -Config $config -Arguments @('status') | ConvertTo-Json -Depth 8 }
+        else { Show-EnvironmentMenu -Config $config }
     }
     'info' { Show-Info -Config $config }
     'install-alias' { Install-Alias }

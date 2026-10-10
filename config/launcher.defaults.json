@@ -16,6 +16,11 @@
   "agentProfilesPath": "config/agent-profiles.json",
   "auditDir": "logs",
   "envFile": ".env",
+  "executionEnvironment": {
+    "mode": "basic",
+    "allow": [],
+    "deny": []
+  },
   "proxy": {
     "http": "",
     "https": "",

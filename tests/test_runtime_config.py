@@ -18,6 +18,29 @@ from tiancheng_mcp.runtime_config import launcher_config
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def test_environment_fields_merge_and_cli_overrides_mode(tmp_path, monkeypatch):
+    (tmp_path / "config").mkdir()
+    (tmp_path / "config/launcher.defaults.json").write_text(json.dumps({
+        "executionEnvironment": {"mode": "basic", "allow": ["BASE_ENV"], "deny": ["DROP_ENV"]}}))
+    local = tmp_path / "local.json"
+    local.write_text(json.dumps({"executionEnvironment": {"mode": "inherit"}}))
+    config = launcher_config(tmp_path, local, {})
+    assert config["executionEnvironment"] == {"mode": "inherit", "allow": ["BASE_ENV"], "deny": ["DROP_ENV"]}
+    captured = {}
+    class FakeService:
+        def __init__(self, **kwargs): captured.update(kwargs)
+        def shutdown(self): pass
+    class FakeServer:
+        def run(self, **kwargs): pass
+    monkeypatch.setattr(cli, "TianChengService", FakeService)
+    monkeypatch.setattr(cli, "create_server", lambda service: FakeServer())
+    cli.main(["--runtime-config", str(local), "--runtime-project-root", str(tmp_path),
+              "--workspace", str(tmp_path / "workspace"), "--exec-env-mode", "minimal", "--pass-env", "EXTRA_ENV"])
+    assert captured["execution_environment"] == {"mode": "minimal", "deny": ["DROP_ENV"]}
+    assert captured["passthrough_env"] == ["BASE_ENV", "EXTRA_ENV"]
+    assert not captured["allow_exec"]
+
+
 def test_configuration_resolves_relative_paths_and_environment(tmp_path):
     (tmp_path / "config").mkdir()
     (tmp_path / "config/launcher.defaults.json").write_text(json.dumps({

@@ -32,6 +32,9 @@ if ($Mode -ne 'safe') {
 $resolved = & $bootstrap (Join-Path $PSScriptRoot 'resolve_launcher.py') @resolveArguments
 if ($LASTEXITCODE -ne 0) { throw 'Launcher configuration could not be resolved' }
 $config = ($resolved -join "`n") | ConvertFrom-Json -AsHashtable
+if ($Mode -ne 'safe') {
+    $PassEnv = @($PassEnv + @($config.executionEnvironment.allow) | Select-Object -Unique)
+}
 $python = if ($config.python) { [string]$config.python } else { $bootstrap }
 if (-not (Test-Path -LiteralPath $python -PathType Leaf)) { throw 'Configured Python is unavailable' }
 
@@ -45,7 +48,7 @@ if ($Mode -ne 'safe') {
     $envPath = [string]$config.envFile
     if ($envPath -and (Test-Path -LiteralPath $envPath -PathType Leaf) -and $PassEnv.Count -gt 0) {
         foreach ($line in Get-Content -LiteralPath $envPath -Encoding UTF8) {
-            if ($line -notmatch '^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\s*$') { continue }
+            if ($line -notmatch '^\s*([A-Za-z_][A-Za-z0-9_()]*)\s*=\s*(.*)\s*$') { continue }
             $name = $Matches[1]
             if ($PassEnv -notcontains $name) { continue }
             if ($null -ne [Environment]::GetEnvironmentVariable($name, 'Process')) { continue }

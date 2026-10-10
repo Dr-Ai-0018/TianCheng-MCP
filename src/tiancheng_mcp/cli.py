@@ -76,6 +76,10 @@ def build_parser() -> argparse.ArgumentParser:
             "repeatable, never accepts control-plane keys"
         ),
     )
+    parser.add_argument("--exec-env-mode", choices=("minimal", "basic", "inherit"), default="basic",
+                        help="Ordinary command environment; never changes SAFE/DEV or Agent credentials")
+    parser.add_argument("--deny-env", action="append", default=[], metavar="NAME",
+                        help="Exclude one ordinary child environment name; overrides --pass-env")
     parser.add_argument(
         "--allow-external-grants",
         action="store_true",
@@ -191,6 +195,7 @@ def main(argv: list[str] | None = None) -> None:
         allow_exec=args.allow_exec,
         command_policy_path=args.command_policy,
         passthrough_env=args.pass_env,
+        execution_environment={"mode": args.exec_env_mode, "deny": args.deny_env},
         allow_external_grants=args.allow_external_grants,
         interactive_timeout_seconds=args.interactive_timeout_seconds,
         access_policy_path=args.access_policy,
