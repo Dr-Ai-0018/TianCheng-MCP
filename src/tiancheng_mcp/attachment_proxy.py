@@ -27,6 +27,9 @@ class _BoundedReader:
     def read(self, size=-1): return self._take(self.stream.read, size)
     def readline(self, size=-1): return self._take(self.stream.readline, size)
     def close(self): self.stream.close()
+    def flush(self):
+        # HTTPResponse.close flushes its reader; this adapter buffers no writes.
+        pass
 
 
 class _PipeSocket:
@@ -88,14 +91,14 @@ class ClashResolver:
                     count = stream.write(payload)
                     if not count: raise ProxyTransportError('Clash controller request failed')
                     payload = payload[count:]
-                response = http.client.HTTPResponse(_PipeSocket(stream))
-                response.begin()
-                if response.status != 200 or response.getheader('Content-Encoding', 'identity') != 'identity':
-                    raise ProxyTransportError('Clash DNS query failed')
-                chunks = []
-                while chunk := response.read(4096):
-                    chunks.append(chunk)
-                result = json.loads(b''.join(chunks))
+                with http.client.HTTPResponse(_PipeSocket(stream)) as response:
+                    response.begin()
+                    if response.status != 200 or response.getheader('Content-Encoding', 'identity') != 'identity':
+                        raise ProxyTransportError('Clash DNS query failed')
+                    chunks = []
+                    while chunk := response.read(4096):
+                        chunks.append(chunk)
+                    result = json.loads(b''.join(chunks))
             if (not isinstance(result, dict) or result.get('Status') != 0 or result.get('TC') is True or
                     not isinstance(result.get('Answer'), list) or len(result['Answer']) > 64):
                 raise ValueError

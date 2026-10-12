@@ -196,3 +196,30 @@ def test_blocked_proxy_worker_is_killed_without_secret_env(monkeypatch, cancelle
     finally:
         if timer: timer.join()
     assert children and children[0].poll() is not None
+
+
+@pytest.mark.parametrize('status', [200, 401])
+def test_controller_http_response_is_closed_before_return(monkeypatch, status):
+    resolver, _ = pipe_response(monkeypatch, {'Status': 0, 'Answer': [
+        {'type': 1, 'data': '8.8.8.8'}]}, status)
+    responses = []
+    original = http.client.HTTPResponse
+    class TrackedResponse(original):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            responses.append(self)
+    monkeypatch.setattr(http.client, 'HTTPResponse', TrackedResponse)
+    try:
+        if status == 200:
+            assert resolver.addresses(HOSTS[0]) == ['8.8.8.8']
+        else:
+            with pytest.raises(proxy.ProxyTransportError):
+                resolver.addresses(HOSTS[0])
+        assert responses and responses[0].closed
+    finally:
+        # Explicit cleanup keeps a failing regression from leaking at test exit.
+        for response in responses:
+            if not response.closed:
+                if response.fp is not None:
+                    response.fp.flush = lambda: None
+                response.close()
