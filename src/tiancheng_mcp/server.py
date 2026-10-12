@@ -9,13 +9,15 @@ from pathlib import PureWindowsPath
 from typing import Any, Literal, TypeVar
 
 from mcp.server import MCPServer
-from mcp.server.mcpserver.exceptions import ToolError
-from mcp.types import ToolAnnotations
+from mcp.server.mcpserver.exceptions import ResourceError, ToolError
+from mcp.types import ToolAnnotations, CallToolResult, TextContent
+from pydantic import ValidationError
 
 from . import __version__
 from .agent_adapters import CodexOptionsInput
 from .jobs import JobCancelled
 from .service import TianChengService
+from .attachment_io import FileReference
 
 
 _T = TypeVar("_T")
@@ -137,13 +139,26 @@ def _instructions(service: TianChengService) -> str:
         "Delete moves items to .tiancheng-trash instead of permanently "
         "destroying them. Tools that run longer than the interactive budget "
         "automatically return a job_id; use job_status, job_result, and "
-        "job_cancel to continue or stop them."
+        "job_cancel to continue or stop them. Image jobs require media_result "
+        "to return pixels; job_result contains only their result handle."
     )
     return " ".join(paragraphs)
 
 
+class _MediaSafeServer(MCPServer):
+    async def call_tool(self, name, arguments, context=None):
+        try:
+            return await super().call_tool(name, arguments, context)
+        except ToolError as exc:
+            # SDK argument validation happens before our handler. Its default
+            # ValidationError text includes input values, including signed URLs.
+            if name == 'import_attachment' and isinstance(exc.__cause__, ValidationError):
+                raise ToolError('Invalid attachment arguments; check FileRef fields and idempotency_key') from None
+            raise
+
+
 def create_server(service: TianChengService) -> MCPServer:
-    mcp = MCPServer(
+    mcp = _MediaSafeServer(
         name="tiancheng-local-mcp",
         title="TianCheng Local MCP",
         description="Workspace-jailed local file and Git tools for the configured workspace",
@@ -193,11 +208,74 @@ def create_server(service: TianChengService) -> MCPServer:
     def call(tool: str, path: str | None, operation: Callable[[], _T]) -> _T:
         return call_label(tool, _audit_path(path), operation)
 
+    def native_media(payload: dict[str, Any]) -> CallToolResult:
+        if 'media_id' in payload:
+            return service.media.response(payload['media_id'])
+        if 'artifact_id' in payload:
+            return service.artifacts.response(payload['artifact_id'])
+        return CallToolResult(content=[TextContent(text='Media processing continues in a background job; use media_result.')],
+                              structured_content=payload)
+
+    def media_tool(*, feature: str, external: bool = False, **kwargs):
+        enabled = getattr(service.media_settings, feature) and (not external or service.external_grants.enabled)
+        return mcp.tool(**kwargs) if enabled else lambda fn: fn
+
+    @media_tool(feature='images', description="Read a static PNG/JPEG/WebP relative to the workspace as native image content. Preview scales to at most 1600 px; original preserves bytes up to 4 MiB; metadata returns no pixels. If a job_id is returned, use media_result, not job_result, to obtain pixels.", annotations=READ_ONLY)
+    def read_image(path: str, mode: Literal['preview', 'original', 'metadata'] = 'preview') -> CallToolResult:
+        try:
+            return native_media(call('read_image', path, lambda: service.read_image(path, mode)))
+        except expected_errors as exc:
+            raise ToolError(str(exc)) from exc
+
+    @mcp.tool(description="Retrieve a completed image or export job as native MCP content. Read authorization, source hash and 15-minute result expiry are checked again. Pending jobs return status only.", annotations=READ_ONLY)
+    def media_result(job_id: str) -> CallToolResult:
+        try:
+            return service.audited('media_result', None, lambda: service.media_result(job_id))
+        except expected_errors as exc:
+            raise ToolError(str(exc)) from exc
+
     def external_tool(**kwargs: Any) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
         """Only expose external-capability tools under the explicit feature flag."""
         if service.external_grants.enabled:
             return mcp.tool(**kwargs)
         return lambda function: function
+
+    @media_tool(feature='exports', description="Export original workspace file bytes through a temporary opaque resource link (up to 4 MiB, expires after 15 minutes). No conversion or extraction. Client download support is experimental; a prepared link does not prove a user download. Background jobs use media_result.", annotations=READ_ONLY)
+    def export_file(path: str) -> CallToolResult:
+        try:
+            return native_media(call('export_file', path, lambda: service.export_file(path)))
+        except expected_errors as exc:
+            raise ToolError(str(exc)) from exc
+
+    @media_tool(feature='exports', external=True, description="Export original external file bytes with current read authorization. Supply a policy-covered absolute path or a read grant_id. Temporary links recheck authorization and source hash on every read; client download support is experimental.", annotations=READ_ONLY)
+    def external_export_file(path: str, grant_id: str | None = None) -> CallToolResult:
+        try:
+            return native_media(call_label('external_export_file', '<external-media>',
+                lambda: service.export_file(path, external=True, grant_id=grant_id),
+                job_metadata={'grant_id': grant_id} if grant_id else None))
+        except expected_errors as exc:
+            raise ToolError(str(exc)) from exc
+
+    if service.media_settings.exports:
+        @mcp.resource('tiancheng-artifact://file/{artifact_id}', mime_type='application/octet-stream',
+                      description='Temporary original binary export; current read authority and source hash required.')
+        def exported_resource(artifact_id: str) -> bytes:
+            try:
+                return service.audited('read_exported_resource', '<artifact>',
+                    lambda: service.artifacts.read(artifact_id))
+            except expected_errors as exc:
+                raise ResourceError(str(exc)) from exc
+
+    @media_tool(feature='images', external=True, description="Read a static PNG/JPEG/WebP outside the workspace as native image content. Use an absolute path covered by external read policy, or a valid read grant_id. Relative paths with a grant are relative to its root. For background jobs retrieve pixels through media_result.", annotations=READ_ONLY)
+    def external_read_image(path: str, mode: Literal['preview', 'original', 'metadata'] = 'preview',
+                            grant_id: str | None = None) -> CallToolResult:
+        try:
+            result = call_label('external_read_image', '<external-media>',
+                                lambda: service.read_image(path, mode, external=True, grant_id=grant_id),
+                                job_metadata={'grant_id': grant_id} if grant_id else None)
+            return native_media(result)
+        except expected_errors as exc:
+            raise ToolError(str(exc)) from exc
 
     def external_call(
         tool: str,
@@ -231,6 +309,17 @@ def create_server(service: TianChengService) -> MCPServer:
             default=str,
         ).encode("utf-8")
         return hashlib.sha256(encoded).hexdigest()
+
+    if service.media_settings.attachment_mode != 'off':
+        @mcp.tool(description="Import a chat attachment FileRef into the workspace without overwriting. Experimental and locally enabled only. Downloads from locally allowed HTTPS hosts using the locally selected direct or Clash proxy mode, up to 32 MiB; never executes or extracts files. destination is relative with an existing parent, or omitted for a random root .bin file. Reuse the same idempotency_key for retries; background results use job_result.",
+                  annotations=OPEN_WORLD_WRITE, meta={'openai/fileParams': ['file']})
+        def import_attachment(file: FileReference, idempotency_key: str,
+                              destination: str | None = None) -> dict[str, Any]:
+            return call_label('import_attachment', _audit_path(destination),
+                lambda: service.import_attachment(file, destination),
+                idempotency_key=idempotency_key,
+                idempotency_fingerprint=side_effect_fingerprint('import_attachment',
+                    [file.get('file_id'), destination]))
 
     @mcp.tool(
         description=(

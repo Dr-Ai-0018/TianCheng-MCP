@@ -197,7 +197,7 @@ function Write-TuiFrame {
 }
 
 function Read-TuiChoice {
-    param([ValidateSet('main','proxy','profile','key','commands','policy','agents','environment')][string]$Page, [string[]]$Status)
+    param([ValidateSet('main','proxy','profile','key','commands','policy','agents','environment','media')][string]$Page, [string[]]$Status)
     $items=@(Get-TuiMenuItems $Page)
     $index = if ($script:TuiSelection.ContainsKey($Page)) { [int]$script:TuiSelection[$Page] } else { 0 }
     $state=$null

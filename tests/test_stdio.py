@@ -136,6 +136,8 @@ async def test_stdio_initialize_tools_list_and_file_smoke(
             "stat",
             "hash_file",
             "read_text",
+            "read_image",
+            "media_result",
             "read_text_chunk",
             "write_text",
             "edit_text",

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "tiancheng-local-mcp"
-version = "0.17.0"
+version = "0.18.0"
 description = "A workspace-jailed local MCP server for TianCheng on Windows and Linux"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -12,6 +12,7 @@ dependencies = [
   "mcp==2.1.0",
   "httpx2>=2.12,<3",
   "socksio==1.*",
+  "pillow>=12.3,<13",
 ]
 
 [project.optional-dependencies]
@@ -33,3 +34,20 @@ packages = ["src/tiancheng_mcp"]
 addopts = "-ra"
 testpaths = ["tests"]
 asyncio_mode = "auto"
+
+# Source archives must remain portable even outside a Git checkout.
+[tool.hatch.build.targets.sdist]
+exclude = [
+  "/.tmp*/**", "/.venv*/**", "/docs/**", "/state/**", "/audit/**",
+  "/logs/**", "/reference/**", "/.uv-cache/**", "/.pytest_cache/**",
+  "/.env", "/.agents/**", "/.codex/**", "/.aws/**",
+  "/config/*.local.json", "/config/agent-profiles.json",
+  "/config/access-policy.json", "/config/agent-sources.json", "/config/*.bak",
+  "/exec-env.allowlist", "/dist/**", "/build/**",
+]
+# Keep the documented credential template; no real .env enters the archive.
+include = [
+  "/src/**", "/scripts/**", "/tests/**", "/manual/**", "/config/*.example.json", "/config/*.defaults.json",
+  "/*.ps1", "/*.sh", "/*.md", "/pyproject.toml", "/uv.lock",
+  "/.env.example", "/exec-env.allowlist.example", "/.gitignore", "/.github/**",
+]

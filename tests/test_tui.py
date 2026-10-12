@@ -28,7 +28,7 @@ def run_script(tmp_path: Path, body: str):
     return json.loads(result.stdout)
 
 
-@pytest.mark.parametrize("page", ["main", "proxy", "profile", "key", "commands", "policy", "agents", "environment"])
+@pytest.mark.parametrize("page", ["main", "proxy", "profile", "key", "commands", "policy", "agents", "environment", "media"])
 @pytest.mark.parametrize("size", [(100, 30), (140, 40), (80, 24), (60, 20)])
 def test_frame_scrolls_and_keeps_help_inside_window(tmp_path: Path, page: str, size):
     width, height = size
@@ -69,11 +69,12 @@ $results=@(
     (Resolve-TuiKey Z 'z' 9 $items),
     (Resolve-TuiKey V 'v' 9 $items)
 )
-@{keys=$results; rich=(Test-TuiConsole)} | ConvertTo-Json -Depth 5
+@{keys=$results; rich=(Test-TuiConsole); item_count=$items.Count} | ConvertTo-Json -Depth 5
 """)
     assert result["rich"] is False
     keys = result["keys"]
-    assert [entry["Index"] for entry in keys[:4]] == [15, 0, 15, 0]
+    last = result['item_count'] - 1
+    assert [entry["Index"] for entry in keys[:4]] == [last, 0, last, 0]
     assert [entry["Action"] for entry in keys[4:]] == ["P", "0", "P", "H", "R", "", "V"]
 
 

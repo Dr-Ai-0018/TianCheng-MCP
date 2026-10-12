@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 from collections.abc import Mapping
 from .execution_environment import EnvironmentPolicy
+from .media_config import MediaSettings
 
 PROJECT_RELATIVE_KEYS = {
     "python", "mcpScript", "mcpExecScript", "mcpGrantsScript", "workspace",
@@ -39,6 +40,15 @@ def launcher_config(project_root: Path, local_path: Path | None = None,
                 value["executionEnvironment"] = {
                     **merged.get("executionEnvironment", {}), **environment_policy,
                 }
+            if 'media' in value:
+                media = value['media']
+                if not isinstance(media, dict):
+                    raise ValueError('media must be an object')
+                previous = merged.get('media', {})
+                combined = {**previous, **media}
+                if 'attachments' in media and isinstance(media['attachments'], dict):
+                    combined['attachments'] = {**previous.get('attachments', {}), **media['attachments']}
+                value['media'] = MediaSettings.parse(combined).document()
             merged.update(value)
     source = os.environ if environment is None else environment
     if source.get("TIANCHENG_WORKSPACE"):
@@ -56,11 +66,13 @@ def launcher_config(project_root: Path, local_path: Path | None = None,
         raise ValueError("interactiveTimeoutSeconds must be an integer from 1 to 90")
     merged["interactiveTimeoutSeconds"] = timeout
     merged["executionEnvironment"] = EnvironmentPolicy.parse(merged.get("executionEnvironment")).document()
+    merged['media'] = MediaSettings.parse(merged.get('media')).document()
     return merged
 
 
 def runtime_arguments(config: Mapping[str, object], local_path: Path) -> list[str]:
     arguments = ["--launcher-local-config", str(local_path)]
+    arguments.extend(('--media-config', json.dumps(MediaSettings.parse(config.get('media')).document())))
     for key, option in RUNTIME_OPTIONS.items():
         value = config.get(key)
         if value:

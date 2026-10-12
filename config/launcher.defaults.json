@@ -21,6 +21,11 @@
     "allow": [],
     "deny": []
   },
+  "media": {
+    "images": true,
+    "exports": false,
+    "attachments": {"mode": "off", "hosts": []}
+  },
   "proxy": {
     "http": "",
     "https": "",

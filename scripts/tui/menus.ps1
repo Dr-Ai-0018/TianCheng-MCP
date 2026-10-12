@@ -1,6 +1,6 @@
 # Menu copy is shared by the interactive selector and context help.
 function Get-TuiMenuItems {
-    param([ValidateSet('main','proxy','profile','key','commands','policy','agents','environment')][string]$Page)
+    param([ValidateSet('main','proxy','profile','key','commands','policy','agents','environment','media')][string]$Page)
     switch ($Page) {
     'main' {
         $rows = @(
@@ -16,10 +16,18 @@ function Get-TuiMenuItems {
             @('P','配置与权限','出站代理','修改出站代理；可手动联网检测出口 IP，输入凭据隐藏。'),
             @('C','配置与权限','命令规则与预设','选择预设、添加或禁用命令；保存后重启，不自动开启 DEV。'),
             @('N','配置与权限','执行环境','选择最小、基础或兼容透传；管理额外变量名称，保存后重启。'),
+            @('F','配置与权限','图片与文件交换','分别管理图片、实验导出和附件下载；本机保存，重启后生效。'),
             @('D','配置与权限','外部路径权限','配置外部目录的浏览、读取、写入和执行权限。'),
             @('E','工具与维护','Agent 与历史来源','管理历史 metadata 来源；真实 smoke 需要确认且消耗额度。'),
             @('A','工具与维护','启动设置','配置程序路径、健康地址、等待时间、自动恢复和连接 TTL。'),
             @('B','工具与维护','安装 / 修复 tc','把 tc 安装到用户 PowerShell 7 Profile；重开终端或加载后生效。')
+        )
+    }
+    'media' {
+        $rows = @(
+            @('1','能力开关','图片读取','开关工作区及已授权外部图片工具，不开启命令执行。'),
+            @('2','能力开关','原文件导出 · 实验','默认关闭；临时资源链接，下载支持需要客户端验收。'),
+            @('3','附件来源','附件下载 · 实验','默认 off；可选直连或 Windows Clash Verge 专用代理，均需精确允许主机。')
         )
     }
     'proxy' {
@@ -105,7 +113,7 @@ function Get-TuiMenuItems {
 
 function Get-TuiPageInfo {
     param([string]$Page)
-    $titles = @{ main='首页'; proxy='出站代理'; profile='Profile 与权限模式'; key='Tunnel Key'; commands='命令规则与预设'; policy='外部路径权限'; agents='Agent 与历史来源'; environment='执行环境' }
+    $titles = @{ main='首页'; proxy='出站代理'; profile='Profile 与权限模式'; key='Tunnel Key'; commands='命令规则与预设'; policy='外部路径权限'; agents='Agent 与历史来源'; environment='执行环境'; media='图片与文件交换' }
     $notes = @{
         main='退出控制台不停止其他窗口实例；H 查看完整说明。'
         proxy='本机配置 > 进程环境；更改后运行实例需重启。'
@@ -113,6 +121,7 @@ function Get-TuiPageInfo {
         key='优先级：当前进程 > 用户环境 > .env；保存后仍需验证权限。'
         commands='显示 next_start 配置；重启生效，不自动开启 DEV。'
         environment='每次操作校验后保存；重启生效。清空额外名单不是零环境变量。'
+        media='显示 next_start；保存后重启生效。导出/附件默认关闭，真实附件导入仍待验收。'
         policy='外部文件工具还需 GRANTS；写权限不自动授予执行权限。'
         agents='来源只索引 metadata；Agent 运行另需 DEV、原生 CLI 和登录态。'
     }

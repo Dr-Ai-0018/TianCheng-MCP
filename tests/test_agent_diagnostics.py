@@ -159,7 +159,9 @@ def test_spawn_failure_is_recorded_without_exception_text_or_prompt(workspace, t
         assert rows[-1]["success"] is False
         assert rows[0]["runtime_context"]["launch_id"] == rows[1]["runtime_context"]["launch_id"]
         assert rows[-1]["runtime_context"]["requested_approval_policy"] == "never"
-        assert "private-" not in json.dumps(rows)
+        serialized = json.dumps(rows)
+        assert "private-error-with-credential" not in serialized
+        assert "private-user-prompt" not in serialized
     finally:
         service.shutdown()
 

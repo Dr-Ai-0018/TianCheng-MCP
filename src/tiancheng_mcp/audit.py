@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import threading
 from datetime import UTC, datetime
 from pathlib import Path
@@ -50,6 +51,7 @@ class AuditLogger:
         reason: str | None = None,
         output_truncated: bool | None = None,
         runtime_context: Mapping[str, Any] | None = None,
+        media_metadata: Mapping[str, Any] | None = None,
     ) -> None:
         event: dict[str, Any] = {
             "timestamp": datetime.now(UTC).isoformat(),
@@ -70,6 +72,24 @@ class AuditLogger:
             event["output_truncated"] = bool(output_truncated)
         if runtime_context is not None:
             event["runtime_context"] = bounded_launch_context(runtime_context)
+        if isinstance(media_metadata, Mapping):
+            # No image bytes, EXIF, paths or arbitrary strings may enter audit.
+            safe = {}
+            for key in ('source_bytes', 'returned_bytes', 'source_width', 'source_height', 'width', 'height'):
+                value = media_metadata.get(key)
+                if isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= 32 * 1024 * 1024:
+                    safe[key] = value
+            for key in ('source_sha256', 'returned_sha256'):
+                value = media_metadata.get(key)
+                if isinstance(value, str) and re.fullmatch(r'[0-9a-f]{64}', value): safe[key] = value
+            for key in ('source_mime_type', 'mime_type'):
+                value = media_metadata.get(key)
+                if value in ('image/png', 'image/jpeg', 'image/webp'): safe[key] = value
+            if media_metadata.get('mode') in ('preview', 'original', 'metadata'):
+                safe['mode'] = media_metadata['mode']
+            if isinstance(media_metadata.get('transformed'), bool):
+                safe['transformed'] = media_metadata['transformed']
+            event['media'] = safe
         encoded = json.dumps(event, ensure_ascii=False, separators=(",", ":"))
         with self._lock:
             self._rotate_if_needed(len((encoded + "\n").encode("utf-8")))

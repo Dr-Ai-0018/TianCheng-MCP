@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import stat
@@ -44,6 +45,7 @@ def build_parser() -> argparse.ArgumentParser:
     config_dir, state_dir = _runtime_directories()
     parser = argparse.ArgumentParser(description="TianCheng workspace-jailed MCP server")
     parser.add_argument("--runtime-config", default=None, help="Resolve launcher settings before explicit CLI options")
+    parser.add_argument('--media-config', default='{}', help='Local media capability JSON; exports and attachment networking default off')
     parser.add_argument("--runtime-project-root", default=str(PROJECT_ROOT), help="Checkout containing launcher defaults")
     parser.add_argument(
         "--workspace",
@@ -194,6 +196,7 @@ def main(argv: list[str] | None = None) -> None:
         audit_directory=args.audit_dir,
         allow_exec=args.allow_exec,
         command_policy_path=args.command_policy,
+        media_config=json.loads(args.media_config),
         passthrough_env=args.pass_env,
         execution_environment={"mode": args.exec_env_mode, "deny": args.deny_env},
         allow_external_grants=args.allow_external_grants,

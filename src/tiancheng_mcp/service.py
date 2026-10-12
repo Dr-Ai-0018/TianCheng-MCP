@@ -65,6 +65,11 @@ from .grants import ExternalGrantManager
 from .jobs import JobCancelled, JobManager, current_cancel_event, current_job_id
 from .policy import AccessPolicy, AccessPolicyError, AccessRule, _canonical_target
 from .security import WorkspaceJail, WorkspaceSecurityError, compile_glob
+from .image_io import ImageMode, read_image as decode_image
+from .media_results import MediaStore
+from .artifacts import ArtifactStore
+from .media_config import MediaSettings
+from .attachment_io import FileReference, validate_reference, download_attachment
 
 
 DEFAULT_READ_BYTES = 256 * 1024
@@ -469,6 +474,7 @@ class TianChengService:
         agent_proxy_mode: str | None = None,
         command_policy_path: str | Path | None = None,
         command_policy: CommandPolicy | None = None,
+        media_config: dict[str, Any] | None = None,
     ) -> None:
         self.jail = WorkspaceJail(workspace, create=True)
         self.access_policy_path = Path(access_policy_path) if access_policy_path else (
@@ -492,6 +498,9 @@ class TianChengService:
             self.audit = AuditLogger(audit_path)
             self.audit_directory = audit_path
         self.allow_exec = allow_exec
+        self.media = MediaStore()
+        self.media_settings = MediaSettings.parse(media_config)
+        self.artifacts = ArtifactStore()
         self.command_policy = command_policy or CommandPolicy.load(
             Path(command_policy_path) if command_policy_path else
             Path(__file__).resolve().parents[2] / "config/command-policy.local.json",
@@ -736,6 +745,12 @@ class TianChengService:
             )
             raise
         output_truncated = result.get("output_truncated") if isinstance(result, dict) else None
+        media_metadata = None
+        if tool in {'read_image', 'external_read_image', 'media_result', 'export_file',
+                    'external_export_file', 'import_attachment'}:
+            media_metadata = result.get('media') if isinstance(result, dict) else getattr(result, 'structured_content', None)
+        if tool == 'read_exported_resource' and isinstance(result, bytes):
+            media_metadata = {'source_bytes': len(result), 'source_sha256': hashlib.sha256(result).hexdigest()}
         self._record_audit_safely(
             tool=tool,
             relative_path=relative_path,
@@ -744,6 +759,7 @@ class TianChengService:
             job_id=job_id,
             state="succeeded",
             output_truncated=output_truncated if isinstance(output_truncated, bool) else None,
+            **({'media_metadata': media_metadata} if media_metadata is not None else {}),
         )
         return result
 
@@ -902,6 +918,9 @@ class TianChengService:
             "server_version": __version__,
             "capabilities": {
                 "file_operations": True,
+                "native_images": self.media_settings.images,
+                "file_exports": self.media_settings.exports,
+                "attachment_imports": self.media_settings.attachment_mode != 'off',
                 "recursive_listing": True,
                 "glob": True,
                 "text_search": True,
@@ -919,6 +938,8 @@ class TianChengService:
             "access_policy_reload_mode": (
                 "hot" if self.allow_policy_hot_reload else "cold"
             ),
+            "media": {**self.media_settings.document(), "configuration_role": "active",
+                      "uri_scope": "service-instance", "result_ttl_seconds": 900},
             "command_execution_enabled": self.allow_exec,
             "command_execution_policy": (
                 "guarded-development" if self.allow_exec else "disabled"
@@ -1719,6 +1740,102 @@ class TianChengService:
             "sha256": digest.hexdigest(),
             "max_bytes": maximum,
         }
+
+    def _resolve_media_path(self, path: str, *, external: bool = False, grant_id: str | None = None) -> Path:
+        if not external:
+            return self.jail.resolve(path, must_exist=True, expect="file", operation="read")
+        if not self.external_grants.enabled:
+            raise PermissionError("External image reads are disabled")
+        if grant_id is not None:
+            resolved, _ = self.external_grants.resolve(grant_id, path, required_mode="read", expect="file")
+            return resolved
+        scoped, relative = self._policy_scoped_service(path, "read")
+        try:
+            return scoped.jail.resolve(relative, must_exist=True, expect="file", operation="read")
+        finally:
+            scoped.shutdown()
+
+    def read_image(self, path: str, mode: ImageMode = 'preview', *, external: bool = False,
+                   grant_id: str | None = None) -> dict[str, Any]:
+        if not self.media_settings.images:
+            raise PermissionError('Image reads are disabled in local media settings')
+        authorize = lambda: self._resolve_media_path(path, external=external, grant_id=grant_id)
+        checked = authorize()
+        payload = decode_image(checked, mode, cancel=current_cancel_event())
+        if authorize() != checked:
+            raise ValueError("Media source changed during decoding")
+        return {**self.media.add(payload, authorize), 'media': payload['metadata']}
+
+    def media_result(self, job_id: str):
+        if self.jobs is None:
+            raise RuntimeError("Job manager is disabled for this service instance")
+        payload = self.jobs.result(job_id)
+        from mcp.types import CallToolResult, TextContent
+        if not payload.get('ready'):
+            return CallToolResult(content=[TextContent(text='Image job pending')], structured_content=payload)
+        value = payload.get('result')
+        if payload.get('state') != 'succeeded' or not isinstance(value, dict):
+            raise ValueError("Job has no completed media result")
+        if 'media_id' in value:
+            return self.media.response(value['media_id'])
+        if 'artifact_id' in value:
+            return self.artifacts.response(value['artifact_id'])
+        raise ValueError("Job has no completed media result")
+
+    def export_file(self, path: str, *, external: bool = False, grant_id: str | None = None) -> dict[str, Any]:
+        if not self.media_settings.exports:
+            raise PermissionError('File exports are disabled in local media settings')
+        return self.artifacts.export(lambda: self._resolve_media_path(path, external=external, grant_id=grant_id))
+
+    def import_attachment(self, file: FileReference, destination: str | None = None) -> dict[str, Any]:
+        if self.media_settings.attachment_mode == 'off':
+            raise PermissionError('Attachment downloads are disabled in local media settings')
+        validate_reference(file)
+        # The supplied name/MIME never chooses a filesystem path or launches a
+        # parser. The caller can explicitly choose a relative destination.
+        destination = destination if destination is not None else f'upload-{secrets.token_hex(12)}.bin'
+        target = self.jail.resolve(destination, must_exist=False, allow_root=False, operation='write')
+        self.jail.resolve(self.jail.relative(target.parent), must_exist=True, expect='directory', operation='write')
+        if target.exists():
+            raise FileExistsError('Attachment destination already exists; choose a new path')
+        data = download_attachment(file['download_url'], self.media_settings.attachment_hosts,
+                                   cancel=current_cancel_event(),
+                                   proxy_url=self.media_settings.attachment_proxy_url
+                                   if self.media_settings.attachment_mode == 'clash_proxy' else None)
+        return self._commit_attachment(destination, data)
+
+    @coordinate_mutation('destination')
+    def _commit_attachment(self, destination: str, data: bytes) -> dict[str, Any]:
+        target = self.jail.resolve(destination, must_exist=False, allow_root=False, operation='write')
+        self.jail.resolve(self.jail.relative(target.parent), must_exist=True, expect='directory', operation='write')
+        self._check_cancelled()
+        if target.exists():
+            raise FileExistsError('Attachment destination already exists; choose a new path')
+        descriptor, name = tempfile.mkstemp(prefix='.tiancheng-upload-', dir=target.parent)
+        temporary = Path(name)
+        receipt = None
+        try:
+            with os.fdopen(descriptor, 'wb') as stream:
+                stream.write(data)
+                stream.flush()
+                os.fsync(stream.fileno())
+            self.jail.resolve(self.jail.relative(temporary), must_exist=True, expect='file', operation='write')
+            self.jail.resolve(destination, must_exist=False, allow_root=False, operation='write')
+            self._check_cancelled()
+            # Same-filesystem hardlink is an atomic exclusive commit on NTFS
+            # and POSIX. Unsupported filesystems fail; no replacing fallback.
+            os.link(temporary, target)
+            receipt = {'path': self.jail.relative(target), 'bytes_written': len(data),
+                    'sha256': hashlib.sha256(data).hexdigest(), 'created': True,
+                    'atomic_no_overwrite': True,
+                    'media': {'source_bytes': len(data), 'source_sha256': hashlib.sha256(data).hexdigest()}}
+            return receipt
+        finally:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                if receipt is not None:
+                    receipt['staging_cleanup_pending'] = True
 
     def read_text(
         self,
@@ -4929,4 +5046,6 @@ class TianChengService:
                 run.ended_epoch = run.ended_epoch or time.time()
         if self.jobs is not None:
             self.jobs.shutdown(wait_seconds=2.0)
+        self.media.clear()
+        self.artifacts.clear()
         self.stop_all_processes()
