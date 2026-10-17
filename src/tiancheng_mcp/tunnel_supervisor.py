@@ -21,6 +21,7 @@ from typing import IO, Callable, Iterable
 
 from .proxy import ProxySettings
 from .service import _WindowsKillJob
+from .execution_supervisor import SupervisorObserver, open_supervisor_observer
 
 
 _CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
@@ -377,6 +378,7 @@ class TunnelSupervisor:
         stop_path: Path | None = None,
         recovery_log_path: Path | None = None,
         monotonic: Callable[[], float] = time.monotonic,
+        observation: SupervisorObserver | None = None,
     ) -> None:
         if _PROFILE_PATTERN.fullmatch(profile) is None:
             raise ValueError("invalid profile name")
@@ -406,6 +408,18 @@ class TunnelSupervisor:
         self.ready_since: float | None = None
         self.last_recovery_reason: str | None = None
         self.backoff_until: str | None = None
+        self.observation = observation
+
+    def _observe(self, method: str, *args):
+        if self.observation is not None:
+            try:
+                return getattr(self.observation, method)(*args)
+            except Exception as exc:
+                try:
+                    self.observation.store.note_failure(type(exc).__name__)
+                except Exception:
+                    pass
+        return None
 
     def _write_state(self, state: str, **extra: object) -> None:
         payload: dict[str, object] = {
@@ -426,6 +440,12 @@ class TunnelSupervisor:
             "updated_at": _utc_now(),
         }
         payload.update(extra)
+        self._observe('state', state, self.generation, self.restart_budget.count,
+            self.last_recovery_reason, extra.get('error'), payload['tunnel_pid'] is not None,
+            extra.get('tunnel_ready'))
+        if self.observation is not None:
+            health = self._observe('health')
+            payload['execution_records'] = health if health is not None else {'state': 'unavailable'}
         try:
             _atomic_write_json(self.state_path, payload)
         except OSError as exc:
@@ -498,9 +518,11 @@ class TunnelSupervisor:
             creationflags=_CREATE_NEW_PROCESS_GROUP,
             start_new_session=os.name != "nt",
         )
+        self._observe('child_started', self.generation, self.process.pid)
         self.kill_job = _WindowsKillJob(self.process)  # type: ignore[arg-type]
         if os.name == "nt" and not self.kill_job.active:
             _terminate_process_tree(self.process)
+            self._observe('child_finished', self.generation, self.process.poll())
             self.process = None
             self.kill_job.close()
             self.kill_job = None
@@ -537,6 +559,7 @@ class TunnelSupervisor:
                     return False
         return False
     def _ready(self) -> bool:
+        ready = False
         try:
             # The admin listener is loopback-only. Never send this probe to a
             # configured proxy, even when the host has proxy env variables.
@@ -545,17 +568,22 @@ class TunnelSupervisor:
             ).open(
                 f"{self.config.health_base_url}/readyz", timeout=2
             ) as response:
-                return response.status == 200
+                ready = response.status == 200
         except (OSError, urllib.error.URLError):
-            return False
+            pass
+        self._observe('ready', self.generation, ready)
+        return ready
 
     def _stop_child(self) -> None:
         process, self.process = self.process, None
         kill_job, self.kill_job = self.kill_job, None
         if process is not None:
+            if process.poll() is None:
+                self._observe('child_stop_requested', self.generation)
             if kill_job is not None and kill_job.active:
                 kill_job.terminate()
             _terminate_process_tree(process)
+            self._observe('child_finished', self.generation, process.poll())
         if kill_job is not None:
             kill_job.close()
 
@@ -580,6 +608,7 @@ class TunnelSupervisor:
         return True
 
     def _append_recovery_event(self, *, reason: str, backoff_until: str | None) -> None:
+        self._observe('recovery', self.generation, reason, self.restart_budget.count, backoff_until)
         if self.recovery_log_path is None:
             return
         payload = {
@@ -614,6 +643,17 @@ class TunnelSupervisor:
         return self._wait_with_stop(delay)
 
     def run(self) -> int:
+        self._observe('started', self.config.settings)
+        terminal = 'failed'
+        try:
+            result = self._run()
+            terminal = 'stopped' if result == 0 else 'failed'
+            return result
+        finally:
+            self._observe('finished', terminal)
+            self._observe('close')
+
+    def _run(self) -> int:
         signal.signal(signal.SIGINT, self.request_stop)
         if hasattr(signal, "SIGTERM"):
             signal.signal(signal.SIGTERM, self.request_stop)
@@ -628,6 +668,8 @@ class TunnelSupervisor:
             while not self._stop_requested():
                 assert self.process is not None
                 exit_code = self.process.poll()
+                if exit_code is not None:
+                    self._observe('child_finished', self.generation, exit_code)
                 now = self.monotonic()
                 elapsed = now - (self.started_at if self.started_at is not None else now)
                 if exit_code is None and elapsed >= self.config.settings.startup_grace_seconds:
@@ -747,12 +789,15 @@ def main(argv: Iterable[str] | None = None) -> int:
             / f"tunnel-supervisor-{args.profile}.jsonl"
         )
         with ProfileLock(lock_path):
+            observation = open_supervisor_observer(
+                args.defaults.resolve(), args.local_config.resolve(), args.profile)
             return TunnelSupervisor(
                 config=config,
                 profile=args.profile,
                 state_path=state_path,
                 stop_path=stop_path,
                 recovery_log_path=recovery_log_path,
+                observation=observation,
             ).run()
     except (OSError, ValueError, RuntimeError, json.JSONDecodeError) as exc:
         print(f"Tunnel supervisor error: {exc}", file=sys.stderr)

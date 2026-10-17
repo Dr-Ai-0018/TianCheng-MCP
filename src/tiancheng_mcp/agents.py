@@ -483,6 +483,7 @@ class AgentRunState:
     provider_errors_observed: int = 0
     output_gap_observed: bool = False
     action: str = "continue"
+    observation: Any = field(default=None, repr=False)
     lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
 
 

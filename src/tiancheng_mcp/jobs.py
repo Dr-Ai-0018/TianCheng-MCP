@@ -58,6 +58,17 @@ class JobRecord:
     error_type: str | None = None
     cancel_event: threading.Event = field(default_factory=threading.Event)
     done: threading.Event = field(default_factory=threading.Event)
+    # Private observation state never enters public metadata/status/results.
+    observation_context: Any = None
+    observer: Callable[['JobRecord', str], None] | None = None
+    observation_ready: threading.Event = field(default_factory=threading.Event)
+
+    def observe(self, phase: str) -> None:
+        if self.observer is not None:
+            try:
+                self.observer(self, phase)
+            except Exception:
+                pass
 
     def status(self) -> dict[str, Any]:
         now = time.time()
@@ -117,6 +128,8 @@ class JobManager:
         metadata: dict[str, Any] | None = None,
         idempotency_key: str | None = None,
         idempotency_fingerprint: str | None = None,
+        observation_context: Any = None,
+        observer: Callable[[JobRecord, str], None] | None = None,
     ) -> JobRecord:
         if self._stopping.is_set():
             raise RuntimeError("Job manager is shutting down")
@@ -132,6 +145,8 @@ class JobManager:
             operation=operation,
             runner=runner,
             metadata=dict(metadata or {}),
+            observation_context=observation_context,
+            observer=observer,
         )
         with self._lock:
             if self._stopping.is_set():
@@ -164,6 +179,10 @@ class JobManager:
                 if idempotency_key is not None:
                     self._idempotency.pop(idempotency_key, None)
                 raise RuntimeError("Job queue is full; retry after current jobs finish") from exc
+        try:
+            record.observe('queued')
+        finally:
+            record.observation_ready.set()
         return record
 
     def submit_and_wait(
@@ -246,6 +265,9 @@ class JobManager:
                 record.done.set()
             status = record.status()
         status["reason"] = (reason or "cancelled by caller")[:500]
+        record.observe('cancel_requested')
+        if record.started_at is None and record.done.is_set():
+            record.observe('cancelled')
         status["accepted"] = True
         return status
 
@@ -272,6 +294,10 @@ class JobManager:
                 if record.started_at is None:
                     record.finished_at = time.time()
                     record.done.set()
+        for record in records:
+            record.observe('cancel_requested')
+            if record.started_at is None:
+                record.observe('expired')
         return count
 
     def shutdown(self, *, wait_seconds: float = 2.0) -> None:
@@ -290,6 +316,9 @@ class JobManager:
                     record.error_type = "Shutdown"
                     record.finished_at = time.time()
                     record.done.set()
+                record.observe('cancel_requested')
+                if record.started_at is None:
+                    record.observe('expired')
         # Workers are daemon threads as a last-resort safety net, but normal
         # shutdown waits briefly so cooperative scanners and subprocess jobs
         # actually leave the process before stdio closes.
@@ -309,12 +338,14 @@ class JobManager:
             if record is None:
                 self._queue.task_done()
                 return
+            record.observation_ready.wait()
             with self._lock:
                 if record.done.is_set():
                     self._queue.task_done()
                     continue
                 record.state = "running"
                 record.started_at = time.time()
+            record.observe('started')
             token = _CURRENT_CANCEL_EVENT.set(record.cancel_event)
             job_token = _CURRENT_JOB_ID.set(record.job_id)
             try:
@@ -363,6 +394,8 @@ class JobManager:
                 _CURRENT_JOB_ID.reset(job_token)
                 with self._lock:
                     record.finished_at = time.time()
+                record.observe('completed')
+                with self._lock:
                     record.done.set()
                 self._queue.task_done()
 

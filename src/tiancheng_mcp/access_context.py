@@ -17,9 +17,15 @@ class AccessContext:
     policy: Callable[[], AccessPolicy]
     # A grant checks expiry/revocation/mode as well as the current static deny.
     grant_authorizer: Callable[[Path, str], None] | None = None
+    protected_roots: tuple[Path, ...] = ()
 
     def authorize(self, path: Path, operation: str | None = None) -> None:
         operation = operation or self.operation
+        candidate = path.resolve(strict=False)
+        for reserved in self.protected_roots:
+            if (candidate == reserved or reserved in candidate.parents
+                    or candidate in reserved.parents):
+                raise PermissionError('Execution records are reserved for local administration')
         if self.grant_authorizer is not None:
             self.grant_authorizer(path, operation)
             return

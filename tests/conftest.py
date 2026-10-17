@@ -52,6 +52,7 @@ def isolate_service_local_agent_state(
         kwargs.setdefault("agent_catalog_path", tmp_path / "agent-catalog.sqlite3")
         kwargs.setdefault("agent_env_file", tmp_path / "agent.env")
         kwargs.setdefault("command_policy_path", tmp_path / "command-policy.local.json")
+        kwargs.setdefault("observability_config", {"mode": "off"})
         original_init(self, *args, **kwargs)
 
     monkeypatch.setattr(TianChengService, "__init__", init_with_test_state)

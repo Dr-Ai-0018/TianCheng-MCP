@@ -3,7 +3,7 @@ param(
     [ValidateSet(
         'menu', 'start', 'start-new', 'doctor', 'profiles', 'configure-profile',
         'select-profile', 'edit-profile', 'key', 'key-status', 'status',
-        'set-mode', 'stop', 'restart', 'open-ui', 'settings', 'proxy', 'info', 'install-alias', 'policy', 'agents', 'commands', 'environment', 'media'
+        'set-mode', 'stop', 'restart', 'open-ui', 'settings', 'proxy', 'info', 'install-alias', 'policy', 'agents', 'commands', 'environment', 'media', 'records'
     )]
     [string]$Action = 'menu',
     [string]$Profile,
@@ -28,6 +28,7 @@ $script:ProjectRoot = $PSScriptRoot
 . (Join-Path $script:ProjectRoot 'scripts\tui\console.ps1')
 . (Join-Path $script:ProjectRoot 'scripts\tui\environment.ps1')
 . (Join-Path $script:ProjectRoot 'scripts\tui\media.ps1')
+. (Join-Path $script:ProjectRoot 'scripts\tui\records.ps1')
 $script:WorkspaceCache = ''
 $script:ProxyProbeResult = $null
 $script:DefaultsPath = Join-Path $PSScriptRoot 'config\launcher.defaults.json'
@@ -1168,6 +1169,7 @@ function Show-Info {
         localConfigPath = $script:LocalConfigPath
         workspace = [string]$Config.workspace
         python = [string]$Config.python
+        executionRecords = @{ scope = 'next_start'; activeMode = 'unknown'; mode = [string]$Config.observability.mode }
         accessPolicyPath = [string]$Config.accessPolicyPath
         commandPolicyPath = [string]$Config.commandPolicyPath
         agentSourcesPath = [string]$Config.agentSourcesPath
@@ -2301,6 +2303,7 @@ function Show-MainMenu {
                 { $_ -match '^(?i)c$' } { Show-CommandPolicyMenu -Config $config }
                 { $_ -match '^(?i)n$' } { Show-EnvironmentMenu -Config $config }
                 { $_ -match '^(?i)f$' } { Show-MediaMenu -Config $config }
+                { $_ -match '^(?i)o$' } { Show-RecordsMenu -Config $config }
                 'r' { continue }
                 'h' { Show-MenuHelp -Section 'main' }
                 '0' { return }
@@ -2354,6 +2357,10 @@ switch ($Action) {
     'media' {
         if ($Json) { Invoke-MediaAdmin -Config $config -Arguments @('status') | ConvertTo-Json -Depth 8 }
         else { Show-MediaMenu -Config $config }
+    }
+    'records' {
+        if ($Json) { Invoke-RecordsAdmin -Config $config -Arguments @('status') | ConvertTo-Json -Depth 12 }
+        else { Show-RecordsMenu -Config $config }
     }
     'environment' {
         if ($Json) { Invoke-EnvironmentAdmin -Config $config -Arguments @('status') | ConvertTo-Json -Depth 8 }

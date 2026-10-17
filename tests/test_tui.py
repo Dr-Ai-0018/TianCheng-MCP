@@ -28,7 +28,7 @@ def run_script(tmp_path: Path, body: str):
     return json.loads(result.stdout)
 
 
-@pytest.mark.parametrize("page", ["main", "proxy", "profile", "key", "commands", "policy", "agents", "environment", "media"])
+@pytest.mark.parametrize("page", ["main", "proxy", "profile", "key", "commands", "policy", "agents", "environment", "media", "records"])
 @pytest.mark.parametrize("size", [(100, 30), (140, 40), (80, 24), (60, 20)])
 def test_frame_scrolls_and_keeps_help_inside_window(tmp_path: Path, page: str, size):
     width, height = size

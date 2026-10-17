@@ -7,6 +7,7 @@ from pathlib import Path
 from collections.abc import Mapping
 from .execution_environment import EnvironmentPolicy
 from .media_config import MediaSettings
+from .execution_config import CaptureSettings
 
 PROJECT_RELATIVE_KEYS = {
     "python", "mcpScript", "mcpExecScript", "mcpGrantsScript", "workspace",
@@ -49,6 +50,12 @@ def launcher_config(project_root: Path, local_path: Path | None = None,
                 if 'attachments' in media and isinstance(media['attachments'], dict):
                     combined['attachments'] = {**previous.get('attachments', {}), **media['attachments']}
                 value['media'] = MediaSettings.parse(combined).document()
+            if 'observability' in value:
+                capture = value['observability']
+                if not isinstance(capture, dict):
+                    raise ValueError('observability must be an object')
+                combined_capture = {**merged.get('observability', {}), **capture}
+                value['observability'] = CaptureSettings.parse(combined_capture).document()
             merged.update(value)
     source = os.environ if environment is None else environment
     if source.get("TIANCHENG_WORKSPACE"):
@@ -67,12 +74,14 @@ def launcher_config(project_root: Path, local_path: Path | None = None,
     merged["interactiveTimeoutSeconds"] = timeout
     merged["executionEnvironment"] = EnvironmentPolicy.parse(merged.get("executionEnvironment")).document()
     merged['media'] = MediaSettings.parse(merged.get('media')).document()
+    merged['observability'] = CaptureSettings.parse(merged.get('observability')).document()
     return merged
 
 
 def runtime_arguments(config: Mapping[str, object], local_path: Path) -> list[str]:
     arguments = ["--launcher-local-config", str(local_path)]
     arguments.extend(('--media-config', json.dumps(MediaSettings.parse(config.get('media')).document())))
+    arguments.extend(('--observability-config', json.dumps(CaptureSettings.parse(config.get('observability')).document())))
     for key, option in RUNTIME_OPTIONS.items():
         value = config.get(key)
         if value:

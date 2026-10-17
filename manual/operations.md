@@ -40,6 +40,7 @@ tc
 - 管理 UI、非敏感启动器设置和显式 Dev profile；
 - “E. 本地 Agent / 会话源管理”可探测 Codex/Claude CLI 与固定历史根，并由用户显式添加、启停、删除、验证、刷新或重建 metadata Catalog；
 - `tc -Action info|profiles|key-status|status|agents -Json` 非交互诊断。
+- 0.19.0 新增 **O. 执行记录与诊断导出**，可查询持久时间线、分页、跟随和预览导出；`tc -Action records -Json` 查询存储状态。具体模式、完整性及权限边界见[执行记录](execution-records.md)。
 
 启动前会检查当前 Profile 是否已在运行，以及本机健康监听端口是否被占用。端口冲突时会提示
 检查占用进程，避免重复开新窗口；菜单无法识别运行进程但检测到端口占用时也不会显示为

@@ -4,7 +4,7 @@
 
 适合在聊天里整理资料、修改代码、查看差异和提交本地仓库。文件保存在你的电脑上；调用工具返回的内容会进入 ChatGPT 对话。
 
-当前版本：`0.18.0`。支持 Windows / PowerShell 7 和原生 Linux。
+当前版本：`0.19.0`。支持 Windows / PowerShell 7 和原生 Linux。
 
 ## 先跑通一次
 
@@ -49,6 +49,7 @@ Linux 用户见 [Linux 使用说明](manual/linux.md)。其他支持 stdio 的 M
 | 开启命令、调整白名单、授权外部目录 | [权限与命令预设](manual/permissions.md) |
 | 查看文件、Git 和其他工具 | [工具参考](manual/tools.md) |
 | 启停、重启、检查状态和日志 | [运行维护](manual/operations.md) |
+| 本机查看执行时间线、记录缺失与诊断导出 | [执行记录](manual/execution-records.md) |
 | 查询长任务、管理常驻进程 | [后台任务与进程](manual/jobs-and-processes.md) |
 | 使用 Codex / Claude / Pi | [本地 Agent](manual/agents.md) |
 | Linux 部署 | [Linux 使用说明](manual/linux.md) |

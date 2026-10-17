@@ -108,6 +108,16 @@ def _command(config: dict[str, object], action: str) -> list[str]:
                               ("agent-env-file", "agent_env_file"),
                               ("launcher-local-config", "launcher_local_config")):
             mcp.extend(["--" + option, str(config[field])])
+        # The Linux manager does not resolve Windows launcher defaults. Forward
+        # only the validated capture policy, keeping unrelated secrets/config
+        # out of the saved MCP command and preserving existing capability flags.
+        from tiancheng_mcp.execution_config import CaptureSettings
+        local_path = Path(str(config["launcher_local_config"]))
+        local = json.loads(local_path.read_text(encoding="utf-8-sig")) if local_path.is_file() else {}
+        if not isinstance(local, dict):
+            raise ValueError("launcher local config must be an object")
+        capture = CaptureSettings.parse(local.get("observability")).document()
+        mcp.extend(["--observability-config", json.dumps(capture, ensure_ascii=True)])
         command.extend(["--alias", str(config["alias"]),
                         "--tunnel-id", str(config["tunnel_id"]),
                         "--runtime-api-key", "env:CONTROL_PLANE_API_KEY",

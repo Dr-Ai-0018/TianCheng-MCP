@@ -8,6 +8,27 @@
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-10-16
+
+### Added
+
+- 新增本机执行记录：独立、有限的 JSONL 捕获，覆盖工具、后台 job、managed process、Agent/provider 元数据和 Supervisor；摘要、限时详情与关闭模式不改变原业务输出、权限或取消语义。
+- 新增本机 `observability_admin` 查询、关联详情、分页、follow 和诊断导出；Windows 主菜单 O 与 `tc -Action records` 共用查询/展示模型。导出先预览，私有文件无覆盖提交，质量和缺口保留。
+- 新增记录健康、保留/容量预算、写入故障隔离和缺失报告；Agent 原始协议、prompt 和 stdout/stderr 不进入持久记录。
+
+### Validation and limits
+
+- Windows 完整回归 992 passed / 18 skipped；最终查询/终端修正另验 15 passed。原生 Linux O5 冻结补丁回归 452 passed / 10 Windows 专项跳过；其后的终端编码修正仅在 Windows 执行，并在 Windows 验证。
+- O2–O4 核心已有 Windows 与原生 Linux 的 summary/detail 各 600 秒合成性能证据；这些测量不代表所有业务负载的性能保证。真实 Codex 只读读取与工作区写入有限验收 15 项通过，核对实际 native item 和独立文件字节；审批及其他 provider 须按各自通道独立验收，单一 Codex 链路不代表全部 provider。
+- 记录不提供防篡改或零丢失保证；Agent 任务仍需独立业务验收，进程 exit 0 不自动证明任务成功。Linux 提供同一捕获和查询 CLI，交互式 tc 菜单仍限 Windows。
+
+### Migration
+
+- 旧 launcher 未配置 observability 时，新实例默认 summary；off 仅关闭新增观察，既有业务权限、审计、输出和取消语义保持。detail 需本机显式选择，并受窗口和配额限制。
+- Linux 管理入口显式传递并校验本机 observability 配置，off、详情窗口和存储位置可对新实例生效；不隐式开启普通命令或热重载。
+- 保存配置后重启实例；tc -Action records 的 next_start 不等于运行实例配置。升级前确认没有活跃任务并保留匹配配置/旧环境；记录目录须在工作区外并满足当前用户私有权限，已有目录不合规时报告降级而不自动放宽 ACL。
+- 执行记录属于本机管理接口，不新增聊天读取日志或修改捕获策略的 MCP 工具；原有 0.18.0 图片、附件及资源工具继续保持原契约。
+
 ## [0.18.0] - 2026-10-12
 
 ### Added

@@ -14,6 +14,7 @@ import time
 
 from mcp import Client, StdioServerParameters
 from tiancheng_mcp.cli import PROJECT_ROOT
+from tiancheng_mcp.execution_query import ExecutionQuery
 
 INNER = "printf 'TQ_B7_MANUAL\\n' > approval-marker.txt"
 COMMAND = '/bin/bash -lc "' + INNER + '"'
@@ -30,6 +31,12 @@ def assess(report):
             or not request_matches(request, report.get('workspace'))
             or not report.get('complete_events') or not report.get('session_closed')):
         return False
+    if report.get('require_records'):
+        durable = report.get('durable', {})
+        if (not durable.get('complete_scan') or not durable.get('decision_binding')
+                or not durable.get('approval_delivered') or not durable.get('task_unverified')
+                or not durable.get('no_protocol_body') or durable.get('capture_loss')):
+            return False
     commands = report.get('commands', [])
     if report['decision'] == 'accept':
         return (report.get('state') == 'succeeded' and len(commands) == 1
@@ -74,6 +81,8 @@ async def main():
     parser.add_argument('--root', type=Path, required=True)
     parser.add_argument('--decision', choices=['cancel', 'accept'], required=True)
     parser.add_argument('--authorized', action='store_true')
+    parser.add_argument('--require-records', action='store_true',
+                        help='Also require matching persistent approval delivery and Agent lifecycle evidence')
     args = parser.parse_args()
     if args.decision == 'accept' and not args.authorized:
         parser.error('accept requires explicit human authorization of the exact command')
@@ -94,8 +103,10 @@ async def main():
         '--agent-profiles', str(config / 'profiles.json'), '--agent-env-file', str(config / 'agent.env'),
         '--agent-sources', str(config / 'sources.json'), '--agent-catalog', str(config / 'catalog.sqlite3'),
         '--launcher-local-config', str(config / 'launcher.json'),
+        '--observability-config', json.dumps({'mode': 'summary', 'storageRoot': str(args.root / 'records')}),
     ], encoding='utf-8')
-    report = {'decision': args.decision, 'workspace': str(workspace), 'verified': False}
+    report = {'decision': args.decision, 'workspace': str(workspace), 'verified': False,
+              'require_records': args.require_records}
     async with Client(parameters, mode='legacy', raise_exceptions=True) as client:
         async def call(tool, **arguments):
             result = await client.call_tool(tool, arguments)
@@ -157,7 +168,25 @@ async def main():
         finally:
             closed = await call('agent_session', action='close', session_id=sid)
             report['session_closed'] = closed.get('closed') is True
-            report['verified'] = assess(report)
+    if args.require_records:
+        page = ExecutionQuery(args.root / 'records').show(rid)
+        events = page['items']
+        approval = [e for e in events if e['kind'] == 'approval'
+                    and e.get('resources', {}).get('approval_id') == request['approval_id']]
+        phases = {e['phase'] for e in approval}
+        raw = b''.join(p.read_bytes() for p in (args.root / 'records').rglob('*.jsonl'))
+        report['durable'] = {
+            'complete_scan': not page['scan_incomplete'] and not page['cursor_gap'] and not page['next_cursor'],
+            'decision_binding': any(e.get('result', {}).get('decision') == args.decision for e in approval),
+            'approval_delivered': {'received', 'decision_submitted', 'response_delivered'} <= phases
+                                  and 'response_failed' not in phases,
+            'task_unverified': any(e['kind'] == 'agent' and e.get('result', {}).get('scope') == 'agent_lifecycle'
+                                   and e['result'].get('task_outcome') == 'unverified' for e in events),
+            'no_protocol_body': CONTENT.encode() not in raw and COMMAND.encode() not in raw,
+            'capture_loss': bool(page['quality']),
+            'phases': sorted(phases), 'events': len(events),
+        }
+    report['verified'] = assess(report)
     print(json.dumps(report, ensure_ascii=False), flush=True)
     return 0 if report['verified'] else 1
 

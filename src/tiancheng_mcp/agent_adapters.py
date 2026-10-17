@@ -530,6 +530,32 @@ class NormalizedEvent:
         }
 
 
+def _notify_observation(parser, event_type: str, metadata: dict) -> None:
+    callback = getattr(parser, 'source_observer', None)
+    if callback is not None:
+        try:
+            callback(event_type, metadata)
+        except Exception:
+            pass
+
+
+def _observe_parser_event(parser, event: NormalizedEvent, raw: dict) -> None:
+    item = raw.get('item') if isinstance(raw.get('item'), dict) else {}
+    kind = event.type
+    metadata = {'source_seq': event.seq}
+    if kind == 'command_completed':
+        metadata.update(native_item_id=item.get('id'), exit_code=event.data.get('exit_code'),
+                        state=event.data.get('status'))
+    elif raw.get('type') == 'item.started' and item.get('type') == 'command_execution':
+        kind = 'command_started'
+        metadata['native_item_id'] = item.get('id')
+    elif raw.get('type') == 'item.completed' and item.get('type') == 'file_change':
+        kind = 'file_changed'
+        changes = item.get('changes')
+        metadata.update(native_item_id=item.get('id'), count=len(changes) if isinstance(changes, list) else None)
+    _notify_observation(parser, kind, metadata)
+
+
 @runtime_checkable
 class AgentEventParser(Protocol):
     next_seq: int
@@ -643,6 +669,7 @@ class CodexJsonlParser:
             clipped or summary_clipped,
         )
         self.next_seq += 1
+        _observe_parser_event(self, event, raw)
         return event
 
     def synthetic_event(
@@ -666,6 +693,7 @@ class CodexJsonlParser:
             summary_clipped or data_clipped,
         )
         self.next_seq += 1
+        _observe_parser_event(self, event, {})
         return event
 
 
@@ -742,6 +770,7 @@ class ClaudeJsonlParser:
             clipped or summary_clipped,
         )
         self.next_seq += 1
+        _observe_parser_event(self, event, raw)
         return event
 
     def synthetic_event(
@@ -765,6 +794,7 @@ class ClaudeJsonlParser:
             summary_clipped or data_clipped,
         )
         self.next_seq += 1
+        _observe_parser_event(self, event, {})
         return event
 
 

@@ -14,7 +14,7 @@ import tomllib
 import uuid
 from typing import Any
 
-from .agent_adapters import CodexJsonlParser, redact_text
+from .agent_adapters import CodexJsonlParser, redact_text, _notify_observation
 
 MAX_APPROVAL_BYTES = 16_384
 APPROVAL_TTL_SECONDS = 300
@@ -73,6 +73,8 @@ class ManualApprovalParser(CodexJsonlParser):
         self.stdin_closed = False
         self.decoder = codecs.getincrementaldecoder("utf-8")("strict")
         self.stage = "initialize"
+        self.approval_observer = None
+        self.observation_delivery: dict[str, tuple[str, str]] = {}
         self.outgoing.append({"id": 1, "method": "initialize", "params": {
             "clientInfo": {"name": "tiancheng_mcp", "version": "0.11.0"},
             "capabilities": {"experimentalApi": True},
@@ -81,6 +83,7 @@ class ManualApprovalParser(CodexJsonlParser):
     def fail(self, message: str):
         self.done = "failed"
         self.failure_message = redact_text(message)[0]
+        self._withdraw_observation()
         self.pending.clear()
         return self.synthetic_event("error", message)
 
@@ -91,13 +94,32 @@ class ManualApprovalParser(CodexJsonlParser):
             self.fail("Invalid UTF-8 in approval protocol")
             return ""
 
-    def _reply(self, rpc_id: Any, decision: str) -> None:
+    def _observe_approval(self, phase: str, approval_id: str, metadata: dict) -> None:
+        if self.approval_observer is not None:
+            try:
+                self.approval_observer(phase, approval_id, metadata)
+            except Exception:
+                pass
+
+    def _withdraw_observation(self) -> None:
+        for key in self.pending:
+            self._observe_approval('withdrawn', key, {})
+
+    def observation_delivery_failed(self) -> None:
+        for approval_id, decision in self.observation_delivery.values():
+            self._observe_approval('response_failed', approval_id, {'decision': decision})
+        self.observation_delivery.clear()
+
+    def _reply(self, rpc_id: Any, decision: str, approval_id: str | None = None) -> None:
         self.outgoing.append({"id": rpc_id, "result": {"decision": decision}})
+        if approval_id is not None and self.approval_observer is not None:
+            self.observation_delivery[json.dumps(rpc_id)] = (approval_id, decision)
 
     def expire(self) -> None:
         for key, request in list(self.pending.items()):
             if time.monotonic() >= request["deadline"]:
-                self._reply(request["rpc_id"], "cancel")
+                self._reply(request["rpc_id"], "cancel", key)
+                self._observe_approval('expired', key, {'decision': 'cancel'})
                 del self.pending[key]
 
     def list_pending(self) -> list[dict[str, Any]]:
@@ -114,7 +136,8 @@ class ManualApprovalParser(CodexJsonlParser):
         if decision not in request["public"]["allowed_decisions"]:
             self.pending[approval_id] = request
             raise ValueError("Decision is not offered by this native request")
-        self._reply(request["rpc_id"], decision)
+        self._reply(request["rpc_id"], decision, approval_id)
+        self._observe_approval('decision_submitted', approval_id, {'decision': decision})
         return {"approval_id": approval_id, "decision": decision, "status": "submitted"}
 
     def feed_line(self, line: str):
@@ -181,6 +204,7 @@ class ManualApprovalParser(CodexJsonlParser):
         elif method == "serverRequest/resolved":
             for key, r in list(self.pending.items()):
                 if r["rpc_id"] == params.get("requestId"):
+                    self._observe_approval('withdrawn', key, {})
                     del self.pending[key]
         elif method in {"item/started", "item/completed"}:
             item = params.get("item", {})
@@ -191,17 +215,24 @@ class ManualApprovalParser(CodexJsonlParser):
                     return self.fail("Too many concurrent native items")
                 if len(json.dumps(item).encode()) <= MAX_APPROVAL_BYTES:
                     self.items[item["id"]] = item
+                    if item.get('type') == 'commandExecution':
+                        _notify_observation(self, 'command_started', {'native_item_id': item.get('id')})
             if method == "item/completed":
                 self.items.pop(item.get("id"), None)
                 if item.get("type") == "agentMessage":
                     return super().feed_line(json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": item.get("text", "")}}))
                 if item.get("type") == "commandExecution":
-                    return super().feed_line(json.dumps({"type": "item.completed", "item": {"type": "command_execution", "status": item.get("status"), "exit_code": item.get("exitCode")}}))
+                    return super().feed_line(json.dumps({"type": "item.completed", "item": {"type": "command_execution", "id": item.get('id'), "status": item.get("status"), "exit_code": item.get("exitCode")}}))
+                if item.get('type') == 'fileChange':
+                    changes = item.get('changes')
+                    _notify_observation(self, 'file_changed', {'native_item_id': item.get('id'),
+                        'count': len(changes) if isinstance(changes, list) else None})
         elif method == "turn/completed":
             turn = params.get("turn", {})
             if params.get("threadId") != self.native_session_id or turn.get("id") != self.turn_id:
                 return self.fail("Completed turn binding mismatch")
             self.done = {"completed": "succeeded", "interrupted": "cancelled"}.get(turn.get("status"), "failed")
+            self._withdraw_observation()
             self.pending.clear()
             return self.synthetic_event("error" if self.done == "failed" else "status", "Manual turn " + str(turn.get("status")))
         elif method == "error":
@@ -246,4 +277,5 @@ class ManualApprovalParser(CodexJsonlParser):
                   "turn_id": self.turn_id, "item_id": p.get("itemId"), "details": details,
                   "allowed_decisions": decisions, "expires_at_epoch": time.time() + APPROVAL_TTL_SECONDS}
         self.pending[approval_id] = {"rpc_id": rpc_id, "deadline": time.monotonic() + APPROVAL_TTL_SECONDS, "public": public}
+        self._observe_approval('received', approval_id, {'native_item_id': p.get('itemId')})
         return self.synthetic_event("approval_requested", "User decision required", {"approval_id": approval_id})

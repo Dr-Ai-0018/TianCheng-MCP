@@ -13,6 +13,7 @@ from .agent_adapters import (
     MAX_EVENT_DATA_BYTES,
     NormalizedEvent,
     redact_text,
+    _notify_observation,
 )
 
 _PROVIDER = re.compile(r"[a-z][a-z0-9-]{0,63}\Z")
@@ -111,6 +112,7 @@ class PiJsonlParser:
             summary_clipped or data_clipped,
         )
         self.next_seq += 1
+        _notify_observation(self, event.type, {"source_seq": event.seq})
         return event
 
 

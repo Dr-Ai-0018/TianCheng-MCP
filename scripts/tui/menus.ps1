@@ -1,6 +1,6 @@
 # Menu copy is shared by the interactive selector and context help.
 function Get-TuiMenuItems {
-    param([ValidateSet('main','proxy','profile','key','commands','policy','agents','environment','media')][string]$Page)
+    param([ValidateSet('main','proxy','profile','key','commands','policy','agents','environment','media','records')][string]$Page)
     switch ($Page) {
     'main' {
         $rows = @(
@@ -19,8 +19,20 @@ function Get-TuiMenuItems {
             @('F','配置与权限','图片与文件交换','分别管理图片、实验导出和附件下载；本机保存，重启后生效。'),
             @('D','配置与权限','外部路径权限','配置外部目录的浏览、读取、写入和执行权限。'),
             @('E','工具与维护','Agent 与历史来源','管理历史 metadata 来源；真实 smoke 需要确认且消耗额度。'),
+            @('O','工具与维护','执行记录与诊断导出','本机查询持久时间线、结果及记录质量；不启动服务或取消任务。'),
             @('A','工具与维护','启动设置','配置程序路径、健康地址、等待时间、自动恢复和连接 TTL。'),
             @('B','工具与维护','安装 / 修复 tc','把 tc 安装到用户 PowerShell 7 Profile；重开终端或加载后生效。')
+        )
+    }
+    'records' {
+        $rows = @(
+            @('1','记录状态','存储与捕获配置','查询记录可读性及 next_start 配置；运行模式无法离线确认。'),
+            @('2','历史查询','操作列表','读取一页摘要；仅对本页扫描范围排序。'),
+            @('3','历史查询','筛选操作','按 tool、provider、status 或 since 查询，留空忽略。'),
+            @('4','历史查询','操作详情','按 operation 或关联资源 ID 查看；详情只能读取已经捕获的片段。'),
+            @('5','历史查询','下一页','沿当前查询绑定游标继续，淘汰或缺口保持可见。'),
+            @('6','实时查看','持续查看','读取同一时间线；Ctrl+C 结束查看，不取消业务任务。'),
+            @('7','本机导出','预览并导出诊断','先展示范围和大小，再确认写入私有目录；默认摘要且不覆盖。')
         )
     }
     'media' {
@@ -113,7 +125,7 @@ function Get-TuiMenuItems {
 
 function Get-TuiPageInfo {
     param([string]$Page)
-    $titles = @{ main='首页'; proxy='出站代理'; profile='Profile 与权限模式'; key='Tunnel Key'; commands='命令规则与预设'; policy='外部路径权限'; agents='Agent 与历史来源'; environment='执行环境'; media='图片与文件交换' }
+    $titles = @{ main='首页'; proxy='出站代理'; profile='Profile 与权限模式'; key='Tunnel Key'; commands='命令规则与预设'; policy='外部路径权限'; agents='Agent 与历史来源'; environment='执行环境'; media='图片与文件交换'; records='执行记录' }
     $notes = @{
         main='退出控制台不停止其他窗口实例；H 查看完整说明。'
         proxy='本机配置 > 进程环境；更改后运行实例需重启。'
@@ -124,6 +136,7 @@ function Get-TuiPageInfo {
         media='显示 next_start；保存后重启生效。导出/附件默认关闭，真实附件导入仍待验收。'
         policy='外部文件工具还需 GRANTS；写权限不自动授予执行权限。'
         agents='来源只索引 metadata；Agent 运行另需 DEV、原生 CLI 和登录态。'
+        records='只读查询持久记录；导出另行确认，不代表任务完整或服务在线。'
     }
     $exit = switch ($Page) { main { '退出' }; proxy { '保存返回' }; default { '返回' } }
     return @{ Title=$titles[$Page]; Note=$notes[$Page]; Exit=$exit }

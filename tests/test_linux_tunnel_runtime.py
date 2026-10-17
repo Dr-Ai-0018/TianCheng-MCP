@@ -8,6 +8,9 @@ import sys
 
 import pytest
 
+import runpy
+import shlex
+
 
 @pytest.mark.skipif(os.name != "posix", reason="Linux tunnel runtime launcher")
 def test_linux_tunnel_runtime_keeps_key_out_of_arguments_and_output(tmp_path: Path) -> None:
@@ -65,3 +68,32 @@ def test_linux_tunnel_runtime_keeps_key_out_of_arguments_and_output(tmp_path: Pa
     assert refused.returncode == 2
     assert not capture.exists()
     assert "synthetic-test-secret" not in refused.stdout + refused.stderr
+
+
+@pytest.mark.parametrize('mode', ['off', 'summary', 'detail'])
+def test_linux_command_forwards_validated_observation_policy_without_other_local_values(tmp_path, mode):
+    module = runpy.run_path(str(Path(__file__).resolve().parents[1] / 'scripts/linux_tunnel_runtime.py'))
+    local = tmp_path / 'launcher.json'
+    storage = tmp_path / 'records'
+    local.write_text(json.dumps({'observability': {'mode': mode, 'storageRoot': str(storage),
+                               'detailWindowMinutes': 12}, 'unrelated_secret': 'must-not-be-in-command'}))
+    config = {k: str(tmp_path / k) for k in module['PATH_FIELDS']}
+    config.update(launcher_local_config=str(local), alias='fixture', profile='fixture', tunnel_id='tunnel_fixture')
+    command = module['_command'](config, 'connect')
+    mcp = shlex.split(command[command.index('--mcp-command') + 1])
+    assert mcp.count('--observability-config') == 1
+    capture = json.loads(mcp[mcp.index('--observability-config') + 1])
+    assert capture['mode'] == mode and capture['storageRoot'] == str(storage)
+    assert capture['detailWindowMinutes'] == 12
+    assert 'must-not-be-in-command' not in ' '.join(command)
+    assert '--allow-exec' not in mcp and '--allow-policy-hot-reload' not in mcp
+
+
+def test_linux_command_rejects_invalid_capture_policy_before_client_launch(tmp_path):
+    module = runpy.run_path(str(Path(__file__).resolve().parents[1] / 'scripts/linux_tunnel_runtime.py'))
+    local = tmp_path / 'launcher.json'
+    local.write_text(json.dumps({'observability': {'summaryMaxMiB': 0}}))
+    config = {k: str(tmp_path / k) for k in module['PATH_FIELDS']}
+    config.update(launcher_local_config=str(local))
+    with pytest.raises(ValueError):
+        module['_command'](config, 'connect')

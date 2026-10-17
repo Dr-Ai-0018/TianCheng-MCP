@@ -19,6 +19,9 @@ logs/*.jsonl
 /config/access-policy.json.bak
 /config/agent-sources.json.bak
 /state/agent-catalog.sqlite*
+/state/execution-records/
+/state/execution-records-local/
+/state/execution-local-admin/
 /state/tunnel-supervisor-*.json
 /state/tunnel-supervisor-*.lock
 /state/tunnel-supervisor-*.stop

@@ -138,6 +138,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=75,
         help="Maximum time a tool call waits before returning a background job handle (1-90)",
     )
+    parser.add_argument('--observability-config', default='{}',
+                        help='Local execution record settings as JSON; off/summary/detail')
     return parser
 
 
@@ -197,6 +199,7 @@ def main(argv: list[str] | None = None) -> None:
         allow_exec=args.allow_exec,
         command_policy_path=args.command_policy,
         media_config=json.loads(args.media_config),
+        observability_config=json.loads(args.observability_config),
         passthrough_env=args.pass_env,
         execution_environment={"mode": args.exec_env_mode, "deny": args.deny_env},
         allow_external_grants=args.allow_external_grants,

@@ -84,6 +84,7 @@ class _ManagedProcess:
         self.completion_callback = None
         self.reader_stop = threading.Event()
         self.output_drain_incomplete = False
+        self.observation = None
 
     def append_output(self, stream: str, chunk: bytes) -> None:
         with self.lock:
@@ -95,6 +96,8 @@ class _ManagedProcess:
             buffer.extend(chunk)
             if len(buffer) > self.output_limit:
                 del buffer[: len(buffer) - self.output_limit]
+        if self.observation is not None:
+            self.observation.output(stream, chunk)
 
     def snapshot_output(
         self, stream: str, maximum: int, after_bytes: int = 0

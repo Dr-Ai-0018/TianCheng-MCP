@@ -25,6 +25,7 @@ def _isolated_server_config_args(
     # A stdio server is a separate process, so pytest's in-process fixtures do
     # not protect it from ignored, machine-owned config in the source checkout.
     return [
+        "--observability-config", '{"mode":"off"}',
         "--access-policy", str(access_policy or tmp_path / "isolated-access-policy.json"),
         "--agent-sources", str(tmp_path / "isolated-agent-sources.json"),
         "--agent-catalog", str(tmp_path / "isolated-catalog.sqlite3"),

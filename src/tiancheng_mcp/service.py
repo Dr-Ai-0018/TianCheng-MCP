@@ -25,6 +25,12 @@ from typing import Any, TypeVar
 from urllib.parse import urlsplit, urlunsplit
 
 from . import __version__
+from dataclasses import replace
+from .execution_config import CaptureSettings
+from .execution_events import EventSink, OperationContext, CURRENT_OPERATION
+from .execution_lifecycle import ProcessObserver, AgentObserver
+from .execution_store import ExecutionStore
+from .execution_paths import validate_root
 from .execution_environment import base_environment, EnvironmentPolicy, validate_names
 from .proxy import add_agent_proxy
 from .command_policy import CommandPolicy, execution_denied
@@ -334,16 +340,29 @@ def _truncate_utf8(text: str, maximum: int) -> tuple[str, bool, int]:
     return "", True, 0
 
 
-def _drain_stream(stream: Any, maximum: int, result: dict[str, Any], key: str) -> None:
+def _drain_stream(stream: Any, maximum: int, result: dict[str, Any], key: str,
+                  observer: Callable[[str, dict[str, Any]], None] | None = None) -> None:
     kept = bytearray()
     total = 0
+    decoder = codecs.getincrementaldecoder('utf-8')(errors='replace')
+    read = stream.read1 if observer is not None and hasattr(stream, 'read1') else stream.read
+    def observe(text: str) -> None:
+        if observer is not None and text:
+            try:
+                observer('output', {'stream': key, 'text': text})
+            except Exception:
+                pass
     while True:
-        chunk = stream.read(65536)
+        chunk = read(65536)
         if not chunk:
             break
         total += len(chunk)
+        if observer is not None:
+            observe(decoder.decode(chunk))
         if len(kept) < maximum:
             kept.extend(chunk[: maximum - len(kept)])
+    if observer is not None:
+        observe(decoder.decode(b'', final=True))
     result[key] = (bytes(kept), total)
 
 
@@ -355,7 +374,14 @@ def _run_process_bounded(
     timeout_seconds: float,
     maximum_output: int,
     cancel_event: threading.Event | None = None,
+    observer: Callable[[str, dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
+    def observe(phase: str, value: dict[str, Any]) -> None:
+        if observer is not None:
+            try:
+                observer(phase, value)
+            except Exception:
+                pass
     if cancel_event is not None and cancel_event.is_set():
         raise JobCancelled("Job cancelled before process start")
     process = subprocess.Popen(
@@ -370,17 +396,18 @@ def _run_process_bounded(
         start_new_session=os.name != "nt",
     )
     kill_job = _WindowsKillJob(process)
+    observe('started', {})
     assert process.stdout is not None
     assert process.stderr is not None
     drained: dict[str, Any] = {}
     stdout_thread = threading.Thread(
         target=_drain_stream,
-        args=(process.stdout, maximum_output, drained, "stdout"),
+        args=(process.stdout, maximum_output, drained, "stdout", observer),
         daemon=True,
     )
     stderr_thread = threading.Thread(
         target=_drain_stream,
-        args=(process.stderr, maximum_output, drained, "stderr"),
+        args=(process.stderr, maximum_output, drained, "stderr", observer),
         daemon=True,
     )
     stdout_thread.start()
@@ -435,7 +462,7 @@ def _run_process_bounded(
     stderr_thread.join(timeout=5)
     stdout_bytes, stdout_total = drained.get("stdout", (b"", 0))
     stderr_bytes, stderr_total = drained.get("stderr", (b"", 0))
-    return {
+    result = {
         "exit_code": exit_code,
         "stdout": stdout_bytes.decode("utf-8", errors="replace"),
         "stderr": stderr_bytes.decode("utf-8", errors="replace"),
@@ -446,6 +473,8 @@ def _run_process_bounded(
         "timeout": timed_out,
         "cancelled": cancelled,
     }
+    observe('completed', result)
+    return result
 
 
 class TianChengService:
@@ -475,8 +504,19 @@ class TianChengService:
         command_policy_path: str | Path | None = None,
         command_policy: CommandPolicy | None = None,
         media_config: dict[str, Any] | None = None,
+        observability_config: dict[str, Any] | None = None,
     ) -> None:
+        self.capture_settings = CaptureSettings.parse(observability_config)
         self.jail = WorkspaceJail(workspace, create=True)
+        capture_root = self.capture_settings.root(Path(__file__).resolve().parents[2])
+        # Explicit unsafe configuration fails before workers start. Disk/ACL
+        # failures during writer activation remain isolated observation faults.
+        self.execution_record_root = (validate_root(capture_root, self.jail.root)
+                                      if self.capture_settings.mode != 'off'
+                                      else capture_root.resolve(strict=False))
+        self.execution_store: ExecutionStore | None = None
+        self.execution_sink: EventSink | None = None
+        self._owns_execution_store = True
         self.access_policy_path = Path(access_policy_path) if access_policy_path else (
             Path(__file__).resolve().parents[2] / "config" / "access-policy.json"
         )
@@ -637,6 +677,11 @@ class TianChengService:
             )
             self._grant_reaper.start()
 
+        if self.capture_settings.mode != 'off':
+            self.execution_store = ExecutionStore(self.execution_record_root, self.capture_settings,
+                                                  workspace=self.jail.root)
+            self.execution_sink = EventSink(self.execution_store)
+
     def _load_access_policy(self) -> AccessPolicy:
         try:
             return AccessPolicy.load(self.access_policy_path, self.jail.root)
@@ -723,17 +768,63 @@ class TianChengService:
     def _validate_passthrough_env(names: Sequence[str]) -> tuple[str, ...]:
         return validate_names(names)
 
+    def _observe_execution(self, method: str, *args, **kwargs):
+        """An observation failure must never change the business operation."""
+        try:
+            return getattr(self.execution_sink, method)(*args, **kwargs)
+        except Exception as exc:
+            try:
+                self.execution_store.note_failure(type(exc).__name__)
+            except Exception:
+                pass
+            return None
+
     def audited(
         self,
         tool: str,
         relative_path: str | None,
         operation: Callable[[], _T],
+        *, observation: OperationContext | None = None,
+    ) -> _T:
+        sink = self.execution_sink
+        context = observation or CURRENT_OPERATION.get()
+        owns_invocation = observation is None and context is None
+        if context is None and sink is not None:
+            context = self._observe_execution('begin_invocation', tool,
+                {'scope': 'workspace', 'path': relative_path})
+            if context is None:
+                # Keep the invocation binding even when its first event failed.
+                # Direct entrypoints use this binding to avoid recursive wrapping.
+                context = OperationContext(sink.store.producer_id, uuid.uuid4().hex,
+                    uuid.uuid4().hex, tool=tool, capture_mode=sink.settings.mode)
+        if context is not None and current_job_id() is not None:
+            context = replace(context, resources={**context.resources, 'job_id': current_job_id()})
+        token = CURRENT_OPERATION.set(context)
+        try:
+            return self._audited_operation(tool, relative_path, operation, context, owns_invocation)
+        finally:
+            CURRENT_OPERATION.reset(token)
+
+    def _audited_operation(
+        self, tool: str, relative_path: str | None, operation: Callable[[], _T],
+        context: OperationContext | None, owns_invocation: bool,
     ) -> _T:
         started = time.perf_counter()
         job_id = current_job_id()
+        if context is not None and self.execution_sink is not None:
+            self._observe_execution('emit', context, 'tool', 'started')
         try:
             result = operation()
         except Exception as exc:
+            if context is not None and self.execution_sink is not None:
+                self._observe_execution('finish_detail', context)
+                outcome = ('cancelled' if isinstance(exc, JobCancelled) else
+                           'denied' if isinstance(exc, PermissionError) else 'failed')
+                self._observe_execution('emit', context, 'tool', outcome if outcome != 'denied' else 'denied',
+                                         operation_outcome=outcome)
+                if owns_invocation:
+                    self._observe_execution('emit', context, 'tool', 'response_failed', invocation_outcome='error',
+                                             operation_outcome=outcome)
             self._record_audit_safely(
                 tool=tool,
                 relative_path=relative_path,
@@ -761,7 +852,25 @@ class TianChengService:
             output_truncated=output_truncated if isinstance(output_truncated, bool) else None,
             **({'media_metadata': media_metadata} if media_metadata is not None else {}),
         )
+        if context is not None and self.execution_sink is not None:
+            facts = result if isinstance(result, dict) else {}
+            outcome = self._observed_outcome(facts)
+            self._observe_execution('finish_detail', context)
+            self._observe_execution('emit', context, 'tool', 'completed', facts, operation_outcome=outcome)
+            if owns_invocation:
+                self._observe_execution('emit', context, 'tool', 'response_delivered',
+                                         invocation_outcome='returned', operation_outcome=outcome)
         return result
+
+    @staticmethod
+    def _observed_outcome(result: Mapping[str, Any]) -> str:
+        if result.get('cancelled'):
+            return 'cancelled'
+        if result.get('timeout'):
+            return 'timed_out'
+        if type(result.get('exit_code')) is int and result['exit_code'] != 0:
+            return 'failed'
+        return 'succeeded'
 
     def _record_audit_safely(self, **event: Any) -> None:
         """Keep audit I/O failures from changing the tool's business result."""
@@ -793,6 +902,54 @@ class TianChengService:
     ) -> _T | dict[str, Any]:
         """Run every tool behind a short wait; return a job handle if it overruns."""
 
+        sink = self.execution_sink
+        if sink is None:
+            return self._run_with_fallback(tool, relative_path, operation, metadata=metadata,
+                idempotency_key=idempotency_key, idempotency_fingerprint=idempotency_fingerprint)
+        context = self._observe_execution('begin_invocation', tool,
+            {'scope': 'workspace', 'path': relative_path})
+        if context is None:
+            context = OperationContext(sink.store.producer_id, uuid.uuid4().hex,
+                uuid.uuid4().hex, tool=tool, capture_mode=sink.settings.mode)
+        token = CURRENT_OPERATION.set(context)
+        try:
+            result = self._run_with_fallback(tool, relative_path, operation, metadata=metadata,
+                idempotency_key=idempotency_key, idempotency_fingerprint=idempotency_fingerprint)
+            response_context = CURRENT_OPERATION.get() or context
+            facts = result if isinstance(result, dict) else {}
+            background = facts.get('execution') == 'background'
+            self._observe_execution('emit', response_context, 'tool', 'handoff' if background else 'response_delivered',
+                      invocation_outcome='returned',
+                      operation_outcome='pending' if background else 'unknown')
+            return result
+        except Exception as exc:
+            self._observe_execution('emit', CURRENT_OPERATION.get() or context, 'tool', 'response_failed',
+                      invocation_outcome='error', operation_outcome='unknown')
+            raise
+        finally:
+            CURRENT_OPERATION.reset(token)
+
+    def _observe_job(self, record: Any, phase: str) -> None:
+        sink = self.execution_sink
+        context = record.observation_context
+        if sink is None or context is None:
+            return
+        context = replace(context, resources={**context.resources, 'job_id': record.job_id})
+        facts = {'state': record.state, 'cancel_requested': record.cancel_requested}
+        outcome = 'pending'
+        if phase in ('completed', 'cancelled', 'expired'):
+            outcome = ('cancelled' if record.state in ('cancelled', 'expired') else
+                       'denied' if isinstance(record.exception, PermissionError) else
+                       'failed' if record.state == 'failed' else self._observed_outcome(
+                           record.result if isinstance(record.result, dict) else {}))
+        self._observe_execution('emit', context, 'job', phase, facts, operation_outcome=outcome)
+
+    def _run_with_fallback(
+        self, tool: str, relative_path: str | None, operation: Callable[[], _T], *,
+        metadata: dict[str, Any] | None = None, idempotency_key: str | None = None,
+        idempotency_fingerprint: str | None = None,
+    ) -> _T | dict[str, Any]:
+
         # Job control and grant lifecycle calls must remain immediately usable
         # even when all background workers are busy.
         if tool in {
@@ -808,14 +965,33 @@ class TianChengService:
 
         if self.jobs is None:
             return self.audited(tool, relative_path, operation)
-        record, completed, result = self.jobs.submit_and_wait(
+        context = CURRENT_OPERATION.get()
+        record = self.jobs.submit(
             tool,
-            lambda _cancel_event: self.audited(tool, relative_path, operation),
-            interactive_timeout=self.interactive_timeout_seconds,
+            lambda _cancel_event: self.audited(tool, relative_path, operation, observation=context),
             metadata=metadata,
             idempotency_key=idempotency_key,
             idempotency_fingerprint=idempotency_fingerprint,
+            observation_context=context,
+            observer=self._observe_job if self.execution_sink is not None else None,
         )
+        if context is not None:
+            original = record.observation_context
+            response_context = replace(context, resources={**context.resources, 'job_id': record.job_id})
+            if original is not None and original is not context:
+                response_context = replace(response_context, operation_id=original.operation_id,
+                                           origin_invocation_id=original.invocation_id)
+                self._observe_execution('emit', response_context, 'job', 'reused')
+            CURRENT_OPERATION.set(response_context)
+        completed = record.done.wait(timeout=self.interactive_timeout_seconds)
+        if completed:
+            if record.exception is not None:
+                raise record.exception
+            result = record.result
+        else:
+            result = {'execution': 'background', 'job_id': record.job_id, 'state': record.state,
+                      'operation': record.operation,
+                      'message': 'Request exceeded the interactive budget; use job_status/job_result to continue.'}
         if not completed:
             self._record_audit_safely(
                 tool=tool,
@@ -914,6 +1090,8 @@ class TianChengService:
     def workspace_info(self) -> dict[str, Any]:
         return {
             "audit_health": self._audit_health(),
+            "execution_record_health": (self.execution_store.health() if self.execution_store
+                                        else {"mode": "off", "storage_available": False}),
             "workspace_root": str(self.jail.root),
             "server_version": __version__,
             "capabilities": {
@@ -1181,6 +1359,8 @@ class TianChengService:
             raise PermissionError("Only an existing directory can be whitelisted")
         project_root = Path(__file__).resolve().parents[2]
         protected = [project_root, self.audit_directory, self.access_policy_path.parent]
+        if self.execution_record_root is not None:
+            protected.append(self.execution_record_root)
         for reserved in protected:
             reserved = Path(reserved).resolve(strict=False)
             if candidate == reserved or reserved in candidate.parents or candidate in reserved.parents:
@@ -1381,13 +1561,20 @@ class TianChengService:
         )
 
     def _scoped_service(self, context: AccessContext, *, allow_exec: bool = False) -> TianChengService:
+        if self.execution_record_root is not None:
+            context = replace(context, protected_roots=(*context.protected_roots, self.execution_record_root))
         scoped = TianChengService(
             context.root, None, allow_exec=allow_exec,
             passthrough_env=self.passthrough_env,
             execution_environment=self.execution_environment.document(), enable_jobs=False,
             enable_agent_catalog=False, access_policy=AccessPolicy.default(context.root),
             command_policy=self.command_policy,
+            observability_config={"mode": "off"},
         )
+        scoped.execution_record_root = self.execution_record_root
+        scoped.execution_store = self.execution_store
+        scoped.execution_sink = self.execution_sink
+        scoped._owns_execution_store = False
         scoped._environment_credential_names = self._environment_credential_names
         scoped.jail = ContextJail(context)
         return scoped
@@ -3401,6 +3588,9 @@ class TianChengService:
         timeout_seconds: int = 60,
         max_output_bytes: int = DEFAULT_COMMAND_OUTPUT_BYTES,
     ) -> dict[str, Any]:
+        if self.execution_sink is not None and CURRENT_OPERATION.get() is None:
+            return self.audited('run_command', cwd, lambda: self.run_command(
+                command, args, cwd, timeout_seconds, max_output_bytes))
         key, _arguments, working_directory, prepared_command = self._validated_exec_request(
             command, args, cwd
         )
@@ -3413,6 +3603,19 @@ class TianChengService:
             maximum=MAX_COMMAND_OUTPUT_BYTES,
             label="max_output_bytes",
         )
+        sink = self.execution_sink
+        context = CURRENT_OPERATION.get()
+        process_context = sink.child(context) if sink is not None and context is not None else None
+        def observe(phase: str, facts: dict[str, Any]) -> None:
+            if sink is None or process_context is None:
+                return
+            if phase == 'output':
+                sink.detail(process_context, facts['stream'], facts['text'])
+            else:
+                if phase == 'completed':
+                    sink.finish_detail(process_context)
+                sink.emit(process_context, 'process', phase, facts,
+                          operation_outcome=self._observed_outcome(facts) if phase == 'completed' else 'pending')
         result = _run_process_bounded(
             prepared_command,
             cwd=working_directory,
@@ -3420,6 +3623,7 @@ class TianChengService:
             timeout_seconds=timeout,
             maximum_output=maximum,
             cancel_event=self._cancel_event(),
+            observer=observe if process_context is not None else None,
         )
         if result["cancelled"]:
             raise JobCancelled("Command cancelled")
@@ -3474,6 +3678,8 @@ class TianChengService:
                 exit_code = process.wait(timeout=record.max_runtime_seconds)
             except subprocess.TimeoutExpired:
                 record.timed_out = True
+                if record.observation is not None:
+                    record.observation.cancel_requested('timeout')
                 if kill_job.active:
                     kill_job.terminate()
                 else:
@@ -3545,8 +3751,17 @@ class TianChengService:
                 record.kill_job = None
                 record.reader_threads.clear()
             self._process_slots.release(slot_token)
+            observed_code = exit_code if exit_code is not None else process.returncode
+            if record.observation is not None:
+                record.observation.finished({
+                    'exit_code': observed_code, 'timeout': record.timed_out,
+                    'cancel_requested': record.stop_requested,
+                    'resources_released': cleanup_error is None,
+                    'output_drain_incomplete': record.output_drain_incomplete,
+                    'stdout_bytes_total': record.stdout_total, 'stderr_bytes_total': record.stderr_total,
+                })
             with record.lock:
-                record.exit_code = exit_code if exit_code is not None else process.returncode
+                record.exit_code = observed_code
                 record.ended_epoch = time.time()
                 record.resources_released = cleanup_error is None
                 record.resource_cleanup_error = cleanup_error
@@ -3570,6 +3785,9 @@ class TianChengService:
         max_runtime_seconds: int = 3600,
         output_limit_bytes: int = DEFAULT_MANAGED_OUTPUT_BYTES,
     ) -> dict[str, Any]:
+        if self.execution_sink is not None and CURRENT_OPERATION.get() is None:
+            return self.audited('start_process', cwd, lambda: self.start_process(
+                command, args, cwd, max_runtime_seconds, output_limit_bytes))
         key, _arguments, working_directory, prepared = self._validated_exec_request(
             command, args, cwd
         )
@@ -3610,6 +3828,7 @@ class TianChengService:
         agent_proxy: bool = False,
         agent_launch_context: Mapping[str, Any] | None = None,
         windows_home_preflight_policy: str = "none",
+        execution_observer: AgentObserver | None = None,
     ) -> dict[str, Any]:
         if not self.allow_exec:
             raise execution_denied(
@@ -3745,6 +3964,17 @@ class TianChengService:
             record = _ManagedProcess(process_id, command_key,
                 self._managed_cwd_label(working_directory), process, kill_job,
                 output_limit, runtime, owner)
+            parent = execution_observer.context if execution_observer is not None else CURRENT_OPERATION.get()
+            if self.execution_sink is not None and parent is not None:
+                try:
+                    record.observation = ProcessObserver(self.execution_sink, parent,
+                        process_id=process_id, owner=owner, program=command_key,
+                        provider=execution_observer.provider if execution_observer is not None else None)
+                    record.observation.started()
+                except Exception as exc:
+                    self.execution_sink.store.note_failure(type(exc).__name__)
+            if execution_observer is not None:
+                execution_observer.started()
             assert process.stdout is not None and process.stderr is not None
             record.reader_threads = [
                 threading.Thread(target=_drain_managed_stream,
@@ -3780,6 +4010,10 @@ class TianChengService:
                 handle.Close()
             with self._process_lock:
                 self._processes.pop(process_id, None)
+            if record is not None and record.observation is not None:
+                record.observation.finished({'exit_code': process.returncode,
+                    'cancel_requested': True, 'resources_released': True,
+                    'reason_code': 'launch_setup_failed'})
             raise
         record_launch("spawned")
         result = self._managed_process_status(record)
@@ -3976,6 +4210,8 @@ class TianChengService:
 
         project_root = Path(__file__).resolve().parents[2]
         protected = (project_root, self.audit_directory, self.access_policy_path.parent)
+        if self.execution_record_root is not None:
+            protected = (*protected, self.execution_record_root)
         for reserved in protected:
             reserved_path = Path(reserved).resolve(strict=False)
             if (
@@ -4331,6 +4567,9 @@ class TianChengService:
         codex_action: str = "continue",
         max_runtime_seconds: int | None = None,
     ) -> dict[str, Any]:
+        if self.execution_sink is not None and CURRENT_OPERATION.get() is None:
+            return self.audited('agent_run_start', None, lambda: self.agent_run_start(
+                session_id, prompt, codex_options, codex_action, max_runtime_seconds))
         session = self._get_agent_session(session_id)
         with session.lock:
             return self._agent_run_start_locked(
@@ -4428,54 +4667,76 @@ class TianChengService:
             )
         if command[: len(prefix)] != prefix or len(command) <= len(prefix):
             raise RuntimeError("Agent adapter returned an invalid executable prefix")
-        started = self._start_managed_process_prepared(
-            profile.command,
-            command,
-            working_directory,
-            max_runtime_seconds=effective_max_runtime_seconds,
-            output_limit_bytes=profile.max_output_bytes,
-            include_passthrough_env=False,
-            profile_credential_env=profile.credential_env,
-            allow_user_credential_fallback=session.provider == "pi",
-            environment_overrides=(
-                {"AWZ_ROUTE": str(prepared_codex_options["route"])}
-                if "route" in prepared_codex_options
-                else None
-            ),
-            codex_home=str(codex_home) if codex_home is not None else None,
-            windows_home_preflight_policy=profile.windows_home_preflight,
-            stdin_enabled=manual_approval,
-            policy_root=(
-                None if session.policy_root is None else Path(session.policy_root)
-            ),
-            owner="agent_run",
-            agent_proxy=session.proxy_enabled,
-            agent_launch_context={
-                "profile": session.profile,
-                "claude_command_mode": session.claude_command_mode,
-                "requested_sandbox": session.sandbox,
-                "requested_approval_policy": prepared_codex_options.get("ask_for_approval"),
-                "requested_auto_review": bool(prepared_codex_options.get("approve_for_me")),
-                "resolved_approval_policy": "not_observed",
-                "requested_additional_write_roots": list(prepared_codex_options.get("add_dirs", ())),
-                "resolved_sandbox_policy": "not_observed",
-            },
-        )
+        run_id = new_run_id()
+        observation = None
+        if self.execution_sink is not None and CURRENT_OPERATION.get() is not None:
+            try:
+                observation = AgentObserver(self.execution_sink, CURRENT_OPERATION.get(),
+                    session_id=session.session_id, run_id=run_id, provider=session.provider)
+                observation.validated()
+                parser.source_observer = observation.source
+                if isinstance(parser, ManualApprovalParser):
+                    parser.approval_observer = observation.approval
+            except Exception as exc:
+                self.execution_sink.store.note_failure(type(exc).__name__)
+        try:
+            started = self._start_managed_process_prepared(
+                profile.command,
+                command,
+                working_directory,
+                max_runtime_seconds=effective_max_runtime_seconds,
+                output_limit_bytes=profile.max_output_bytes,
+                include_passthrough_env=False,
+                profile_credential_env=profile.credential_env,
+                allow_user_credential_fallback=session.provider == "pi",
+                environment_overrides=(
+                    {"AWZ_ROUTE": str(prepared_codex_options["route"])}
+                    if "route" in prepared_codex_options
+                    else None
+                ),
+                codex_home=str(codex_home) if codex_home is not None else None,
+                windows_home_preflight_policy=profile.windows_home_preflight,
+                stdin_enabled=manual_approval,
+                policy_root=(
+                    None if session.policy_root is None else Path(session.policy_root)
+                ),
+                owner="agent_run",
+                agent_proxy=session.proxy_enabled,
+                agent_launch_context={
+                    "profile": session.profile,
+                    "claude_command_mode": session.claude_command_mode,
+                    "requested_sandbox": session.sandbox,
+                    "requested_approval_policy": prepared_codex_options.get("ask_for_approval"),
+                    "requested_auto_review": bool(prepared_codex_options.get("approve_for_me")),
+                    "resolved_approval_policy": "not_observed",
+                    "requested_additional_write_roots": list(prepared_codex_options.get("add_dirs", ())),
+                    "resolved_sandbox_policy": "not_observed",
+                },
+                execution_observer=observation,
+            )
+        except BaseException as exc:
+            if observation is not None:
+                observation.launch_failed(type(exc).__name__)
+            raise
         run = AgentRunState(
-            new_run_id(),
+            run_id,
             session.session_id,
             started["process_id"],
             parser=parser,
             invocation_summary=summarize_codex_options(effective_codex_options),
             runtime_context=dict(started.get("runtime_context", {})),
             action=codex_action,
+            observation=observation,
         )
         with self._agent_lock:
             session.runs[run.run_id] = run
         if manual_approval:
             try:
                 self._flush_manual_protocol(run)
-            except Exception:
+            except Exception as exc:
+                if observation is not None:
+                    observation.launch_failed(type(exc).__name__)
+                run.parser.observation_delivery_failed()
                 self._stop_process(run.process_id, force=True)
                 raise
         initial_state = "running" if started["running"] else (
@@ -4658,6 +4919,7 @@ class TianChengService:
                     if self._process_status(run.process_id)["running"]:
                         self._flush_manual_protocol(run)
                     else:
+                        run.parser.observation_delivery_failed()
                         run.parser.outgoing.clear()
                 except (RuntimeError, OSError):
                     if not run.parser.done and self._process_status(run.process_id)["running"]:
@@ -4687,6 +4949,7 @@ class TianChengService:
 
             terminal = run.state not in {"queued", "running"}
             if terminal and isinstance(run.parser, ManualApprovalParser):
+                run.parser._withdraw_observation()
                 run.parser.pending.clear()
                 if run.state == "succeeded" and run.parser.done != "succeeded":
                     run.state = "failed"
@@ -4745,6 +5008,11 @@ class TianChengService:
                 run.terminal_event_emitted = True
             if terminal and record.finished.is_set():
                 status = self._managed_process_status(record)
+                if run.observation is not None:
+                    outcomes = self._agent_outcomes(run, status)
+                    run.observation.finished(state=run.state, code=status.get('exit_code'),
+                        commands=outcomes['commands'], provider_errors=run.provider_errors_observed,
+                        output_gap=run.output_gap_observed)
                 run.final_process_status = dict(status)
                 # Agent events and provider summaries are the retained result;
                 # raw pipes/buffers are private and no longer needed afterwards.
@@ -4815,7 +5083,15 @@ class TianChengService:
         if parser.done != "failed":
             while parser.outgoing:
                 message = parser.outgoing.pop(0)
-                process.send_input(json.dumps(message, ensure_ascii=False) + "\n")
+                delivery = parser.observation_delivery.pop(json.dumps(message.get('id')), None)
+                try:
+                    process.send_input(json.dumps(message, ensure_ascii=False) + "\n")
+                except (RuntimeError, OSError):
+                    if delivery is not None:
+                        parser._observe_approval('response_failed', delivery[0], {'decision': delivery[1]})
+                    raise
+                if delivery is not None:
+                    parser._observe_approval('response_delivered', delivery[0], {'decision': delivery[1]})
         if parser.done:
             parser.stdin_closed = True
             process.send_input("", close_stdin=True)
@@ -4980,6 +5256,8 @@ class TianChengService:
                 already_exited = True
             else:
                 already_exited = False
+                if not record.stop_requested and record.observation is not None:
+                    record.observation.cancel_requested()
                 record.stop_requested = True
                 if force and record.kill_job.active:
                     record.kill_job.terminate()
@@ -5049,3 +5327,5 @@ class TianChengService:
         self.media.clear()
         self.artifacts.clear()
         self.stop_all_processes()
+        if self._owns_execution_store and self.execution_store is not None:
+            self.execution_store.close()

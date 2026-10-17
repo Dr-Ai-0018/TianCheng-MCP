@@ -53,3 +53,16 @@ def test_cancel_does_not_accept_executed_commands_or_absent_marker_alone():
     report['commands'] = []
     report['state'] = 'succeeded'
     assert not ASSESS(report)
+
+
+@pytest.mark.parametrize('decision', ['accept', 'cancel'])
+@pytest.mark.parametrize('missing', ['complete_scan', 'decision_binding', 'approval_delivered',
+                                   'task_unverified', 'no_protocol_body', 'capture_loss'])
+def test_persistent_acceptance_requires_binding_delivery_and_private_complete_records(decision, missing):
+    report = evidence(decision)
+    report['require_records'] = True
+    report['durable'] = dict(complete_scan=True, decision_binding=True, approval_delivered=True,
+                             task_unverified=True, no_protocol_body=True, capture_loss=False)
+    assert ASSESS(report)
+    report['durable'][missing] = missing == 'capture_loss'
+    assert not ASSESS(report)

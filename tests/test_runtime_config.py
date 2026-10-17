@@ -23,7 +23,8 @@ def test_environment_fields_merge_and_cli_overrides_mode(tmp_path, monkeypatch):
     (tmp_path / "config/launcher.defaults.json").write_text(json.dumps({
         "executionEnvironment": {"mode": "basic", "allow": ["BASE_ENV"], "deny": ["DROP_ENV"]}}))
     local = tmp_path / "local.json"
-    local.write_text(json.dumps({"executionEnvironment": {"mode": "inherit"}}))
+    local.write_text(json.dumps({"executionEnvironment": {"mode": "inherit"},
+                                 "observability": {"mode": "detail"}}))
     config = launcher_config(tmp_path, local, {})
     assert config["executionEnvironment"] == {"mode": "inherit", "allow": ["BASE_ENV"], "deny": ["DROP_ENV"]}
     captured = {}
@@ -35,10 +36,12 @@ def test_environment_fields_merge_and_cli_overrides_mode(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "TianChengService", FakeService)
     monkeypatch.setattr(cli, "create_server", lambda service: FakeServer())
     cli.main(["--runtime-config", str(local), "--runtime-project-root", str(tmp_path),
-              "--workspace", str(tmp_path / "workspace"), "--exec-env-mode", "minimal", "--pass-env", "EXTRA_ENV"])
+              "--workspace", str(tmp_path / "workspace"), "--exec-env-mode", "minimal", "--pass-env", "EXTRA_ENV",
+              "--observability-config", '{"mode":"off"}'])
     assert captured["execution_environment"] == {"mode": "minimal", "deny": ["DROP_ENV"]}
     assert captured["passthrough_env"] == ["BASE_ENV", "EXTRA_ENV"]
     assert not captured["allow_exec"]
+    assert captured['observability_config'] == {'mode': 'off'}
 
 
 def test_configuration_resolves_relative_paths_and_environment(tmp_path):
@@ -138,6 +141,7 @@ async def test_native_launchers_use_selected_config_end_to_end(tmp_path, mode):
         "envFile": str(env_path), "auditDir": str(tmp_path / "selected-audit"),
         "commandPolicyPath": str(tmp_path / "selected-command-policy.json"),
         "interactiveTimeoutSeconds": 42,
+        "observability": {"storageRoot": str(tmp_path / 'selected-records')},
     }), encoding="utf-8")
     environment = {"PATH": os.environ.get("PATH", ""), "CONTROL_PLANE_API_KEY": "synthetic-parent-secret"}
     if mode == "tui-safe":
@@ -165,6 +169,8 @@ async def test_native_launchers_use_selected_config_end_to_end(tmp_path, mode):
         info = result.structured_content
         assert info["workspace_root"] == str(workspace)
         assert info["interactive_timeout_seconds"] == 42
+        assert info['execution_record_health']['mode'] == 'summary'
+        assert info['execution_record_health']['storage_available']
         assert any(rule["name"] == "selected-python" and rule["source"] == "local"
             for rule in info["command_policy"]["commands"])
         assert any(rule["path"] == str(workspace / "blocked") and rule["mode"] == "deny"
