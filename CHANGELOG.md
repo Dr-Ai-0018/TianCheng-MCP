@@ -18,6 +18,8 @@
 
 ### Validation and limits
 
+- Windows 私有记录按实际 ACE SID 核验；管理员令牌下的新文件显式使用当前用户所有者，不改变已有 ACL。共享元数据锁忙时显示延后并重试，不把已提交事件重复计为丢失；真实 I/O 故障继续可见。
+
 - Windows 完整回归 992 passed / 18 skipped；最终查询/终端修正另验 15 passed。原生 Linux O5 冻结补丁回归 452 passed / 10 Windows 专项跳过；其后的终端编码修正仅在 Windows 执行，并在 Windows 验证。
 - O2–O4 核心已有 Windows 与原生 Linux 的 summary/detail 各 600 秒合成性能证据；这些测量不代表所有业务负载的性能保证。真实 Codex 只读读取与工作区写入有限验收 15 项通过，核对实际 native item 和独立文件字节；审批及其他 provider 须按各自通道独立验收，单一 Codex 链路不代表全部 provider。
 - 记录不提供防篡改或零丢失保证；Agent 任务仍需独立业务验收，进程 exit 0 不自动证明任务成功。Linux 提供同一捕获和查询 CLI，交互式 tc 菜单仍限 Windows。

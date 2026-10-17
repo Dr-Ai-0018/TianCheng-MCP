@@ -8,6 +8,8 @@ Windows 主菜单 **O** 或 `tc -Action records` 打开执行记录。菜单提�
 
 `tc -Action records -Json` 只查询本机记录和下次启动配置，不连接模型、不启动业务服务。`available` 表示历史存储可读，**不代表服务在线**；`capture_config.scope=next_start` 不是当前实例配置。当前实例的实际模式和健康应查看 `workspace_info.execution_record_health`。
 
+健康中的 `metadata_pending` 表示共享锁繁忙、元数据等待刷新，`metadata_deferred_count` 累计这种延后；已同步的事件不会因此重复写入或计作丢失。真正的写入错误仍计入 `write_failure_count`，历史故障与未关闭记录的质量提示会保留，重启不会清除旧证据。
+
 列表只对当前有界扫描页排序，不保证全局最新优先；还有游标时使用“下一页”。分页详情的完整性只针对本页已找到的证据，不要把独立页面拼接成未经验证的全局成功结论。同值资源 ID 可能匹配多项操作，界面保留多重匹配提示。
 
 ## Windows / Linux CLI

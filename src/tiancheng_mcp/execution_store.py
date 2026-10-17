@@ -80,6 +80,8 @@ class ExecutionStore:
         self._numbers = {'summary': 0, 'detail': 0}
         self._segments: list[dict] = []
         self._last_sync = None
+        self._metadata_pending = False
+        self._metadata_deferred = 0
         self._manifest = {'schema_version': 1, 'producer_id': self.producer_id,
                           'mode': self.settings.mode, 'started_at': utc(), 'closed': False}
         if self.settings.mode == 'off': return
@@ -213,7 +215,8 @@ class ExecutionStore:
                 'dropped_summary': self._dropped_summary, 'dropped_detail': self._dropped_detail,
                 'write_failure_count': self._failures, 'last_error_type': self._last_error,
                 'observed_seq': self._seq, 'written_seq': self._written, 'synced_seq': self._synced,
-                'last_sync_time': self._last_sync, 'shutdown_incomplete': self._stopping and not self._closed}
+                'last_sync_time': self._last_sync, 'shutdown_incomplete': self._stopping and not self._closed,
+                'metadata_pending': self._metadata_pending, 'metadata_deferred_count': self._metadata_deferred}
 
     def _write_manifest(self) -> None:
         health = self.health()
@@ -321,13 +324,30 @@ class ExecutionStore:
         segment['last_seq'] = event['seq']
         with self._condition: self._written = event['seq']
 
-    def _sync(self, *, metadata: bool = True) -> None:
+    def _sync(self, *, metadata: bool = True) -> bool:
         for _, handle in self._files.values(): handle.flush(); os.fsync(handle.fileno())
         with self._condition:
             self._synced = self._written; self._last_sync = utc()
         if metadata:
-            with FileLock(self.root/'store.lock'):
+            lock = FileLock(self.root/'store.lock')
+            try:
+                lock.acquire(timeout=0.25)
+            except BlockingIOError:
+                # Event bytes are already synced. Retry shared metadata without
+                # reporting data loss or requeueing an already-written event.
+                with self._condition:
+                    self._metadata_pending = True
+                    self._metadata_deferred = min(self._metadata_deferred + 1, 2**63 - 1)
+                return False
+            try:
+                with self._condition: self._metadata_pending = False
                 self._write_manifest()
+            except Exception:
+                with self._condition: self._metadata_pending = True
+                raise
+            finally:
+                lock.release()
+        return True
 
     def _writer(self) -> None:
         synced_at = time.monotonic()
@@ -343,17 +363,20 @@ class ExecutionStore:
                         q = min(candidates,key=lambda q:q[0][0]); item = q.popleft()
                         if q is self._critical: self._critical_bytes -= item[3]
                         else: self._normal_bytes -= item[3]
+                written = False
                 try:
-                    if item: self._write_event(item[1],item[2])
+                    if item:
+                        self._write_event(item[1],item[2])
+                        written = True
                     if time.monotonic()-synced_at >= self.limits.sync_seconds or (item and item[2]['phase'] in ('completed','failed','denied','closed')):
                         due = time.monotonic()-synced_at >= self.limits.sync_seconds
                         # During bounded shutdown only the final manifest needs
                         # publishing. Still sync every terminal event's bytes.
-                        self._sync(metadata=due and not self._stopping)
-                        if due: synced_at = time.monotonic()
+                        synced = self._sync(metadata=due and not self._stopping)
+                        if due and synced: synced_at = time.monotonic()
                 except Exception as exc:
                     self.note_failure(type(exc).__name__)
-                    if item:
+                    if item and not written:
                         with self._condition: self._drop(item[1],item[0])
                     # Avoid a busy loop on a stalled/broken disk. The bounded
                     # admission queues keep producer calls independent.
@@ -382,6 +405,7 @@ class ExecutionStore:
                 for path,_ in self._files.values():
                     reservation = path.with_name(path.name + '.reserve')
                     if reservation.exists(): validate_private(reservation); reservation.unlink()
+                with self._condition: self._metadata_pending = False
                 self._write_manifest()
             with self._condition: self._closed = True
         except Exception as exc:

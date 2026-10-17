@@ -71,8 +71,8 @@ def _windows_dacl_is_private(dacl, sid: str, adv, kernel) -> bool:
     return True
 
 
-def _windows_descriptor(path: Path, create: bool = False) -> None:
-    # Create a protected inheritable DACL on NEW directories only. Existing ACLs
+def _windows_descriptor(path: Path, create: bool = False, *, create_file: bool = False) -> None:
+    # Create a protected inheritable DACL on NEW paths only. Existing ACLs
     # are inspected, never rewritten or relaxed to satisfy a test.
     import ctypes
     from ctypes import wintypes as w
@@ -112,10 +112,22 @@ def _windows_descriptor(path: Path, create: bool = False) -> None:
         class Attributes(ctypes.Structure):
             _fields_ = [('length', w.DWORD), ('descriptor', ctypes.c_void_p), ('inherit', w.BOOL)]
         attrs = Attributes(ctypes.sizeof(Attributes), descriptor, False)
-        kernel.CreateDirectoryW.argtypes = [w.LPCWSTR, ctypes.POINTER(Attributes)]
         try:
-            if not kernel.CreateDirectoryW(str(path), ctypes.byref(attrs)):
-                raise PermissionError('Cannot create private record directory')
+            if create_file:
+                kernel.CreateFileW.argtypes = [w.LPCWSTR, w.DWORD, w.DWORD, ctypes.POINTER(Attributes), w.DWORD, w.DWORD, w.HANDLE]
+                kernel.CreateFileW.restype = w.HANDLE
+                handle = kernel.CreateFileW(str(path), 0xC0000000, 7, ctypes.byref(attrs), 1, 0x00200080, None)
+                if handle == ctypes.c_void_p(-1).value:
+                    if ctypes.get_last_error() not in (80, 183):
+                        raise PermissionError('Cannot create private record file')
+                    # Another producer can create store.lock concurrently. The
+                    # existing file still has to pass the same owner/ACL checks.
+                else:
+                    kernel.CloseHandle(handle)
+            else:
+                kernel.CreateDirectoryW.argtypes = [w.LPCWSTR, ctypes.POINTER(Attributes)]
+                if not kernel.CreateDirectoryW(str(path), ctypes.byref(attrs)):
+                    raise PermissionError('Cannot create private record directory')
         finally:
             kernel.LocalFree(descriptor)
     owner, dacl = ctypes.c_void_p(), ctypes.c_void_p()
@@ -162,7 +174,12 @@ def private_open(path: Path, mode: str = 'a+b'):
     checked_path(path)
     if path.exists():
         validate_private(path)
-    flags = os.O_RDWR | (os.O_CREAT if mode != 'r+b' else 0)
+    elif os.name == 'nt' and mode != 'r+b':
+        # Elevated Windows accounts may default new file ownership to the
+        # Administrators group. Set the actual user owner at creation, without
+        # modifying or trusting an existing file's permissions.
+        _windows_descriptor(path, create=True, create_file=True)
+    flags = os.O_RDWR | (os.O_CREAT if mode != 'r+b' and os.name != 'nt' else 0)
     flags |= getattr(os, 'O_NOFOLLOW', 0)
     fd = os.open(path, flags, 0o600)
     try:

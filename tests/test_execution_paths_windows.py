@@ -5,7 +5,7 @@ import os
 
 import pytest
 
-from tiancheng_mcp.execution_paths import _windows_dacl_is_private
+from tiancheng_mcp.execution_paths import _windows_dacl_is_private, private_directory, private_open, validate_private
 
 
 @pytest.mark.skipif(os.name != 'nt', reason='Native Windows ACL trustee identity')
@@ -46,3 +46,29 @@ def test_acl_compares_actual_sid_and_keeps_private_boundary(sid, aces, expected)
 def test_null_dacl_is_not_private():
     assert not _windows_dacl_is_private(
         ctypes.c_void_p(), 'S-1-5-18', ctypes.WinDLL('advapi32'), ctypes.WinDLL('kernel32'))
+
+
+@pytest.mark.skipif(os.name != 'nt', reason='Native Windows file owner creation')
+def test_new_files_have_private_current_user_owner_and_keep_existing_bytes(tmp_path):
+    root = private_directory(tmp_path / 'records')
+    path = root / 'store.lock'
+    with private_open(path) as handle:
+        handle.write(b'private-marker')
+    validate_private(path)
+    with private_open(path, 'r+b') as handle:
+        assert handle.read() == b'private-marker'
+    validate_private(path)
+    with pytest.raises(FileNotFoundError):
+        private_open(root / 'missing.lock', 'r+b')
+
+
+@pytest.mark.skipif(os.name != 'nt', reason='Native Windows file owner creation')
+def test_file_creation_race_validates_existing_file_without_replacing_it(tmp_path):
+    from tiancheng_mcp.execution_paths import _windows_descriptor
+    root = private_directory(tmp_path / 'records')
+    path = root / 'store.lock'
+    with private_open(path) as handle:
+        handle.write(b'preserved')
+    _windows_descriptor(path, create=True, create_file=True)
+    assert path.read_bytes() == b'preserved'
+    validate_private(path)
