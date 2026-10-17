@@ -1208,7 +1208,8 @@ def create_server(service: TianChengService) -> MCPServer:
         @mcp.tool(
             description=(
                 "Run a command allowed by the configured command policy (see workspace_info.command_policy), "
-                "with separated args and a workspace cwd, "
+                "with separated args and a relative or absolute workspace cwd, or an external "
+                "absolute cwd covered by an enabled, no-approval static exec rule, "
                 "global Git/GCM access, a secret-scrubbed environment, process-tree timeout, "
                 "and bounded output. Credential-printing commands are blocked. This is not an "
                 "OS sandbox. minimal allows only git/rg --version; balanced permits development code; "
@@ -1239,7 +1240,9 @@ def create_server(service: TianChengService) -> MCPServer:
 
         @mcp.tool(
             description=(
-                "Start a command-policy controlled long-running developer process in a workspace cwd. "
+                "Start a command-policy controlled long-running developer process with a relative "
+                "or absolute workspace cwd, or an external absolute cwd covered by an enabled, "
+                "no-approval static exec rule. "
                 "Output is kept only in bounded memory and the process has a hard lifetime."
             ),
             annotations=EXECUTION,

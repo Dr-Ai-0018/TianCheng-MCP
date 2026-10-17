@@ -73,6 +73,7 @@ class ExecutionStore:
         self._loss_pending = 0
         self._loss_first = self._loss_last = None
         self._stopping = self._closed = False
+        self._shutdown_deadline = None
         self._available = False
         self._thread = None
         self._owner = None
@@ -401,12 +402,20 @@ class ExecutionStore:
             self._sync(metadata=False)
             self._manifest['closed'] = True
             self._manifest['closed_at'] = utc()
-            with FileLock(self.root/'store.lock'):
+            # A competing producer may be publishing its final manifest too.
+            # Use the remaining bounded close budget rather than abandoning
+            # already-synced events after the ordinary 250 ms lock attempt.
+            with self._condition:
+                remaining = max(0, self._shutdown_deadline - time.monotonic())
+            lock = FileLock(self.root/'store.lock').acquire(timeout=remaining)
+            try:
                 for path,_ in self._files.values():
                     reservation = path.with_name(path.name + '.reserve')
                     if reservation.exists(): validate_private(reservation); reservation.unlink()
                 with self._condition: self._metadata_pending = False
                 self._write_manifest()
+            finally:
+                lock.release()
             with self._condition: self._closed = True
         except Exception as exc:
             self.note_failure(type(exc).__name__)
@@ -420,10 +429,13 @@ class ExecutionStore:
 
     def close(self, deadline_seconds: float = 2) -> str:
         if self.settings.mode=='off': return 'drained'
+        budget = max(0, min(deadline_seconds, 2))
         with self._condition:
             already=self._stopping
         if not already: self.publish(self._producer_event('closed'))
         with self._condition:
+            if not self._stopping:
+                self._shutdown_deadline = time.monotonic() + budget
             self._stopping=True; self._condition.notify_all()
-        if self._thread: self._thread.join(timeout=max(0,min(deadline_seconds,2)))
+        if self._thread: self._thread.join(timeout=budget)
         return 'drained' if self._closed else 'incomplete'

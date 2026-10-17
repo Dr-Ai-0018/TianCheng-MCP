@@ -993,7 +993,9 @@ def test_prepared_process_entrypoint_revalidates_prefix_and_workspace(
             max_runtime_seconds=10,
             output_limit_bytes=4096,
         )
-    with pytest.raises(WorkspaceSecurityError, match="outside the workspace"):
+    # An external cwd now goes through explicit exec authorization. A path
+    # outside every approved rule must still fail before consuming a slot.
+    with pytest.raises(PermissionError, match="No enabled rule"):
         service._start_managed_process_prepared(
             "python",
             [*prefix, "-V"],
@@ -1001,6 +1003,9 @@ def test_prepared_process_entrypoint_revalidates_prefix_and_workspace(
             max_runtime_seconds=10,
             output_limit_bytes=4096,
         )
+    assert service._process_slots.active_count == 0
+    assert service._processes == {}
+    service.shutdown()
 
 
 def test_codex_jsonl_parser_extracts_thread_and_final_message() -> None:

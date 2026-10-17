@@ -70,7 +70,7 @@ from .search_runtime import SearchCandidates
 from .grants import ExternalGrantManager
 from .jobs import JobCancelled, JobManager, current_cancel_event, current_job_id
 from .policy import AccessPolicy, AccessPolicyError, AccessRule, _canonical_target
-from .security import WorkspaceJail, WorkspaceSecurityError, compile_glob
+from .security import WorkspaceJail, WorkspaceSecurityError, compile_glob, is_native_absolute_path
 from .image_io import ImageMode, read_image as decode_image
 from .media_results import MediaStore
 from .artifacts import ArtifactStore
@@ -3554,6 +3554,40 @@ class TianChengService:
             )
         return [*prefix, *arguments]
 
+    def _execution_working_directory(self, cwd: str | Path) -> Path:
+        """Select an existing exec cwd without widening a delegated context.
+
+        Relative requests retain the established workspace jail contract.
+        Absolute external requests use current, non-approval static exec rules;
+        this selects a start directory, not an operating-system sandbox.
+        """
+        raw = "." if cwd is None or str(cwd) == "" else str(cwd)
+        if not self._is_absolute_request(raw):
+            return self.jail.resolve(raw, must_exist=True, expect="directory")
+        if not is_native_absolute_path(raw):
+            raise WorkspaceSecurityError("Working directory must be a native absolute path without parent components")
+        # A scoped grant/context must never escape to another static rule.
+        if isinstance(self.jail, ContextJail):
+            return self.jail.resolve(
+                self.jail.relative(Path(raw)), must_exist=True, expect="directory"
+            )
+        try:
+            relative = self.jail.relative(Path(raw))
+        except WorkspaceSecurityError:
+            pass
+        else:
+            return self.jail.resolve(relative, must_exist=True, expect="directory")
+        decision = self.access_policy.authorize(raw, "exec")
+        if decision.requires_approval:
+            raise PermissionError("This working directory requires explicit external access approval")
+        if decision.rule_path is None:
+            raise PermissionError("No enabled static exec rule covers this working directory")
+        reserved = (self.execution_record_root,) if self.execution_record_root is not None else ()
+        context = AccessContext(decision.rule_path, "exec", lambda: self.access_policy,
+                                protected_roots=reserved)
+        jail = ContextJail(context)
+        return jail.resolve(jail.relative(decision.path), must_exist=True, expect="directory")
+
     def _validated_exec_request(
         self, command: str, args: list[str] | None, cwd: str
     ) -> tuple[str, list[str], Path, list[str]]:
@@ -3577,7 +3611,7 @@ class TianChengService:
             for value in arguments
         ):
             raise ValueError("Each command argument must be bounded text without NUL bytes")
-        working_directory = self.jail.resolve(cwd, must_exist=True, expect="directory")
+        working_directory = self._execution_working_directory(cwd)
         return key, arguments, working_directory, self._prepare_exec_command(key, arguments)
 
     def run_command(
@@ -3616,6 +3650,7 @@ class TianChengService:
                     sink.finish_detail(process_context)
                 sink.emit(process_context, 'process', phase, facts,
                           operation_outcome=self._observed_outcome(facts) if phase == 'completed' else 'pending')
+        working_directory = self._execution_working_directory(working_directory)
         result = _run_process_bounded(
             prepared_command,
             cwd=working_directory,
@@ -3629,7 +3664,7 @@ class TianChengService:
             raise JobCancelled("Command cancelled")
         return {
             "command": key,
-            "cwd": self.jail.relative(working_directory),
+            "cwd": self._managed_cwd_label(working_directory),
             "policy": "guarded-development",
             **result,
         }
@@ -3866,14 +3901,15 @@ class TianChengService:
         # check but no longer resolves safely.  A whitelisted agent cwd is
         # re-checked against its own authorized root instead of the workspace;
         # the caller must already have authorized that root for this run.
-        containing_jail = (
-            self.jail if policy_root is None else WorkspaceJail(policy_root, create=False)
-        )
-        working_directory = containing_jail.resolve(
-            containing_jail.relative(working_directory),
-            must_exist=True,
-            expect="directory",
-        )
+        if owner == "agent_run":
+            containing_jail = (
+                self.jail if policy_root is None else WorkspaceJail(policy_root, create=False)
+            )
+            working_directory = containing_jail.resolve(
+                containing_jail.relative(working_directory), must_exist=True, expect="directory"
+            )
+        else:
+            working_directory = self._execution_working_directory(working_directory)
         runtime = _bounded_int(
             max_runtime_seconds,
             minimum=1,

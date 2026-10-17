@@ -107,7 +107,9 @@ pnpm 等脚本包装器须配置可信 Node 的绝对路径，以及 CLI 脚本�
 - exec 默认关闭且 tool 不注册；
 - 开启后遵守所选命令策略；前三档使用启动时解析的名单，unrestricted 支持动态程序及绝对路径；
 - `command` 与 `args` 分离，始终 `shell=False`；
-- cwd 仍需通过 workspace jail；
+- cwd 的相对路径继续通过 workspace jail；主工作区内也可用绝对路径。主工作区外的绝对目录
+  必须匹配已启用、无需额外审批且 `allow_exec=true` 的静态规则，启动前重新检查；普通命令与
+  `start_process` 使用同一规则。更具体的 deny/审批规则及符号链接继续拒绝，禁用规则不参与匹配；
 - minimal/balanced 默认不开放 Shell；elevated/unrestricted 显式允许 Shell，其系统访问由宿主账户决定；
   需要回收站语义的删除应使用 trash-aware `delete` 工具；
 - Git 与 `gh` 在 Dev Profile 中可执行本地和远程开发工作流，并复用用户 Git config/GCM；
@@ -115,6 +117,7 @@ pnpm 等脚本包装器须配置可信 Node 的绝对路径，以及 CLI 脚本�
 - 普通命令默认使用 basic 基础环境，不继承任意业务 secret；可显式允许或禁止变量名称。
   本机可选择 inherit 兼容透传业务环境，但固定控制面密钥仍被过滤；Agent、专用 Git 和搜索独立。详见 [执行环境](configuration.md#执行环境默认基础环境按需开放)；
 - Python、uv、pip、npm 缓存和临时目录重定向到 workspace 内的 `.tiancheng-tmp`；
+
 - 默认 timeout 60 秒，最大 300 秒；stdout/stderr 分别有内存与返回上限；
 - Windows 使用 kill-on-close Job Object；超时会终止整个子进程树，正常退出也不允许遗留
   后台 daemon；
@@ -122,6 +125,11 @@ pnpm 等脚本包装器须配置可信 Node 的绝对路径，以及 CLI 脚本�
   stdout/stderr 只保存在有上限的内存尾部缓冲区，支持 `after_bytes` 增量游标和
   `process_input` UTF-8 stdin，MCP 退出时会回收进程树；
 - 审计日志只记 tool/cwd，不记录 command args。
+
+例如静态策略已批准 `/srv/example-project` 的执行能力时，普通命令可直接使用
+`cwd="/srv/example-project"`；无需把它搬进主工作区，也无需为了这条静态规则开启临时
+外部授权工具。相对 cwd 始终相对于主工作区，不会自动切换到最近使用的外部目录。
+需要额外审批的规则仍需走既有审批流程；委托 grant/context 不能跳到另一个白名单根。
 
 allowlist 只约束首个 executable，不约束程序内部行为，也不会把参数伪装成路径牢笼。
 Python、Node、Git、`gh`、pytest、npm script 或项目代码都可以动态构造路径、访问网络或
