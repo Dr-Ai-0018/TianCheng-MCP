@@ -31,6 +31,46 @@ def validate_root(root: Path, workspace: Path | None = None) -> Path:
     return root
 
 
+def _windows_dacl_is_private(dacl, sid: str, adv, kernel) -> bool:
+    """Compare actual ACE trustee SIDs, independent of SDDL account aliases."""
+    import ctypes
+    from ctypes import wintypes as w
+
+    class AclSize(ctypes.Structure):
+        _fields_ = [('count', w.DWORD), ('used', w.DWORD), ('free', w.DWORD)]
+
+    class AceHeader(ctypes.Structure):
+        _fields_ = [('kind', w.BYTE), ('flags', w.BYTE), ('size', w.WORD)]
+
+    adv.GetAclInformation.argtypes = [ctypes.c_void_p, ctypes.c_void_p, w.DWORD, ctypes.c_int]
+    adv.GetAce.argtypes = [ctypes.c_void_p, w.DWORD, ctypes.POINTER(ctypes.c_void_p)]
+    adv.ConvertSidToStringSidW.argtypes = [ctypes.c_void_p, ctypes.POINTER(w.LPWSTR)]
+    kernel.LocalFree.argtypes = [ctypes.c_void_p]
+    size = AclSize()
+    if not dacl or not adv.GetAclInformation(dacl, ctypes.byref(size), ctypes.sizeof(size), 2):
+        return False
+    if not size.count:
+        return False
+    for index in range(size.count):
+        ace = ctypes.c_void_p()
+        if not adv.GetAce(dacl, index, ctypes.byref(ace)) or not ace.value:
+            return False
+        header = AceHeader.from_address(ace.value)
+        if header.kind == 1:  # Standard deny ACE; it cannot grant access.
+            continue
+        if header.kind != 0 or header.size < 12:
+            return False  # Object, callback and unknown ACEs remain rejected.
+        trustee = w.LPWSTR()
+        if not adv.ConvertSidToStringSidW(ace.value + 8, ctypes.byref(trustee)):
+            return False
+        try:
+            if trustee.value not in (sid, 'S-1-5-18'):
+                return False
+        finally:
+            kernel.LocalFree(trustee)
+    return True
+
+
 def _windows_descriptor(path: Path, create: bool = False) -> None:
     # Create a protected inheritable DACL on NEW directories only. Existing ACLs
     # are inspected, never rewritten or relaxed to satisfy a test.
@@ -44,7 +84,6 @@ def _windows_descriptor(path: Path, create: bool = False) -> None:
     adv.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = [w.LPCWSTR, w.DWORD, ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p]
     adv.GetNamedSecurityInfoW.argtypes = [w.LPCWSTR, ctypes.c_int, w.DWORD, ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
     adv.GetNamedSecurityInfoW.restype = w.DWORD
-    adv.ConvertSecurityDescriptorToStringSecurityDescriptorW.argtypes = [ctypes.c_void_p, w.DWORD, w.DWORD, ctypes.POINTER(w.LPWSTR), ctypes.c_void_p]
     kernel.GetCurrentProcess.restype = w.HANDLE
     kernel.CloseHandle.argtypes = [w.HANDLE]
     kernel.LocalFree.argtypes = [ctypes.c_void_p]
@@ -82,24 +121,16 @@ def _windows_descriptor(path: Path, create: bool = False) -> None:
     owner, dacl = ctypes.c_void_p(), ctypes.c_void_p()
     if adv.GetNamedSecurityInfoW(str(path), 1, 5, ctypes.byref(owner), None, ctypes.byref(dacl), None, ctypes.byref(descriptor)):
         raise PermissionError('Cannot inspect private record ACL')
-    owner_text, text = w.LPWSTR(), w.LPWSTR()
+    owner_text = w.LPWSTR()
     try:
         if not adv.ConvertSidToStringSidW(owner, ctypes.byref(owner_text)):
             raise PermissionError('Cannot inspect private record owner')
         if owner_text.value != sid or not dacl.value:
             raise PermissionError('Records must be owned by the current user')
-        if not adv.ConvertSecurityDescriptorToStringSecurityDescriptorW(descriptor, 1, 4, ctypes.byref(text), None):
-            raise PermissionError('Cannot inspect private record ACL')
-        import re
-        entries = re.findall(r'\(([^()]*)\)', text.value or '')
-        # Reject null/unknown/conditional/object ACLs conservatively. Only the
-        # current account and SYSTEM may receive access; deny ACEs are harmless.
-        if not entries or any(parts[0] != 'D' and (parts[0] != 'A' or parts[-1] not in (sid, 'SY', 'S-1-5-18'))
-                              for entry in entries for parts in [entry.split(';')]):
+        if not _windows_dacl_is_private(dacl, sid, adv, kernel):
             raise PermissionError('Record ACL grants access outside the private boundary')
     finally:
         if owner_text: kernel.LocalFree(owner_text)
-        if text: kernel.LocalFree(text)
         kernel.LocalFree(descriptor)
 
 
