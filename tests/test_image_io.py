@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import io
+import os
 import threading
 import subprocess
 import sys
@@ -117,3 +118,105 @@ def test_running_worker_is_terminated_and_reaped(tmp_path, monkeypatch, cancel_w
         if timer: timer.cancel(); timer.join()
     assert len(children) == 1
     assert children[0].poll() is not None
+
+
+def test_large_input_survives_slow_worker_startup(tmp_path, monkeypatch):
+    from tiancheng_mcp import image_io
+    path = tmp_path / 'large.png'
+    Image.frombytes('RGB', (512, 256), os.urandom(512 * 256 * 3)).save(path)
+    assert path.stat().st_size > 65536
+    actual_popen = subprocess.Popen
+    children = []
+
+    def slow_worker(args, **kwargs):
+        code = ('import sys,time; time.sleep(.2); '
+                'from tiancheng_mcp.image_io import _worker; '
+                'sys.argv=["image_io","--worker",*sys.argv[1:]]; _worker()')
+        child = actual_popen([args[0], '-I', '-c', code, *args[5:]], **kwargs)
+        children.append(child)
+        return child
+
+    monkeypatch.setattr(image_io.subprocess, 'Popen', slow_worker)
+    payload = read_image(path, 'original', limits=replace(ImageLimits(), seconds=3))
+    assert base64.b64decode(payload['data']) == path.read_bytes()
+    assert len(children) == 1 and children[0].poll() == 0
+    assert children[0].stdin.closed and children[0].stdout.closed
+
+
+@pytest.mark.parametrize('cancel_worker', [False, True])
+def test_blocked_input_is_cancelled_and_all_resources_recovered(tmp_path, monkeypatch, cancel_worker):
+    from tiancheng_mcp import image_io
+    path = tmp_path / 'large.png'
+    Image.frombytes('RGB', (512, 256), os.urandom(512 * 256 * 3)).save(path)
+    actual_popen = subprocess.Popen
+    children = []
+    io_threads = []
+
+    def blocked_worker(args, **kwargs):
+        child = actual_popen([args[0], '-I', '-c', 'import time; time.sleep(60)'], **kwargs)
+        actual_communicate = child.communicate
+
+        def communicate(*args, **kwargs):
+            io_threads.append(threading.current_thread())
+            return actual_communicate(*args, **kwargs)
+
+        child.communicate = communicate
+        children.append(child)
+        return child
+
+    cancel = threading.Event()
+    timer = threading.Timer(.4, cancel.set) if cancel_worker else None
+    with monkeypatch.context() as patch:
+        patch.setattr(image_io.subprocess, 'Popen', blocked_worker)
+        if timer:
+            timer.start()
+        try:
+            with pytest.raises(JobCancelled if cancel_worker else TimeoutError):
+                read_image(path, cancel=cancel,
+                           limits=replace(ImageLimits(), seconds=3 if cancel_worker else .4))
+        finally:
+            if timer:
+                timer.cancel()
+                timer.join()
+    assert len(children) == 1 and children[0].poll() is not None
+    assert children[0].stdin.closed and children[0].stdout.closed
+    assert len(io_threads) == 1
+    assert io_threads[0] is not threading.current_thread() and not io_threads[0].is_alive()
+    assert image_io._SLOTS.acquire(blocking=False)
+    try:
+        assert image_io._SLOTS.acquire(blocking=False)
+        image_io._SLOTS.release()
+    finally:
+        image_io._SLOTS.release()
+    assert read_image(path, 'metadata')['metadata']['source_width'] == 512
+
+
+@pytest.mark.parametrize('failure', ['thread_start', 'communication', 'worker_exit'])
+def test_communication_failures_reap_worker_and_restore_slots(tmp_path, monkeypatch, failure):
+    from tiancheng_mcp import image_io
+    path = tmp_path / 'sample.png'
+    sample(path)
+    actual_popen = subprocess.Popen
+    children = []
+
+    def fail(*args, **kwargs):
+        raise OSError('synthetic communication failure')
+
+    def worker(args, **kwargs):
+        code = 'raise SystemExit(3)' if failure == 'worker_exit' else 'import time; time.sleep(60)'
+        child = actual_popen([args[0], '-I', '-c', code], **kwargs)
+        children.append(child)
+        if failure == 'communication':
+            child.communicate = fail
+        return child
+
+    with monkeypatch.context() as patch:
+        patch.setattr(image_io.subprocess, 'Popen', worker)
+        if failure == 'thread_start':
+            patch.setattr(threading.Thread, 'start', fail)
+        expected = ValueError if failure == 'worker_exit' else OSError
+        with pytest.raises(expected, match='worker failed' if failure == 'worker_exit' else 'synthetic'):
+            read_image(path)
+    assert len(children) == 1 and children[0].poll() is not None
+    assert children[0].stdin.closed and children[0].stdout.closed
+    assert read_image(path, 'metadata')['metadata']['source_width'] == 80

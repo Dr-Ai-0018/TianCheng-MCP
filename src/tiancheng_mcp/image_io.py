@@ -129,6 +129,7 @@ def read_image(path: Path, mode: ImageMode = 'preview', *, limits: ImageLimits =
     while not _SLOTS.acquire(timeout=0.05):
         check()
     child = None
+    transfer = None
     try:
         check()
         data = bounded_file_read(path, limits.source_bytes)
@@ -139,14 +140,30 @@ def read_image(path: Path, mode: ImageMode = 'preview', *, limits: ImageLimits =
                                  env={name: value for name, value in os.environ.items()
                                       if name.upper() in {'SYSTEMROOT', 'WINDIR', 'TEMP', 'TMP'}},
                                  creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
-        first = True
-        while True:
-            check()
+        completed = threading.Event()
+        output = b''
+        communication_error = None
+
+        def communicate() -> None:
+            nonlocal output, communication_error
             try:
-                output, _ = child.communicate(input=data if first else None, timeout=0.05)
-                break
-            except subprocess.TimeoutExpired:
-                first = False
+                # One owner sends all input and drains output. On POSIX,
+                # retrying communicate(input=None) after a short timeout can
+                # leave partially written stdin permanently unregistered.
+                output, _ = child.communicate(input=data)
+            except BaseException as exc:
+                communication_error = exc
+            finally:
+                completed.set()
+
+        transfer = threading.Thread(target=communicate, name='tiancheng-image-io')
+        transfer.start()
+        while not completed.wait(timeout=0.05):
+            check()
+        check()
+        transfer.join()
+        if communication_error is not None:
+            raise communication_error
         if len(output) > limits.json_bytes:
             raise ValueError('Image response exceeds JSON byte limit')
         if child.returncode != 0:
@@ -156,10 +173,23 @@ def read_image(path: Path, mode: ImageMode = 'preview', *, limits: ImageLimits =
             raise ValueError(result['error'])
         return result
     finally:
-        if child is not None and child.poll() is None:
-            child.kill()
-            child.communicate()
-        _SLOTS.release()
+        try:
+            if child is not None:
+                if child.poll() is None:
+                    try:
+                        child.kill()
+                    except ProcessLookupError:
+                        pass  # The worker exited between poll and kill.
+                if transfer is not None and transfer.ident is not None:
+                    # Killing the worker unblocks input/output. Never start a
+                    # second communicate call concurrently with its owner.
+                    transfer.join()
+                child.wait()
+                for stream in (child.stdin, child.stdout):
+                    if stream is not None:
+                        stream.close()
+        finally:
+            _SLOTS.release()
 
 
 def _worker() -> None:
